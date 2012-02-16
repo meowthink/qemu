@@ -227,6 +227,7 @@ static const struct {
     { .driver = "vhost-user-vga",       .flag = &default_vga       },
     { .driver = "virtio-vga-gl",        .flag = &default_vga       },
     { .driver = "virtio-vga-rutabaga",  .flag = &default_vga       },
+    { .driver = "s3-trio",              .flag = &default_vga       },
 };
 
 static QemuOptsList qemu_rtc_opts = {
@@ -994,6 +995,11 @@ static const VGAInterfaceInfo vga_interfaces[VGA_TYPE_MAX] = {
         .name = "Xen paravirtualized framebuffer",
     },
 #endif
+    [VGA_S3] = {
+        .opt_name = "s3",
+        .name = "S3 Trio",
+        .class_names = { "s3-trio" },
+    },
 };
 
 static bool vga_interface_available(VGAInterfaceType t)
