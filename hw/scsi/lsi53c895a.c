@@ -2378,6 +2378,7 @@ static void lsi_scsi_realize_8xx(PCIDevice *dev, Error **errp, uint16_t type)
      */
     s->ram_io.disable_reentrancy_guard = true;
     s->mmio_io.disable_reentrancy_guard = true;
+    s->io_io.disable_reentrancy_guard = true;
 
     if (type == PCI_DEVICE_ID_LSI_53C895A) {
         mmio_size = 0x400;
