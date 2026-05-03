@@ -113,6 +113,23 @@ SRST
     Show the cpu registers.
 ERST
 
+#if defined(TARGET_ALPHA)
+        {
+        .name       = "iprs",
+        .args_type  = "cpustate_all:-a,vcpu:i?",
+        .params     = "[-a|vcpu]",
+        .help       = "show the cpu internal processor registers (-a: show IPR info for all cpus;"
+                      " vcpu: specific vCPU to query; show the current CPU's IPRs if"
+                      " no argument is specified)",
+        .cmd        = hmp_info_iprs,
+    },
+#endif
+
+SRST
+  ``info iprs``
+    Show the cpu internal processor registers.
+ERST
+
 #if defined(TARGET_I386)
     {
         .name       = "lapic",
@@ -196,7 +213,8 @@ SRST
 ERST
 
 #if defined(TARGET_I386) || defined(TARGET_SH4) || defined(TARGET_SPARC) || \
-    defined(TARGET_PPC) || defined(TARGET_XTENSA) || defined(TARGET_M68K)
+    defined(TARGET_PPC) || defined(TARGET_XTENSA) || defined(TARGET_M68K) || \
+    defined(TARGET_ALPHA)
     {
         .name       = "tlb",
         .args_type  = "",
