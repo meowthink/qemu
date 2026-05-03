@@ -1,4 +1,37 @@
 # See docs/devel/tracing.rst for syntax documentation.
 
-# pci.c
-alpha_pci_iack_write(void) ""
+# rmc.c
+es40_rmc_write(uint32_t addr, uint32_t val) "addr=0x%x val=0x%x "
+es40_rmc_read(uint32_t addr, uint32_t val) "addr=0x%x val=0x%x "
+es40_rmc_command(const char *cmd, uint8_t len, uint16_t addr) "cmd=%s len=%u addr=0x%04x"
+es40_rmc_set_cpu_on(int cpuid, uint64_t entry) "cpuid=%d entry=0x%" PRIx64
+es40_rmc_display(const char *text) "text='%-16.16s'"
+
+# tsunami.c
+tsunami_pchip_set_irq(int index, int irq, int level) "index=%d irq=%d level=%d"
+tsunami_pchip_write(int index, const char *region, uint64_t addr, uint64_t val, unsigned len) "index=%u region=%s addr=0x%"PRIx64 " val=0x%"PRIx64 " len=%u"
+tsunami_pchip_read(int index, const char *region, uint64_t addr, uint64_t val, unsigned len) "index=%u region=%s addr=0x%"PRIx64 " val=0x%"PRIx64 " len=%u"
+tsunami_cchip_arbitration_clear(int cpuid) "cpuid=%d"
+tsunami_cchip_arbitration_try(int cpuid, const char *status) "cpuid=%d status=%s"
+tsunami_cchip_write(uint64_t addr, uint64_t val, unsigned len) "addr=0x%"PRIx64 " val=0x%"PRIx64 " len=%u"
+tsunami_cchip_read(uint64_t addr, uint64_t val, unsigned len) "addr=0x%"PRIx64 " val=0x%"PRIx64 " len=%u"
+tsunami_dchip_write(uint64_t addr, uint64_t val, unsigned len) "addr=0x%"PRIx64 " val=0x%"PRIx64 " len=%u"
+tsunami_dchip_read(uint64_t addr, uint64_t val, unsigned len) "addr=0x%"PRIx64 " val=0x%"PRIx64 " len=%u"
+tsunami_blackhole_write(uint64_t addr, uint64_t val, unsigned len) "addr=0x%"PRIx64 " val=0x%"PRIx64 " len=%u"
+tsunami_device_irq_update(int irq, int level) "irq=%d level=%d"
+tsunami_timer_irq_update(int cpu, int level) "cpu=%d level=%d"
+tsunami_ipi_irq_update(int cpu, int level) "cpu=%d level=%d"
+tsunami_devsup_irq_set(int cpu) "cpu=%d"
+tsunami_devsup_irq_trigger(void) ""
+tsunami_iommu_translate_abort(const char *n, uint64_t iova) "%s translation abort on iova=0x%" PRIx64
+tsunami_iommu_translate_success(const char *n, uint64_t iova, uint64_t translated) "%s translation success iova=0x%" PRIx64 " translated=0x%" PRIx64
+tsunami_iommu_invalid_pte(uint64_t pte) "pte=0x%" PRIx64
+tsunami_iommu_get_pte(uint64_t pte_addr, uint64_t pte) "pte_addr=0x%" PRIx64 " pte=0x%" PRIx64
+
+# tigbus.c
+tigbus_unassigned_read(uint64_t addr, int size) "reading unassigned addr 0x%"PRIx64 " size %d"
+tigbus_unassigned_write(uint64_t addr, uint64_t val, int size) "writing unassigned addr 0x%"PRIx64 " value 0x%"PRIx64 " size %d"
+
+# tigcontrol.c
+tig_control_write(uint64_t addr, uint64_t val, unsigned len) "addr=0x%"PRIx64 " val=0x%"PRIx64 " len=%u"
+tig_control_read(uint64_t addr, uint64_t val, unsigned len) "addr=0x%"PRIx64 " val=0x%"PRIx64 " len=%u"
