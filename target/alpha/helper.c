@@ -2276,7 +2276,13 @@ static uint64_t ev6_va_form(CPUAlphaState *env, bool ifetch)
     case 0b01: /* VA_48 = 1, VA_FORM_32 = 0 */
         vaddr = sextract64(vaddr, 0, 48) & TARGET_PAGE_MASK;
         ret = vptb & R_EV6_VA_FORM_48_VPTB_MASK;
-        ret |= ((vaddr >> 13) << 3) & R_EV6_VA_FORM_48_VA_MASK;
+        ret |= ((vaddr >> 13) << 3) &
+               (R_EV6_VA_FORM_48_VA_MASK |
+                R_EV6_VA_FORM_48_VA_SEXT0_MASK |
+                R_EV6_VA_FORM_48_VA_SEXT1_MASK |
+                R_EV6_VA_FORM_48_VA_SEXT2_MASK |
+                R_EV6_VA_FORM_48_VA_SEXT3_MASK |
+                R_EV6_VA_FORM_48_VA_SEXT4_MASK);
         break;
     case 0b10: /* VA_48 = 0, VA_FORM_32 = 1 */
         vaddr = extract64(vaddr, 0, 32) & TARGET_PAGE_MASK;
