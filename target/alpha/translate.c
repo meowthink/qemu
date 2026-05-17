@@ -290,6 +290,30 @@ static void gen_set_rounding_mode(DisasContext *s, int fn11)
     gen_helper_set_rounding_mode(tcg_env, tmp);
 }
 
+/*
+ * Fix: gen_set_flush_zero logic was completely inverted.
+ * 
+ * The /U qualifier on IEEE FP instructions enables underflow trapping.
+ * When /U is SET (QUAL_U != 0):
+ *   - Underflow traps ARE enabled
+ *   - The instruction will raise an arithmetic trap on underflow
+ *   - Results should NOT be flushed to zero silently; the trap
+ *     handler decides what to do
+ *   - Therefore flush_to_zero = 0
+ *
+ * When /U is CLEAR (QUAL_U == 0):
+ *   - Underflow traps are disabled
+ *   - Underflowed results may be silently flushed to zero per FPCR.UNDZ
+ *   - Therefore flush_to_zero = fpcr_flush_to_zero (from FPCR.UNDZ)
+ *
+ * The original code had this backwards: it forced flush_to_zero=1 when
+ * underflow traps were DISABLED (/U clear), and read FPCR when they were
+ * ENABLED (/U set). This caused:
+ *   - Instructions without /U to always flush to zero (ignoring FPCR.UNDZ)
+ *   - Instructions with /U to sometimes flush when they should trap
+ * Both behaviors are wrong and cause incorrect results in programs that
+ * rely on proper underflow/denormal handling (Pinball physics, IE layout).
+ */
 static void gen_set_flush_zero(DisasContext *s, int fn11)
 {
     TCGv_i32 tmp;
@@ -302,11 +326,17 @@ static void gen_set_flush_zero(DisasContext *s, int fn11)
     tmp = tcg_temp_new_i32();
     s->tb_ftz = fn11;
     if (s->tb_ftz) {
-        /* Underflow is enabled, use the FPCR setting. */
-        tmp = load_cpu_field(fpcr_flush_to_zero);
+        /*
+         * /U is set: underflow trapping is enabled.
+         * Do not flush to zero - let the exception fire.
+         */
+        tcg_gen_movi_i32(tmp, 0);
     } else {
-        /* Underflow is disabled, force flush-to-zero. */
-        tcg_gen_movi_i32(tmp, 1);
+        /*
+         * /U is clear: underflow trapping is disabled.
+         * Use the FPCR.UNDZ setting to determine whether to flush.
+         */
+        tmp = load_cpu_field(fpcr_flush_to_zero);
     }
 
     gen_helper_set_flush_zero(tcg_env, tmp);
@@ -471,13 +501,30 @@ static void gen_stt(DisasContext *s, TCGv_i64 src, TCGv_i64 addr)
                         MO_LEUQ | MO_ALIGN);
 }
 
+/*
+ * Fix: gen_ieee_unop was reading from the INTEGER register file
+ * (read_cpu_reg) instead of the FLOATING POINT register file (read_fpu_reg).
+ *
+ * All unary IEEE FP operations (sqrts, sqrtt, cvtts, cvtst, cvttq,
+ * cvtql, cvtqs, cvtqt) use FP register rb as their source operand.
+ * Using read_cpu_reg reads from cpu_ir[] (the integer registers),
+ * returning completely wrong data - whatever integer value happens to
+ * be in register rb, not the floating point value.
+ *
+ * This is almost certainly the primary cause of crashes in Pinball
+ * (sqrt operations on physics values) and Internet Explorer (float
+ * conversions in layout/rendering code), as every single-operand
+ * FP instruction was operating on garbage data.
+ * Note that this was what was likely causing the FP crashes in Pinball
+ * and IE prior to the patch
+ */
 static void gen_ieee_unop(DisasContext *s, IeeeUnaryFn *helper,
                           int rb, int rc, int fn11)
 {
     TCGv_i64 vb, vc;
     TCGv_i32 qual;
 
-    vb = read_cpu_reg(s, rb);
+    vb = read_fpu_reg(s, rb);          /* Fix #8: was read_cpu_reg */
     vc = fpu_reg(s, rc);
     qual = tcg_constant_i32(fn11 & QUAL_MASK);
     gen_set_rounding_mode(s, fn11);
@@ -502,6 +549,18 @@ static void gen_ieee_binop(DisasContext *s, IeeeBinaryFn *helper,
     gen_helper_check_float_exceptions(tcg_env, qual);
 }
 
+/*
+ * Fix: gen_ieee_compare was missing gen_set_flush_zero.
+ *
+ * Comparison instructions can receive denormal inputs. Without
+ * configuring flush_to_zero to match the current FPCR/qualifier
+ * state, the ieee_input() path in fpu_helper.c may behave
+ * inconsistently when FPCR_DNZ is set - denormal inputs might
+ * not be squashed to zero as expected, leading to incorrect
+ * comparison results (e.g., NaN comparisons returning wrong
+ * ordering, denormal values comparing unequal to zero when
+ * they should compare equal after flushing).
+ */
 static void gen_ieee_compare(DisasContext *s, IeeeCompareFn *helper,
                              int ra, int rb, int rc, int fn11)
 {
@@ -513,6 +572,7 @@ static void gen_ieee_compare(DisasContext *s, IeeeCompareFn *helper,
     vc = fpu_reg(s, rc);
     qual = tcg_constant_i32(fn11 & QUAL_MASK);
     gen_set_rounding_mode(s, fn11);
+    gen_set_flush_zero(s, fn11);        /* Fix #10: was missing */
     (*helper)(vc, tcg_env, va, vb, qual);
     gen_helper_check_float_exceptions(tcg_env, qual);
 }
@@ -673,13 +733,22 @@ static void gen_stg(DisasContext *s, TCGv_i64 src, TCGv_i64 addr)
                         MO_LEUQ | MO_ALIGN);
 }
 
+/*
+ * Fix: gen_vax_unop had the same wrong register file bug as
+ * gen_ieee_unop: it was using read_cpu_reg (integer registers)
+ * instead of read_fpu_reg (FP registers) for the source operand.
+ *
+ * VAX FP unary operations (sqrtf, sqrtg) read their source from
+ * an FP register. Using read_cpu_reg returned the integer register
+ * value instead, producing completely wrong sqrt inputs.
+ */
 static void gen_vax_unop(DisasContext *s, VaxUnaryFn *helper,
                           int rb, int rc, int fn11)
 {
     TCGv_i64 vb, vc;
     TCGv_i32 qual;
 
-    vb = read_cpu_reg(s, rb);
+    vb = read_fpu_reg(s, rb);          /* Fix #9: was read_cpu_reg */
     vc = fpu_reg(s, rc);
     qual = tcg_constant_i32(fn11 & QUAL_MASK);
     gen_set_rounding_mode(s, fn11);
