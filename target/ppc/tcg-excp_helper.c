@@ -503,6 +503,10 @@ static void do_rfi(CPUPPCState *env, target_ulong nip, target_ulong msr)
         msr &= ~(1ULL << MSR_TGPR);
     }
 
+    /* MSR:ILE is untouched by any form of rfi */
+    msr &= ~(1ULL << MSR_ILE);
+    msr |= (env->msr & (1ULL << MSR_ILE));
+
 #ifdef TARGET_PPC64
     /* Switching to 32-bit ? Crop the nip */
     if (!msr_is_64bit(env, msr)) {
