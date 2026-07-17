@@ -76,7 +76,11 @@ static inline target_ulong ppc_hash32_load_hpte0(PowerPCCPU *cpu,
 {
     target_ulong base = ppc_hash32_hpt_base(cpu);
 
-    return ldl_phys(CPU(cpu)->as, base + pte_offset);
+    if (cpu->env.bytelaneswap) {
+        return bswap32(ldl_phys(CPU(cpu)->as, (base + pte_offset) ^ 4));
+    } else {
+        return ldl_phys(CPU(cpu)->as, base + pte_offset);
+    }
 }
 
 static inline target_ulong ppc_hash32_load_hpte1(PowerPCCPU *cpu,
@@ -84,7 +88,11 @@ static inline target_ulong ppc_hash32_load_hpte1(PowerPCCPU *cpu,
 {
     target_ulong base = ppc_hash32_hpt_base(cpu);
 
-    return ldl_phys(CPU(cpu)->as, base + pte_offset + HASH_PTE_SIZE_32 / 2);
+    if (cpu->env.bytelaneswap) {
+        return bswap32(ldl_phys(CPU(cpu)->as, (base + pte_offset + HASH_PTE_SIZE_32 / 2) ^ 4));
+    } else {
+        return ldl_phys(CPU(cpu)->as, base + pte_offset + HASH_PTE_SIZE_32 / 2);
+    }
 }
 
 static inline void ppc_hash32_store_hpte0(PowerPCCPU *cpu,
@@ -92,7 +100,11 @@ static inline void ppc_hash32_store_hpte0(PowerPCCPU *cpu,
 {
     target_ulong base = ppc_hash32_hpt_base(cpu);
 
-    stl_phys(CPU(cpu)->as, base + pte_offset, pte0);
+    if (cpu->env.bytelaneswap) {
+        stl_phys(CPU(cpu)->as, (base + pte_offset) ^ 4, bswap32(pte0));
+    } else {
+        stl_phys(CPU(cpu)->as, base + pte_offset, pte0);
+    }
 }
 
 static inline void ppc_hash32_store_hpte1(PowerPCCPU *cpu,
@@ -100,7 +112,11 @@ static inline void ppc_hash32_store_hpte1(PowerPCCPU *cpu,
 {
     target_ulong base = ppc_hash32_hpt_base(cpu);
 
-    stl_phys(CPU(cpu)->as, base + pte_offset + HASH_PTE_SIZE_32 / 2, pte1);
+    if (cpu->env.bytelaneswap) {
+        stl_phys(CPU(cpu)->as, (base + pte_offset + HASH_PTE_SIZE_32 / 2) ^ 4, bswap32(pte1));
+    } else {
+        stl_phys(CPU(cpu)->as, base + pte_offset + HASH_PTE_SIZE_32 / 2, pte1);
+    }
 }
 
 static inline hwaddr get_pteg_offset32(PowerPCCPU *cpu, hwaddr hash)

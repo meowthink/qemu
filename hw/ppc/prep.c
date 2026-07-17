@@ -237,7 +237,7 @@ static void ibm_40p_init(MachineState *machine)
     CPUPPCState *env = NULL;
     uint16_t cmos_checksum;
     PowerPCCPU *cpu;
-    DeviceState *dev, *i82378_dev;
+    DeviceState *dev, *i82378_dev, *raven_dev;
     SysBusDevice *pcihost, *s;
     Nvram *m48t59 = NULL;
     PCIBus *pci_bus;
@@ -290,7 +290,7 @@ static void ibm_40p_init(MachineState *machine)
     g_free(filename);
 
     /* PCI host */
-    dev = qdev_new("raven-pcihost");
+    raven_dev = dev = qdev_new("raven-pcihost");
     pcihost = SYS_BUS_DEVICE(dev);
     object_property_add_child(qdev_get_machine(), "raven", OBJECT(dev));
     sysbus_realize_and_unref(pcihost, &error_fatal);
@@ -315,6 +315,7 @@ static void ibm_40p_init(MachineState *machine)
     qdev_prop_set_uint32(dev, "ibm-planar-id", 0xfc);
     qdev_prop_set_uint32(dev, "equipment", 0xc0);
     isa_realize_and_unref(isa_dev, isa_bus, &error_fatal);
+    qdev_connect_gpio_out(dev, 0, qdev_get_gpio_in(raven_dev, 0));
 
     /* Memory controller */
     isa_dev = isa_new("rs6000-mc");

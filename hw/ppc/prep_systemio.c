@@ -35,6 +35,7 @@
 #include "system/runstate.h"
 #include "cpu.h"
 #include "trace.h"
+#include "exec/tb-flush.h"
 
 #define TYPE_PREP_SYSTEMIO "prep-systemio"
 OBJECT_DECLARE_SIMPLE_TYPE(PrepSystemIoState, PREP_SYSTEMIO)
@@ -72,12 +73,12 @@ static void prep_port0092_write(void *opaque, uint32_t addr, uint32_t val)
     s->sreset = val & PORT0092_SOFTRESET;
     qemu_set_irq(s->softreset_irq, s->sreset);
 
-    if ((val & PORT0092_LE_MODE) != 0) {
-        /* XXX Not supported yet */
-        error_report("little-endian mode not supported");
-        vm_stop(RUN_STATE_PAUSED);
-    } else {
-        /* Nothing to do */
+    if ((val & ~PORT0092_LE_MODE) == 0) {
+        PowerPCCPU *cpu = POWERPC_CPU(first_cpu);
+        CPUPPCState *env = &cpu->env;
+        env->bytelaneswap = val & PORT0092_LE_MODE ? true : false;
+        queue_tb_flush(first_cpu);
+        cpu_exit(first_cpu);
     }
 }
 
