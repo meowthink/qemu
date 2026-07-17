@@ -1305,6 +1305,10 @@ struct CPUArchState {
     target_ulong msr;      /* machine state register */
     target_ulong tgpr[4];  /* temporary general purpose registers, */
                            /* used to speed-up TLB assist handlers */
+    /* PReP has byte lane swapper, but it is optimal to implement such
+       fuction in CPU, as address munging (MSR[LE] in 6xx 7xx) + byte
+       lane swapping + alignment access = true litten endian */
+    bool bytelaneswap;
 
     target_ulong nip;      /* next instruction pointer */
 

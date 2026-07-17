@@ -171,7 +171,7 @@ struct DisasContext {
     target_ulong cia;  /* current instruction address */
     uint32_t opcode;
     /* Routine used to access memory */
-    bool pr, hv, dr, le_mode;
+    bool pr, hv, dr, le_mode, bytelaneswap;
     bool lazy_tlb_flush;
     bool need_access_type;
     int mem_idx;
@@ -212,7 +212,13 @@ struct DisasContext {
 /* Return true if address swizzling required */
 static inline bool need_addrswizzle_le(const DisasContext *ctx)
 {
-    return ctx->le_mode && true;
+    /* Here is the hack for everything before PPC_64B:
+     * since le_mode is set by MSR[LE], judge by bytelaneswap
+     *     true: pure le_mode
+     *     false: be_mode with address swizzled
+     */
+    return ctx->le_mode && !ctx->bytelaneswap &&
+           !(ctx->insns_flags & PPC_64B);
 }
 
 static inline bool is_ppe(const DisasContext *ctx)
@@ -4360,7 +4366,7 @@ static void gen_mtmsr(DisasContext *ctx)
         /* L=1 form only updates EE and RI */
         mask &= (1ULL << MSR_RI) | (1ULL << MSR_EE);
     } else {
-        if (likely(!(ctx->insns_flags2 & PPC2_PPE42))) {
+        if (likely(!(ctx->insns_flags2 & PPC2_PPE42)) && (ctx->insns_flags & PPC_64B)) {
             /* mtmsr does not alter S, ME, or LE */
             mask &= ~((1ULL << MSR_LE) | (1ULL << MSR_ME) | (1ULL << MSR_S));
         }
@@ -6613,6 +6619,7 @@ static void ppc_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->access_type = -1;
     ctx->need_access_type = !mmu_is_64bit(env->mmu_model);
     ctx->le_mode = (hflags >> HFLAGS_LE) & 1;
+    ctx->bytelaneswap = env->bytelaneswap;
     ctx->default_tcg_memop_mask = (!need_addrswizzle_le(ctx) &&
                                    ctx->le_mode) ? MO_LE : MO_BE;
     ctx->flags = env->flags;
