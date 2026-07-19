@@ -203,6 +203,8 @@ struct DisasContext {
     uint64_t insns_flags;
     uint64_t insns_flags2;
 };
+static int bytelaneswap_latch;
+#define NUM_LATCHES 2
 
 #define DISAS_EXIT         DISAS_TARGET_0  /* exit to main loop, pc updated */
 #define DISAS_EXIT_UPDATE  DISAS_TARGET_1  /* exit to main loop, pc stale */
@@ -6619,7 +6621,9 @@ static void ppc_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->access_type = -1;
     ctx->need_access_type = !mmu_is_64bit(env->mmu_model);
     ctx->le_mode = (hflags >> HFLAGS_LE) & 1;
-    ctx->bytelaneswap = env->bytelaneswap;
+    if (bytelaneswap_latch == NUM_LATCHES) {
+        ctx->bytelaneswap = env->bytelaneswap;
+    }
     ctx->default_tcg_memop_mask = (!need_addrswizzle_le(ctx) &&
                                    ctx->le_mode) ? MO_LE : MO_BE;
     ctx->flags = env->flags;
@@ -6718,6 +6722,16 @@ static void ppc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     /* End the TB when crossing a page boundary. */
     if (ctx->base.is_jmp == DISAS_NEXT && !(pc & ~TARGET_PAGE_MASK)) {
         ctx->base.is_jmp = DISAS_TOO_MANY;
+    }
+
+    /* Let byte lane swap latches NUM_LATCHES instructions */
+    if (unlikely(ctx->bytelaneswap != env->bytelaneswap)) {
+        if (bytelaneswap_latch >= NUM_LATCHES) {
+            bytelaneswap_latch = 1;
+        } else {
+            bytelaneswap_latch ++;
+        }
+        ctx->base.is_jmp = DISAS_EXIT_UPDATE;
     }
 }
 
