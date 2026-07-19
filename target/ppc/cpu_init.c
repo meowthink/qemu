@@ -7248,6 +7248,9 @@ static void ppc_cpu_reset_hold(Object *obj, ResetType type)
         pcc->parent_phases.hold(obj, type);
     }
 
+    env->bytelaneswap = false;
+    env->bytelaneswap_latch = 0;
+
     msr = (target_ulong)0;
     if (!(env->flags & POWERPC_FLAG_PPE42)) {
         msr |= (target_ulong)MSR_HVB;
