@@ -76,9 +76,11 @@ static void prep_port0092_write(void *opaque, uint32_t addr, uint32_t val)
     if ((val & ~PORT0092_LE_MODE) == 0) {
         PowerPCCPU *cpu = POWERPC_CPU(first_cpu);
         CPUPPCState *env = &cpu->env;
-        env->bytelaneswap = val & PORT0092_LE_MODE ? true : false;
-        queue_tb_flush(first_cpu);
-        cpu_exit(first_cpu);
+        if (env->bytelaneswap != !!(val & PORT0092_LE_MODE)) {
+            env->bytelaneswap_latch = 2;
+            queue_tb_flush(first_cpu);
+            cpu_exit(first_cpu);
+        }
     }
 }
 
