@@ -3628,6 +3628,7 @@ if have_system
     'hw/input',
     'hw/intc',
     'hw/isa',
+    'hw/m68k',
     'hw/mem',
     'hw/mips',
     'hw/misc',

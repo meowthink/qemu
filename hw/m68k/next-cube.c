@@ -33,6 +33,7 @@
 #include "ui/console.h"
 #include "target/m68k/cpu.h"
 #include "migration/vmstate.h"
+#include "trace.h"
 
 /* #define DEBUG_NEXT */
 #ifdef DEBUG_NEXT
@@ -45,6 +46,11 @@
 #define ENTRY       0x0100001e
 #define RAM_SIZE    0x4000000
 #define ROM_FILE    "Rev_2.5_v66.bin"
+
+#define NEXT_DMA_BASE        0x02000000
+#define NEXT_SCSI_BASE       0x02114000
+#define NEXT_SCSI_CSR_OFFSET 0x20
+#define NEXT_SCSI_CSR_BASE   (NEXT_SCSI_BASE + NEXT_SCSI_CSR_OFFSET)
 
 
 #define TYPE_NEXT_RTC "next-rtc"
@@ -68,6 +74,12 @@ struct NeXTRTC {
 #define TYPE_NEXT_SCSI "next-scsi"
 OBJECT_DECLARE_SIMPLE_TYPE(NeXTSCSI, NEXT_SCSI)
 
+typedef struct NeXTTraceReadSampler {
+    hwaddr addr;
+    uint64_t value;
+    uint64_t repeats;
+} NeXTTraceReadSampler;
+
 /* NeXT SCSI Controller */
 struct NeXTSCSI {
     SysBusDevice parent_obj;
@@ -79,6 +91,8 @@ struct NeXTSCSI {
     MemoryRegion scsi_csr_mem;
     uint8_t scsi_csr_1;
     uint8_t scsi_csr_2;
+
+    NeXTTraceReadSampler trace_csr_read;
 };
 
 #define TYPE_NEXT_PC "next-pc"
@@ -145,6 +159,8 @@ struct NeXTState {
     MemoryRegion bmapm2;
 
     next_dma dma[10];
+
+    NeXTTraceReadSampler trace_scsi_dma_read;
 };
 
 /* Thanks to NeXT forums for this */
@@ -302,10 +318,28 @@ static const MemoryRegionOps next_mmio_ops = {
 #define NEXTDMA_NEXT_INIT    0x4200
 #define NEXTDMA_SIZE         0x4204
 
+static bool next_trace_read_sample(NeXTTraceReadSampler *sampler,
+                                   hwaddr addr, uint64_t value)
+{
+    if (sampler->repeats && sampler->addr == addr &&
+        sampler->value == value) {
+        if (sampler->repeats != UINT64_MAX) {
+            sampler->repeats++;
+        }
+    } else {
+        sampler->addr = addr;
+        sampler->value = value;
+        sampler->repeats = 1;
+    }
+
+    return !(sampler->repeats & (sampler->repeats - 1));
+}
+
 static void next_dma_write(void *opaque, hwaddr addr, uint64_t val,
                            unsigned int size)
 {
     NeXTState *next_state = NEXT_MACHINE(opaque);
+    bool scsi_reg = false;
 
     switch (addr) {
     case NEXTDMA_ENRX(NEXTDMA_CSR):
@@ -344,6 +378,7 @@ static void next_dma_write(void *opaque, hwaddr addr, uint64_t val,
         break;
 
     case NEXTDMA_SCSI(NEXTDMA_CSR):
+        scsi_reg = true;
         if (val & DMA_DEV2M) {
             next_state->dma[NEXTDMA_SCSI].csr |= DMA_DEV2M;
         }
@@ -368,26 +403,39 @@ static void next_dma_write(void *opaque, hwaddr addr, uint64_t val,
 
     case NEXTDMA_SCSI(NEXTDMA_NEXT):
         next_state->dma[NEXTDMA_SCSI].next = val;
+        scsi_reg = true;
         break;
 
     case NEXTDMA_SCSI(NEXTDMA_LIMIT):
         next_state->dma[NEXTDMA_SCSI].limit = val;
+        scsi_reg = true;
         break;
 
     case NEXTDMA_SCSI(NEXTDMA_START):
         next_state->dma[NEXTDMA_SCSI].start = val;
+        scsi_reg = true;
         break;
 
     case NEXTDMA_SCSI(NEXTDMA_STOP):
         next_state->dma[NEXTDMA_SCSI].stop = val;
+        scsi_reg = true;
         break;
 
     case NEXTDMA_SCSI(NEXTDMA_NEXT_INIT):
         next_state->dma[NEXTDMA_SCSI].next_initbuf = val;
+        scsi_reg = true;
         break;
 
     default:
         DPRINTF("DMA write @ %x w/ %x\n", (unsigned)addr, (unsigned)val);
+    }
+
+    if (scsi_reg) {
+        next_dma *dma = &next_state->dma[NEXTDMA_SCSI];
+
+        trace_next_scsi_dma_reg_write(NEXT_DMA_BASE + addr, val, dma->csr,
+                                      dma->next, dma->next_initbuf,
+                                      dma->limit, dma->start, dma->stop);
     }
 }
 
@@ -395,11 +443,13 @@ static uint64_t next_dma_read(void *opaque, hwaddr addr, unsigned int size)
 {
     NeXTState *next_state = NEXT_MACHINE(opaque);
     uint64_t val;
+    bool scsi_reg = false;
 
     switch (addr) {
     case NEXTDMA_SCSI(NEXTDMA_CSR):
         DPRINTF("SCSI DMA CSR READ\n");
         val = next_state->dma[NEXTDMA_SCSI].csr;
+        scsi_reg = true;
         break;
 
     case NEXTDMA_ENRX(NEXTDMA_CSR):
@@ -420,22 +470,27 @@ static uint64_t next_dma_read(void *opaque, hwaddr addr, unsigned int size)
 
     case NEXTDMA_SCSI(NEXTDMA_NEXT):
         val = next_state->dma[NEXTDMA_SCSI].next;
+        scsi_reg = true;
         break;
 
     case NEXTDMA_SCSI(NEXTDMA_NEXT_INIT):
         val = next_state->dma[NEXTDMA_SCSI].next_initbuf;
+        scsi_reg = true;
         break;
 
     case NEXTDMA_SCSI(NEXTDMA_LIMIT):
         val = next_state->dma[NEXTDMA_SCSI].limit;
+        scsi_reg = true;
         break;
 
     case NEXTDMA_SCSI(NEXTDMA_START):
         val = next_state->dma[NEXTDMA_SCSI].start;
+        scsi_reg = true;
         break;
 
     case NEXTDMA_SCSI(NEXTDMA_STOP):
         val = next_state->dma[NEXTDMA_SCSI].stop;
+        scsi_reg = true;
         break;
 
     default:
@@ -447,6 +502,21 @@ static uint64_t next_dma_read(void *opaque, hwaddr addr, unsigned int size)
      * once the csr's are done, subtract 0x3FEC from the addr, and that will
      * normalize the upper registers
      */
+
+    if (scsi_reg &&
+        trace_event_get_state_backends(TRACE_NEXT_SCSI_DMA_REG_READ)) {
+        hwaddr trace_addr = NEXT_DMA_BASE + addr;
+
+        if (next_trace_read_sample(&next_state->trace_scsi_dma_read,
+                                   trace_addr, val)) {
+            next_dma *dma = &next_state->dma[NEXTDMA_SCSI];
+
+            trace_next_scsi_dma_reg_read(
+                trace_addr, val, dma->csr, dma->next, dma->next_initbuf,
+                dma->limit, dma->start, dma->stop,
+                next_state->trace_scsi_dma_read.repeats);
+        }
+    }
 
     return val;
 }
@@ -558,6 +628,11 @@ static void next_irq(void *opaque, int number, int level)
         s->int_status &= ~(1 << shift);
         cpu_reset_interrupt(CPU(cpu), CPU_INTERRUPT_HARD);
     }
+
+    if (number == NEXT_SCSI_I || number == NEXT_SCSI_DMA_I) {
+        trace_next_scsi_irq(number == NEXT_SCSI_I ? "esp" : "dma", level,
+                            s->int_status, s->int_mask, cpu->env.pc);
+    }
 }
 
 static void nextdma_write(void *opaque, uint8_t *buf, int size, int type)
@@ -565,6 +640,7 @@ static void nextdma_write(void *opaque, uint8_t *buf, int size, int type)
     uint32_t base_addr;
     int irq = 0;
     uint8_t align = 16;
+    int requested = size;
     NeXTState *next_state = NEXT_MACHINE(qdev_get_machine());
 
     if (type == NEXTDMA_ENRX || type == NEXTDMA_ENTX) {
@@ -585,6 +661,12 @@ static void nextdma_write(void *opaque, uint8_t *buf, int size, int type)
     } else {
         base_addr = next_state->dma[type].next_initbuf;
     }
+
+    trace_next_scsi_dma_transfer(
+        "entry", requested, size, base_addr,
+        next_state->dma[type].csr, next_state->dma[type].next,
+        next_state->dma[type].next_initbuf, next_state->dma[type].limit,
+        next_state->dma[type].saved_next, next_state->dma[type].saved_limit);
 
     physical_memory_write(base_addr, buf, size);
 
@@ -607,6 +689,12 @@ static void nextdma_write(void *opaque, uint8_t *buf, int size, int type)
 
     /* Set dma registers and raise an irq */
     next_state->dma[type].csr |= DMA_COMPLETE; /* DON'T CHANGE THIS! */
+
+    trace_next_scsi_dma_transfer(
+        "complete", requested, size, base_addr,
+        next_state->dma[type].csr, next_state->dma[type].next,
+        next_state->dma[type].next_initbuf, next_state->dma[type].limit,
+        next_state->dma[type].saved_next, next_state->dma[type].saved_limit);
 
     switch (type) {
     case NEXTDMA_SCSI:
@@ -635,9 +723,11 @@ static void next_scsi_csr_write(void *opaque, hwaddr addr, uint64_t val,
 {
     NeXTSCSI *s = NEXT_SCSI(opaque);
     NeXTPC *pc = NEXT_PC(container_of(s, NeXTPC, next_scsi));
+    uint8_t old;
 
     switch (addr) {
     case 0:
+        old = s->scsi_csr_1;
         if (val & SCSICSR_FIFOFL) {
             DPRINTF("SCSICSR FIFO Flush\n");
             /* will have to add another irq to the esp if this is needed */
@@ -696,11 +786,21 @@ static void next_scsi_csr_write(void *opaque, hwaddr addr, uint64_t val,
             /* s->scsi_csr_1 |= 0x80; */
         }
         DPRINTF("SCSICSR1 Write: %"PRIx64 "\n", val);
+        trace_next_scsi_csr_write(
+            NEXT_SCSI_CSR_BASE + addr, old, val,
+            !!(val & SCSICSR_ENABLE),
+            !!(val & SCSICSR_RESET), !!(val & SCSICSR_FIFOFL),
+            !!(val & SCSICSR_DMADIR), !!(val & SCSICSR_CPUDMA),
+            !!(val & SCSICSR_INTMASK));
         s->scsi_csr_1 = val;
         break;
 
     case 1:
+        old = s->scsi_csr_2;
         DPRINTF("SCSICSR2 Write: %"PRIx64 "\n", val);
+        trace_next_scsi_csr_write(
+            NEXT_SCSI_CSR_BASE + addr, old, val,
+            0, 0, 0, 0, 0, 0);
         s->scsi_csr_2 = val;
         break;
 
@@ -727,6 +827,15 @@ static uint64_t next_scsi_csr_read(void *opaque, hwaddr addr, unsigned size)
 
     default:
         g_assert_not_reached();
+    }
+
+    if (trace_event_get_state_backends(TRACE_NEXT_SCSI_CSR_READ)) {
+        hwaddr trace_addr = NEXT_SCSI_CSR_BASE + addr;
+
+        if (next_trace_read_sample(&s->trace_csr_read, trace_addr, val)) {
+            trace_next_scsi_csr_read(trace_addr, val,
+                                     s->trace_csr_read.repeats);
+        }
     }
 
     return val;
@@ -780,7 +889,8 @@ static void next_scsi_realize(DeviceState *dev, Error **errp)
                                 sysbus_mmio_get_region(sbd, 0));
 
     /* SCSI CSRs */
-    memory_region_add_subregion(&s->scsi_mem, 0x20, &s->scsi_csr_mem);
+    memory_region_add_subregion(&s->scsi_mem, NEXT_SCSI_CSR_OFFSET,
+                                &s->scsi_csr_mem);
 
     scsi_bus_legacy_handle_cmdline(&s->sysbus_esp.esp.bus);
 }
@@ -1297,7 +1407,7 @@ static void next_cube_init(MachineState *machine)
     empty_slot_init("next.unknown.1", 0x02112000, 0x10);
 
     /* SCSI */
-    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 2, 0x02114000);
+    sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 2, NEXT_SCSI_BASE);
     /* Floppy */
     sysbus_mmio_map(SYS_BUS_DEVICE(pcdev), 3, 0x02114108);
     /* ESCC */
@@ -1354,7 +1464,7 @@ static void next_cube_init(MachineState *machine)
     /* DMA */
     memory_region_init_io(&m->dmamem, NULL, &next_dma_ops, machine,
                           "next.dma", 0x5000);
-    memory_region_add_subregion(sysmem, 0x02000000, &m->dmamem);
+    memory_region_add_subregion(sysmem, NEXT_DMA_BASE, &m->dmamem);
 }
 
 static void next_machine_class_init(ObjectClass *oc, const void *data)
