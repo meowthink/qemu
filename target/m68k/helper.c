@@ -964,10 +964,25 @@ static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
         }
     }
 
+    uint32_t limit_word;
+    bool limited;
+
     rp = ((access_type & ACCESS_SUPER) && (tc & M68K_TC030_SRE))
          ? env->mmu.srp030 : env->mmu.crp030;
     dt = rp[0] & 3;
     table = rp[1] & M68K_DESC030_ADDR;
+
+    /*
+     * Long-format table descriptors (and the root pointer) carry a
+     * 15-bit index limit for the table they point at, with bit 31
+     * selecting lower-limit (1) or upper-limit (0) semantics.  An
+     * index outside the range is a limit violation (bus error).  The
+     * Mac IIsi ROM depends on this: its compact 32-bit map bounds the
+     * RAM level-B table to a single entry with limit 0 and leaves the
+     * rest of the table area as RAM-test garbage.
+     */
+    limit_word = rp[0];
+    limited = true;
 
     is = M68K_TC030_IS(tc);
     shift = 32 - is;
@@ -985,6 +1000,19 @@ static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
         }
         shift -= tw;
         index = (address >> shift) & ((1 << tw) - 1);
+        if (limited) {
+            uint32_t limit = (limit_word >> 16) & 0x7fff;
+
+            if (limit_word & 0x80000000) {
+                if ((uint32_t)index < limit) {
+                    return -1;
+                }
+            } else {
+                if ((uint32_t)index > limit) {
+                    return -1;
+                }
+            }
+        }
         entry = table + index * (dt == M68K_DT_LONG ? 8 : 4);
 
         desc = address_space_ldl(cs->as, entry, MEMTXATTRS_UNSPECIFIED, &txres);
@@ -998,8 +1026,11 @@ static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
                 return -1;
             }
             table = lo & M68K_DESC030_ADDR;
+            limit_word = desc;
+            limited = true;
         } else {
             table = desc & M68K_DESC030_ADDR;
+            limited = false;
         }
         if (desc & M68K_DESC030_WP) {
             wp = 1;
