@@ -699,6 +699,16 @@ static const TCGCPUOps m68k_tcg_ops = {
     .guest_default_memory_order = TCG_MO_ALL,
     .mttcg_supported = false,
 
+    /*
+     * The 68000's prefetch queue is only two words deep: code may
+     * legally store into the instruction stream a few bytes ahead of
+     * the PC and expect the new bytes to execute (TOS 1.04's AES trap
+     * dispatcher patches a moveml register mask six bytes ahead).
+     * Without precise SMC handling the current TB keeps running from
+     * the stale translation.
+     */
+    .precise_smc = true,
+
     .initialize = m68k_tcg_init,
     .translate_code = m68k_translate_code,
     .get_tb_cpu_state = m68k_get_tb_cpu_state,
