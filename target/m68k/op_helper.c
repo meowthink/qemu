@@ -63,8 +63,14 @@ throwaway:
         case 0:
             break;
         case 1:
+            /*
+             * Throwaway frame: restore the SR (which switches back to
+             * the master stack when its M bit is set) and continue the
+             * RTE with the frame on the newly selected stack.
+             */
             env->aregs[7] = sp;
             cpu_m68k_set_sr(env, sr);
+            sp = env->aregs[7];
             goto throwaway;
         case 2:
         case 3:
@@ -473,6 +479,14 @@ static void m68k_interrupt_all(CPUM68KState *env, int is_hw)
         break;
 
     case EXCP_SPURIOUS ... EXCP_INT_LEVEL_7:
+    default:
+        /*
+         * Hardware interrupts taken in master mode push the frame on
+         * the master stack, then switch to the interrupt stack with a
+         * throwaway format 1 frame.  This applies to vectored device
+         * interrupts as well (the exception index is the raw vector
+         * number then), not only to the autovectored ones.
+         */
         if (is_hw && (oldsr & SR_M)) {
             do_stack_frame(env, &sp, 0, oldsr, 0, env->pc);
             oldsr = sr;
@@ -485,9 +499,6 @@ static void m68k_interrupt_all(CPUM68KState *env, int is_hw)
             do_stack_frame(env, &sp, 1, oldsr, 0, env->pc);
             break;
         }
-        /* fall through */
-
-    default:
         do_stack_frame(env, &sp, 0, oldsr, 0, env->pc);
         break;
     }
