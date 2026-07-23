@@ -5676,6 +5676,9 @@ DISAS_INSN(frestore)
         if (mode == 3) {
             tcg_gen_add_i32(AREG(insn, 0), addr, size);
         }
+    } else if (m68k_feature(s->env, M68K_FEATURE_FPU)) {
+        /* 6888x state is always saved as a NULL frame. */
+        SRC_EA(env, addr, OS_LONG, 0, NULL);
     } else {
         disas_undef(env, s, insn);
     }
@@ -5706,6 +5709,10 @@ DISAS_INSN(fsave)
         if (mode == 3 || mode == 4) {
             tcg_gen_mov_i32(AREG(insn, 0), new_addr);
         }
+    } else if (m68k_feature(s->env, M68K_FEATURE_FPU)) {
+        /* 6888x state is always saved as a NULL frame. */
+        TCGv null = tcg_constant_i32(0x00000000);
+        DEST_EA(env, insn, OS_LONG, null, NULL);
     } else {
         disas_undef(env, s, insn);
     }
