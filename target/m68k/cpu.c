@@ -211,6 +211,8 @@ static void m68k_cpu_initfn(Object *obj)
 
     /* the RESET instruction pulses this; boards wire up their reset */
     qdev_init_gpio_out_named(DEVICE(obj), &cpu->reset_out, "reset-out", 1);
+    /* pulsed with the taken IPL when a hardware interrupt is acked */
+    qdev_init_gpio_out_named(DEVICE(obj), cpu->iack_out, "iack-out", 8);
 }
 #endif
 

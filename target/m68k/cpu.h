@@ -189,6 +189,16 @@ struct ArchCPU {
      * carries on with the next instruction.
      */
     qemu_irq reset_out;
+    /*
+     * Interrupt-acknowledge outputs, one per IPL level: the line for
+     * the level being taken is pulsed when the CPU starts processing a
+     * hardware interrupt (the point where real chips run the IACK bus
+     * cycle).  Boards with interrupt sources that are cleared by the
+     * acknowledge itself - the Atari ST GLUE's VBL/HBL latches and the
+     * MFP 68901's pending-to-in-service handover - wire these up;
+     * boards that leave them unconnected keep plain level semantics.
+     */
+    qemu_irq iack_out[8];
 #endif
 };
 

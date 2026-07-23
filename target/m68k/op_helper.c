@@ -24,6 +24,7 @@
 #include "accel/tcg/cpu-loop.h"
 #include "semihosting/semihost.h"
 #include "qemu/plugin.h"
+#include "hw/core/irq.h"
 
 #if !defined(CONFIG_USER_ONLY)
 
@@ -617,8 +618,20 @@ bool m68k_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
          * this, so we provide/save the vector when the interrupt is
          * first signalled.
          */
+        M68kCPU *cpu = env_archcpu(env);
+        int level = env->pending_level;
+
         cs->exception_index = env->pending_vector;
         do_interrupt_m68k_hardirq(env);
+        /*
+         * The IACK cycle: sources that are cleared by the acknowledge
+         * itself (GLUE VBL/HBL latches, MFP IPR->ISR) hook this.  Run
+         * it after the exception entry so a re-assertion for a lower
+         * or equal channel waits behind the raised SR mask.
+         */
+        if (level > 0 && level < 8 && cpu->iack_out[level]) {
+            qemu_irq_pulse(cpu->iack_out[level]);
+        }
         return true;
     }
     return false;
