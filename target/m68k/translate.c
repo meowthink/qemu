@@ -4653,6 +4653,92 @@ DISAS_INSN(ptest)
     is_read = tcg_constant_i32((insn >> 5) & 1);
     gen_helper_ptest(tcg_env, AREG(insn, 0), is_read);
 }
+
+/*
+ * 68030 on-chip PMMU coprocessor instructions (cp-id 0): PMOVE,
+ * PTEST, PFLUSH, PLOAD.  PMOVE is implemented as plain register
+ * storage, which is enough for firmware register probes; the TLB
+ * operations are no-ops since 030 translation is not implemented.
+ */
+DISAS_INSN(pmmu030)
+{
+    uint16_t ext;
+    TCGv addr, tmp;
+    int index = IS_USER(s);
+    int reg_to_mem, preg;
+    int ofs = -1, ofs2 = -1;
+    int opsize = OS_LONG;
+
+    if (IS_USER(s)) {
+        gen_exception(s, s->base.pc_next, EXCP_PRIVILEGE);
+        return;
+    }
+    ext = read_im16(env, s);
+    reg_to_mem = (ext >> 9) & 1;
+    preg = (ext >> 10) & 7;
+
+    switch (ext >> 13) {
+    case 0: /* PMOVE to/from TT0/TT1 */
+        if (preg == 2) {
+            ofs = offsetof(CPUM68KState, mmu.tt030[0]);
+        } else if (preg == 3) {
+            ofs = offsetof(CPUM68KState, mmu.tt030[1]);
+        }
+        break;
+    case 1: /* PFLUSH/PLOAD: no-op, we hold no 030 TLB state */
+        return;
+    case 2: /* PMOVE to/from TC/SRP/CRP */
+        if (preg == 0) {
+            ofs = offsetof(CPUM68KState, mmu.tc030);
+        } else if (preg == 2) {
+            ofs = offsetof(CPUM68KState, mmu.srp030[0]);
+            ofs2 = offsetof(CPUM68KState, mmu.srp030[1]);
+        } else if (preg == 3) {
+            ofs = offsetof(CPUM68KState, mmu.crp030[0]);
+            ofs2 = offsetof(CPUM68KState, mmu.crp030[1]);
+        }
+        break;
+    case 3: /* PMOVE to/from MMUSR (PSR) */
+        if (preg == 0) {
+            ofs = offsetof(CPUM68KState, mmu.mmusr);
+            opsize = OS_WORD;
+        }
+        break;
+    case 4: /* PTEST: report translation valid, no faults */
+        tcg_gen_st_i32(tcg_constant_i32(0), tcg_env,
+                       offsetof(CPUM68KState, mmu.mmusr));
+        return;
+    }
+    if (ofs < 0) {
+        disas_undef(env, s, insn);
+        return;
+    }
+
+    addr = gen_lea(env, s, insn, OS_LONG);
+    if (IS_NULL_QREG(addr)) {
+        gen_addr_fault(s);
+        return;
+    }
+
+    if (reg_to_mem) {
+        tmp = tcg_temp_new();
+        tcg_gen_ld_i32(tmp, tcg_env, ofs);
+        gen_store(s, opsize, addr, tmp, index);
+        if (ofs2 >= 0) {
+            tcg_gen_addi_i32(addr, addr, 4);
+            tcg_gen_ld_i32(tmp, tcg_env, ofs2);
+            gen_store(s, opsize, addr, tmp, index);
+        }
+    } else {
+        tmp = gen_load(s, opsize, addr, 0, index);
+        tcg_gen_st_i32(tmp, tcg_env, ofs);
+        if (ofs2 >= 0) {
+            tcg_gen_addi_i32(addr, addr, 4);
+            tmp = gen_load(s, opsize, addr, 0, index);
+            tcg_gen_st_i32(tmp, tcg_env, ofs2);
+        }
+    }
+}
 #endif
 
 DISAS_INSN(wddata)
@@ -6063,6 +6149,7 @@ void register_m68k_insns (CPUM68KState *env)
     INSN(fsave,     f300, ffc0, CF_FPU);
     INSN(frestore,  f340, ffc0, FPU);
     INSN(fsave,     f300, ffc0, FPU);
+    INSN(pmmu030,   f000, ffc0, M68030);
     INSN(intouch,   f340, ffc0, CF_ISA_A);
     INSN(cpushl,    f428, ff38, CF_ISA_A);
     INSN(cpush,     f420, ff20, M68040);

@@ -144,6 +144,11 @@ typedef struct CPUArchState {
         bool fault;
         uint32_t ttr[4];
         uint32_t mmusr;
+        /* 68030 PMMU registers, accessed via PMOVE */
+        uint32_t tc030;
+        uint32_t tt030[2];
+        uint32_t srp030[2];
+        uint32_t crp030[2];
     } mmu;
 
     /* Control registers.  */
