@@ -286,8 +286,14 @@ void HELPER(m68k_movec_to)(CPUM68KState *env, uint32_t reg, uint32_t val)
             return;
         }
         break;
-    /* Unimplemented Registers */
+    /* MC68020/MC68030 */
     case M68K_CR_CAAR:
+        if (m68k_feature(env, M68K_FEATURE_M68020)
+         || m68k_feature(env, M68K_FEATURE_M68030)) {
+            env->caar = val;
+            return;
+        }
+        break;
     /* MC68060 only, unimplemented */
     case M68K_CR_PCR:
     case M68K_CR_BUSCR:
@@ -394,8 +400,13 @@ uint32_t HELPER(m68k_movec_from)(CPUM68KState *env, uint32_t reg)
             return env->mmu.ttr[M68K_DTTR1];
         }
         break;
-    /* Unimplemented Registers */
+    /* MC68020/MC68030 */
     case M68K_CR_CAAR:
+        if (m68k_feature(env, M68K_FEATURE_M68020)
+         || m68k_feature(env, M68K_FEATURE_M68030)) {
+            return env->caar;
+        }
+        break;
     /* MC68060 only, unimplemented */
     case M68K_CR_PCR:
     case M68K_CR_BUSCR:

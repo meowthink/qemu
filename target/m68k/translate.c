@@ -6552,5 +6552,6 @@ void m68k_cpu_dump_state(CPUState *cs, FILE *f, int flags)
     qemu_fprintf(f, "TC030 %08x CRP %08x/%08x SRP030 %08x/%08x\n",
                  env->mmu.tc030, env->mmu.crp030[0], env->mmu.crp030[1],
                  env->mmu.srp030[0], env->mmu.srp030[1]);
+    qemu_fprintf(f, "CAAR %08x\n", env->caar);
 #endif /* !CONFIG_USER_ONLY */
 }
