@@ -26,6 +26,8 @@
 #include "exec/gdbstub.h"
 #include "exec/helper-proto.h"
 #include "accel/tcg/cpu-loop.h"
+#include "hw/core/irq.h"
+#include "qemu/main-loop.h"
 #include "system/memory.h"
 #include "gdbstub/helpers.h"
 #include "fpu/softfloat.h"
@@ -1658,6 +1660,17 @@ void HELPER(pflush)(CPUM68KState *env, uint32_t addr, uint32_t opmode)
 
 void HELPER(reset)(CPUM68KState *env)
 {
-    /* FIXME: reset all except CPU */
+    M68kCPU *cpu = env_archcpu(env);
+
+    /*
+     * RESET asserts the external reset line: the board resets while
+     * the CPU itself carries on with the next instruction.  Software
+     * depends on the side effects - the Amiga ROM reboot code runs
+     * RESET and then jumps through address 4, counting on the reset
+     * to have re-enabled the Kickstart overlay there.
+     */
+    bql_lock();
+    qemu_irq_pulse(cpu->reset_out);
+    bql_unlock();
 }
 #endif /* !CONFIG_USER_ONLY */

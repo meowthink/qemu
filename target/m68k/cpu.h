@@ -181,6 +181,15 @@ struct ArchCPU {
     CPUState parent_obj;
 
     CPUM68KState env;
+
+#if !defined(CONFIG_USER_ONLY)
+    /*
+     * The external reset output, pulsed by the RESET instruction: on
+     * real chips it resets the rest of the board while the CPU itself
+     * carries on with the next instruction.
+     */
+    qemu_irq reset_out;
+#endif
 };
 
 /*

@@ -24,6 +24,7 @@
 #include "qapi/error.h"
 
 #ifndef CONFIG_USER_ONLY
+#include "hw/core/qdev.h"
 #include "migration/vmstate.h"
 #include "monitor/hmp.h"
 #endif
@@ -202,6 +203,16 @@ static ObjectClass *m68k_cpu_class_by_name(const char *cpu_model)
 
     return oc;
 }
+
+#if !defined(CONFIG_USER_ONLY)
+static void m68k_cpu_initfn(Object *obj)
+{
+    M68kCPU *cpu = M68K_CPU(obj);
+
+    /* the RESET instruction pulses this; boards wire up their reset */
+    qdev_init_gpio_out_named(DEVICE(obj), &cpu->reset_out, "reset-out", 1);
+}
+#endif
 
 static void m5206_cpu_initfn(Object *obj)
 {
@@ -766,6 +777,9 @@ static const TypeInfo m68k_cpus_type_infos[] = {
         .parent = TYPE_CPU,
         .instance_size = sizeof(M68kCPU),
         .instance_align = __alignof(M68kCPU),
+#if !defined(CONFIG_USER_ONLY)
+        .instance_init = m68k_cpu_initfn,
+#endif
         .abstract = true,
         .class_size = sizeof(M68kCPUClass),
         .class_init = m68k_cpu_class_init,

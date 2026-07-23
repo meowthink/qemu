@@ -2868,6 +2868,11 @@ DISAS_INSN(reset)
     }
 
     gen_helper_reset(tcg_env);
+    /*
+     * The board reset it pulses can change the memory map (the Amiga
+     * re-enables its ROM overlay), so don't run on within this TB.
+     */
+    gen_exit_tb(s);
 }
 #endif
 
