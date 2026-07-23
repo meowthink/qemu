@@ -57,6 +57,8 @@ static TCGTBCPUState m68k_get_tb_cpu_state(CPUState *cs)
     }
     if (M68K_SR_TRACE(env->sr) == M68K_SR_TRACE_ANY_INS) {
         flags |= TB_FLAGS_TRACE;
+    } else if (M68K_SR_TRACE(env->sr) == M68K_SR_TRACE_FLOW) {
+        flags |= TB_FLAGS_TRACE_FLOW;
     }
 
     return (TCGTBCPUState){ .pc = env->pc, .flags = flags };

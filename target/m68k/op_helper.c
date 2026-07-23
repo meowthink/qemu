@@ -41,9 +41,11 @@ static void cf_rte(CPUM68KState *env)
     cpu_m68k_set_sr(env, fmt);
 }
 
-static void m68k_rte(CPUM68KState *env)
+/* Returns false on a format error, with no state committed. */
+static bool m68k_rte(CPUM68KState *env)
 {
     uint32_t sp;
+    uint32_t pc;
     uint16_t fmt;
     uint16_t sr;
 
@@ -51,7 +53,7 @@ static void m68k_rte(CPUM68KState *env)
 throwaway:
     sr = cpu_lduw_be_mmuidx_ra(env, sp, MMU_KERNEL_IDX, 0);
     sp += 2;
-    env->pc = cpu_ldl_be_mmuidx_ra(env, sp, MMU_KERNEL_IDX, 0);
+    pc = cpu_ldl_be_mmuidx_ra(env, sp, MMU_KERNEL_IDX, 0);
     sp += 4;
     if (m68k_feature(env, M68K_FEATURE_EXCEPTION_FORMAT_VEC)) {
         /*  all except 68000 */
@@ -74,10 +76,29 @@ throwaway:
         case 7:
             sp += 52;
             break;
+        case 0xa:
+        case 0xb:
+            /*
+             * 68020/030 bus fault frames.  If the handler cleared the
+             * SSW DF bit it wants the instruction completed without
+             * rerunning the faulted data cycle: we re-execute the
+             * instruction with the next bus fault suppressed, so the
+             * access completes like an unassigned read instead.
+             */
+            if (!(cpu_lduw_be_mmuidx_ra(env, sp + 2, MMU_KERNEL_IDX, 0)
+                  & M68K_SSW_DF_030)) {
+                env->bus_error_suppress = 1;
+            }
+            sp += (fmt >> 12) == 0xa ? 24 : 84;
+            break;
+        default:
+            return false;
         }
     }
+    env->pc = pc;
     env->aregs[7] = sp;
     cpu_m68k_set_sr(env, sr);
+    return true;
 }
 
 static const char *m68k_exception_name(int index)
@@ -304,8 +325,12 @@ static void m68k_interrupt_all(CPUM68KState *env, int is_hw)
         switch (cs->exception_index) {
         case EXCP_RTE:
             /* Return from an exception.  */
-            m68k_rte(env);
-            return;
+            if (m68k_rte(env)) {
+                return;
+            }
+            /* undefined frame format: deliver a format error instead */
+            cs->exception_index = EXCP_FORMAT;
+            break;
         }
     }
 
@@ -346,6 +371,37 @@ static void m68k_interrupt_all(CPUM68KState *env, int is_hw)
             cpu_abort(cs, "DOUBLE MMU FAULT\n");
         }
         env->mmu.fault = true;
+        if (!m68k_feature(env, M68K_FEATURE_M68040)) {
+            /* 68020/030 short bus cycle fault, format A */
+            /* internal registers */
+            sp -= 4;
+            cpu_stl_be_mmuidx_ra(env, sp, 0, MMU_KERNEL_IDX, 0);
+            /* data output buffer */
+            sp -= 4;
+            cpu_stl_be_mmuidx_ra(env, sp, 0, MMU_KERNEL_IDX, 0);
+            /* internal registers */
+            sp -= 4;
+            cpu_stl_be_mmuidx_ra(env, sp, 0, MMU_KERNEL_IDX, 0);
+            /* data cycle fault address */
+            sp -= 4;
+            cpu_stl_be_mmuidx_ra(env, sp, env->mmu.ar, MMU_KERNEL_IDX, 0);
+            /* instruction pipe stage B */
+            sp -= 2;
+            cpu_stw_be_mmuidx_ra(env, sp, 0, MMU_KERNEL_IDX, 0);
+            /* instruction pipe stage C */
+            sp -= 2;
+            cpu_stw_be_mmuidx_ra(env, sp, 0, MMU_KERNEL_IDX, 0);
+            /* special status word */
+            sp -= 2;
+            cpu_stw_be_mmuidx_ra(env, sp, env->mmu.ssw, MMU_KERNEL_IDX, 0);
+            /* internal register */
+            sp -= 2;
+            cpu_stw_be_mmuidx_ra(env, sp, 0, MMU_KERNEL_IDX, 0);
+
+            do_stack_frame(env, &sp, 0xa, oldsr, 0, env->pc);
+            env->mmu.fault = false;
+            break;
+        }
         /* push data 3 */
         sp -= 4;
         cpu_stl_be_mmuidx_ra(env, sp, 0, MMU_KERNEL_IDX, 0);
@@ -511,6 +567,26 @@ void m68k_cpu_transaction_failed(CPUState *cs, hwaddr physaddr, vaddr addr,
             env->mmu.ssw |= M68K_RW_040;
         }
 
+        env->mmu.ar = addr;
+
+        cs->exception_index = EXCP_ACCESS;
+        cpu_loop_exit(cs);
+    } else if (m68k_feature(env, M68K_FEATURE_M68K)) {
+        /* 68020/030: deliver a bus error with a format A frame */
+        if (env->bus_error_suppress) {
+            /*
+             * The handler of the previous fault completed the
+             * instruction with the data cycle suppressed: let the
+             * access complete as an unassigned read/write.
+             */
+            env->bus_error_suppress = 0;
+            return;
+        }
+        env->mmu.mmusr = 0;
+        env->mmu.ssw = M68K_SSW_DF_030;
+        if (access_type != MMU_DATA_STORE) {
+            env->mmu.ssw |= M68K_SSW_RW_030;
+        }
         env->mmu.ar = addr;
 
         cs->exception_index = EXCP_ACCESS;
@@ -1134,4 +1210,30 @@ void HELPER(cmp2)(CPUM68KState *env, int32_t val, int32_t lb, int32_t ub)
     /* Identical to CHK2 (above) but doesn't raise an exception */
     env->cc_z = val != lb && val != ub;
     env->cc_c = lb <= ub ? val < lb || val > ub : val > ub && val < lb;
+}
+
+/*
+ * MOVES accesses the address space selected by SFC/DFC.  Only function
+ * codes 1/2 (user data/program) and 5/6 (supervisor data/program)
+ * address memory; nothing decodes the reserved codes or CPU space on
+ * real boards, so such accesses end in a bus error.
+ */
+void HELPER(moves_chk)(CPUM68KState *env, uint32_t addr, uint32_t is_store)
+{
+    uint32_t fc = (is_store ? env->dfc : env->sfc) & 7;
+
+    if (fc == 1 || fc == 2 || fc == 5 || fc == 6) {
+        return;
+    }
+    if (env->bus_error_suppress) {
+        env->bus_error_suppress = 0;
+        return;
+    }
+    env->mmu.mmusr = 0;
+    env->mmu.ssw = M68K_SSW_DF_030;
+    if (!is_store) {
+        env->mmu.ssw |= M68K_SSW_RW_030;
+    }
+    env->mmu.ar = addr;
+    raise_exception_ra(env, EXCP_ACCESS, GETPC());
 }

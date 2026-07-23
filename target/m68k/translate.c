@@ -110,6 +110,8 @@ typedef struct DisasContext {
     int writeback_mask;
     TCGv writeback[8];
     bool ss_active;
+    /* trace on change of flow (SR trace mode 01) */
+    bool ss_flow;
 } DisasContext;
 
 static TCGv get_areg(DisasContext *s, unsigned regno)
@@ -1390,7 +1392,9 @@ static void gen_exit_tb(DisasContext *s)
 static void gen_jmp_tb(DisasContext *s, int n, target_ulong dest,
                        target_ulong src)
 {
-    if (unlikely(s->ss_active)) {
+    if (unlikely(s->ss_active) ||
+        (unlikely(s->ss_flow) && dest != s->pc)) {
+        /* ss_flow: a jump away from the next insn is a change of flow */
         update_cc_op(s);
         tcg_gen_movi_i32(QREG_PC, dest);
         gen_raise_exception_format2(s, EXCP_TRACE, src);
@@ -4449,6 +4453,11 @@ DISAS_INSN(moves)
         return;
     }
 
+    if (m68k_feature(s->env, M68K_FEATURE_M68K)) {
+        /* function codes with no address space cause a bus error */
+        gen_helper_moves_chk(tcg_env, addr,
+                             tcg_constant_i32((ext >> 11) & 1));
+    }
     if (ext & 0x0800) {
         /* from reg to ea */
         gen_store(s, opsize, addr, reg, DFC_INDEX(s));
@@ -6179,6 +6188,7 @@ static void m68k_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cpu)
     dc->writeback_mask = 0;
 
     dc->ss_active = (M68K_SR_TRACE(env->sr) == M68K_SR_TRACE_ANY_INS);
+    dc->ss_flow = (M68K_SR_TRACE(env->sr) == M68K_SR_TRACE_FLOW);
     /* If architectural single step active, limit to 1 */
     if (dc->ss_active) {
         dc->base.max_insns = 1;
@@ -6199,7 +6209,19 @@ static void m68k_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
 {
     DisasContext *dc = container_of(dcbase, DisasContext, base);
     CPUM68KState *env = cpu_env(cpu);
-    uint16_t insn = read_im16(env, dc);
+    uint16_t insn;
+
+    if ((dc->base.pc_next & 1) && m68k_feature(env, M68K_FEATURE_M68K)) {
+        /* instruction fetch from an odd address: address error */
+        gen_exception(dc, dc->base.pc_next, EXCP_ADDRESS);
+        dc->base.is_jmp = DISAS_NORETURN;
+        dc->pc_prev = dc->base.pc_next;
+        dc->pc = dc->base.pc_next + 1;
+        dc->base.pc_next = dc->pc;
+        return;
+    }
+
+    insn = read_im16(env, dc);
 
     opcode_table[insn](env, dc, insn);
     do_writebacks(dc);
@@ -6243,7 +6265,7 @@ static void m68k_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
         break;
     case DISAS_JUMP:
         /* We updated CC_OP and PC in gen_jmp/gen_jmp_im.  */
-        if (dc->ss_active) {
+        if (dc->ss_active || dc->ss_flow) {
             gen_raise_exception_format2(dc, EXCP_TRACE, dc->pc_prev);
         } else {
             tcg_gen_lookup_and_goto_ptr();

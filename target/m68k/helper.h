@@ -27,6 +27,7 @@ DEF_HELPER_4(stp96, void, env, fp, i32, i32)
 DEF_HELPER_2(redf32, f32, env, fp)
 DEF_HELPER_2(redf64, f64, env, fp)
 DEF_HELPER_2(reds32, s32, env, fp)
+DEF_HELPER_3(moves_chk, void, env, i32, i32)
 
 DEF_HELPER_3(fsround, void, env, fp, fp)
 DEF_HELPER_3(fdround, void, env, fp, fp)

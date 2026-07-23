@@ -115,6 +115,8 @@ typedef struct CPUArchState {
     bool fp_state_null;
     uint8_t fp_pending_vector;
     uint32_t fp_pending_pc;
+    /* complete the next faulting bus access as unassigned (030 rerun) */
+    uint32_t bus_error_suppress;
     float_status fp_status;
 
     uint64_t mactmp;
@@ -280,6 +282,10 @@ typedef enum {
 #define M68K_TM_040_DATA  0x0001
 #define M68K_TM_040_CODE  0x0002
 #define M68K_TM_040_SUPER 0x0004
+
+/* bits for 68020/030 bus fault special status word */
+#define M68K_SSW_DF_030   0x0100
+#define M68K_SSW_RW_030   0x0040
 
 /* bits for 68040 write back status word */
 #define M68K_WBV_040   0x80
@@ -637,6 +643,11 @@ void m68k_cpu_transaction_failed(CPUState *cs, hwaddr physaddr, vaddr addr,
 #define TB_FLAGS_DFC_S          (1 << TB_FLAGS_DFC_S_BIT)
 #define TB_FLAGS_TRACE          16
 #define TB_FLAGS_TRACE_BIT      (1 << TB_FLAGS_TRACE)
+#define TB_FLAGS_TRACE_FLOW_BIT 17
+#define TB_FLAGS_TRACE_FLOW     (1 << TB_FLAGS_TRACE_FLOW_BIT)
+
+/* SR trace mode 01: trace on change of flow */
+#define M68K_SR_TRACE_FLOW      0x1
 
 void dump_mmu(CPUM68KState *env);
 
