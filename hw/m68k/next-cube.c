@@ -23,6 +23,7 @@
 #include "hw/core/boards.h"
 #include "hw/core/loader.h"
 #include "hw/dma/next-dma.h"
+#include "hw/misc/next-memctl.h"
 #include "hw/net/next-mb8795.h"
 #include "hw/scsi/esp.h"
 #include "hw/core/sysbus.h"
@@ -830,7 +831,14 @@ static void next_system_timer_expire(void *opaque)
 {
     NeXTPC *s = opaque;
 
-    s->timer_counter = 0;
+    /*
+     * Expiry reloads the counter from the latch.  NeXT kernels load the
+     * immediate deadline, start the timer, then leave 0xffff in the latch
+     * as the fallback period until the interrupt handler programs it again.
+     */
+    s->timer_counter = s->timer_latch ?
+                       s->timer_latch : NEXT_TIMER_FULL_PERIOD;
+    next_system_timer_schedule(s);
     next_timer_set_irq(s, true, false);
 }
 
@@ -1484,6 +1492,7 @@ static void next_cube_init(MachineState *machine)
     const char *bios_name = machine->firmware ?: ROM_FILE;
     DeviceState *dma_dev;
     DeviceState *mbdev;
+    DeviceState *memctl_dev;
     DeviceState *pcdev;
     int channel;
 
@@ -1536,6 +1545,13 @@ static void next_cube_init(MachineState *machine)
                        qdev_get_gpio_in(pcdev, NEXT_ENRX_I));
     next_dma_set_ethernet_notify(m->dma, &next_mb8795_dma_notify,
                                  m->mb8795);
+
+    /* Memory timing registers */
+    memctl_dev = qdev_new(TYPE_NEXT_MEMCTL);
+    object_property_add_child(OBJECT(machine), "memctl",
+                              OBJECT(memctl_dev));
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(memctl_dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(memctl_dev), 0, 0x02106010);
 
     /* 64MB RAM starting at 0x04000000  */
     memory_region_add_subregion(sysmem, 0x04000000, machine->ram);
