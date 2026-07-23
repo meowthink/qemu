@@ -689,6 +689,9 @@ void m68k_cpu_transaction_failed(CPUState *cs, hwaddr physaddr, vaddr addr,
         }
         env->mmu.mmusr = 0;
         env->mmu.ssw = M68K_SSW_DF_030;
+        env->mmu.ssw |= M68K_SSW_FC_030(((env->sr & SR_S) ? 4 : 0) |
+                                        (access_type == MMU_INST_FETCH
+                                         ? 2 : 1));
         if (access_type != MMU_DATA_STORE) {
             env->mmu.ssw |= M68K_SSW_RW_030;
         }
@@ -1347,7 +1350,7 @@ void HELPER(moves_chk)(CPUM68KState *env, uint32_t addr, uint32_t is_store)
         return;
     }
     env->mmu.mmusr = 0;
-    env->mmu.ssw = M68K_SSW_DF_030;
+    env->mmu.ssw = M68K_SSW_DF_030 | M68K_SSW_FC_030(fc);
     if (!is_store) {
         env->mmu.ssw |= M68K_SSW_RW_030;
     }

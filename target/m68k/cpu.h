@@ -362,6 +362,12 @@ typedef enum {
 #define M68K_SSW_FB_030   0x4000
 #define M68K_SSW_DF_030   0x0100
 #define M68K_SSW_RW_030   0x0040
+/*
+ * Function code of the faulted access, SSW bits 2..0.  NetBSD's
+ * KDFAULT() reads these to tell kernel-space faults during
+ * copyin/copyout apart from user-space ones.
+ */
+#define M68K_SSW_FC_030(fc)  ((fc) & 7)
 
 /* bits for 68040 write back status word */
 #define M68K_WBV_040   0x80
