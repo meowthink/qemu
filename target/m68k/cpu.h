@@ -368,6 +368,34 @@ typedef enum {
 #define M68K_TTR_SFIELD_USER   0x0000
 #define M68K_TTR_SFIELD_SUPER  0x2000
 
+/*
+ * 68030 PMMU.  The Translation Control register (tc030) selects the page
+ * size and the widths of up to four table-index fields; the root pointers
+ * (crp030/srp030) and every table descriptor carry a 2-bit descriptor
+ * type in their low bits.  Descriptors come in a 4-byte "short" form
+ * (address + flags in one longword) and an 8-byte "long" form (a
+ * limit/flags longword followed by an address longword).
+ */
+#define M68K_TC030_ENABLE   0x80000000
+#define M68K_TC030_SRE      0x02000000  /* separate supervisor root */
+#define M68K_TC030_FCL      0x01000000  /* function-code lookup */
+#define M68K_TC030_PS(tc)   (((tc) >> 20) & 0xf)   /* page size = 2^PS */
+#define M68K_TC030_IS(tc)   (((tc) >> 16) & 0xf)   /* initial shift */
+#define M68K_TC030_TI(tc, n) (((tc) >> (12 - 4 * (n))) & 0xf)  /* TIA..TID */
+
+/* descriptor type, low two bits of a root pointer / descriptor */
+#define M68K_DT_INVALID     0
+#define M68K_DT_PAGE        1  /* page (leaf) descriptor */
+#define M68K_DT_SHORT       2  /* valid, next table has 4-byte descriptors */
+#define M68K_DT_LONG        3  /* valid, next table has 8-byte descriptors */
+
+#define M68K_DESC030_WP     0x00000004  /* write protect */
+#define M68K_DESC030_U      0x00000008  /* used (short: bit 3) */
+#define M68K_DESC030_ADDR   0xfffffff0  /* table/page address, bits 31:4 */
+/* long-format status longword extras */
+#define M68K_DESC030L_M     0x00000010  /* modified */
+#define M68K_DESC030L_CI    0x00000040  /* cache inhibit */
+
 /* m68k Control Registers */
 
 /* ColdFire */

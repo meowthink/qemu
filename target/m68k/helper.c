@@ -932,6 +932,128 @@ txfail:
     return -1;
 }
 
+/*
+ * 68030 PMMU translation.  The table geometry is described by tc030: an
+ * initial shift (IS) drops high address bits, then up to four table
+ * index fields (TIA..TID) walk the tree, and the low PS bits are the
+ * page offset.  Each root pointer / table descriptor names the size of
+ * the descriptors in the table it points at (short 4-byte or long
+ * 8-byte); a descriptor type of "page" ends the walk, and a page found
+ * before the index fields are exhausted is an early-terminated (larger)
+ * page.
+ */
+static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
+                                    int *prot, target_ulong address,
+                                    int access_type, target_ulong *page_size)
+{
+    CPUState *cs = env_cpu(env);
+    uint32_t tc = env->mmu.tc030;
+    uint32_t *rp, table, desc;
+    int dt, is, shift, wp = 0, super_only = 0, level, i;
+    MemTxResult txres;
+
+    /* transparent translation: the 030 TT registers match the 040 TTR */
+    for (i = 0; i < 2; i++) {
+        if (check_TTR(env->mmu.tt030[i], prot, address, access_type)) {
+            *physical = address;
+            *page_size = TARGET_PAGE_SIZE;
+            return 0;
+        }
+    }
+
+    rp = ((access_type & ACCESS_SUPER) && (tc & M68K_TC030_SRE))
+         ? env->mmu.srp030 : env->mmu.crp030;
+    dt = rp[0] & 3;
+    table = rp[1] & M68K_DESC030_ADDR;
+
+    is = M68K_TC030_IS(tc);
+    shift = 32 - is;
+
+    for (level = 0; level < 4; level++) {
+        int tw = M68K_TC030_TI(tc, level);
+        uint32_t entry;
+        int index;
+
+        if (dt == M68K_DT_INVALID) {
+            return -1;
+        }
+        if (dt == M68K_DT_PAGE || tw == 0) {
+            break;
+        }
+        shift -= tw;
+        index = (address >> shift) & ((1 << tw) - 1);
+        entry = table + index * (dt == M68K_DT_LONG ? 8 : 4);
+
+        desc = address_space_ldl(cs->as, entry, MEMTXATTRS_UNSPECIFIED, &txres);
+        if (txres != MEMTX_OK) {
+            return -1;
+        }
+        if (dt == M68K_DT_LONG) {
+            uint32_t lo = address_space_ldl(cs->as, entry + 4,
+                                            MEMTXATTRS_UNSPECIFIED, &txres);
+            if (txres != MEMTX_OK) {
+                return -1;
+            }
+            table = lo & M68K_DESC030_ADDR;
+        } else {
+            table = desc & M68K_DESC030_ADDR;
+        }
+        if (desc & M68K_DESC030_WP) {
+            wp = 1;
+        }
+        if (desc & 0x100) {           /* long descriptor supervisor bit */
+            super_only = 1;
+        }
+        dt = desc & 3;
+
+        /*
+         * Set the descriptor's Used bit (and Modified on the leaf page
+         * for a store) so the guest sees the MMU exercising its tables.
+         */
+        if (!(access_type & ACCESS_DEBUG)) {
+            uint32_t nd = desc | M68K_DESC030_U;
+            if (dt == M68K_DT_PAGE && (access_type & ACCESS_STORE) &&
+                !(desc & M68K_DESC030_WP)) {
+                nd |= M68K_DESC030L_M;
+            }
+            if (nd != desc) {
+                address_space_stl(cs->as, entry, nd,
+                                  MEMTXATTRS_UNSPECIFIED, &txres);
+            }
+        }
+    }
+
+    if (dt != M68K_DT_PAGE) {
+        return -1;
+    }
+    if (super_only && !(access_type & ACCESS_SUPER)) {
+        return -1;
+    }
+
+    /* whatever address bits the index fields did not consume are offset */
+    if (shift >= 32) {
+        /*
+         * Early termination in the root pointer with IS=0: one "page"
+         * spans the whole 4G space and the descriptor address is added
+         * to the full logical address (147Bug's MMU register test uses
+         * this as an identity map while the test patterns are live).
+         * 1u << 32 is undefined C, so special-case it.
+         */
+        *physical = table + address;
+        *page_size = TARGET_PAGE_SIZE;
+    } else {
+        *page_size = 1u << shift;
+        *physical = (table & ~(*page_size - 1)) | (address & (*page_size - 1));
+    }
+    *prot = PAGE_READ | PAGE_EXEC;
+    if (!wp) {
+        *prot |= PAGE_WRITE;
+    } else if (access_type & ACCESS_STORE) {
+        return -1;
+    }
+    return 0;
+}
+
 hwaddr m68k_cpu_get_phys_addr_debug(CPUState *cs, vaddr addr)
 {
     CPUM68KState *env = cpu_env(cs);
@@ -988,8 +1110,11 @@ bool m68k_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
     int access_type;
     int ret;
     target_ulong page_size;
+    bool is_030 = m68k_feature(env, M68K_FEATURE_M68030);
+    bool mmu_enabled = is_030 ? (env->mmu.tc030 & M68K_TC030_ENABLE)
+                              : (env->mmu.tcr & M68K_TCR_ENABLED);
 
-    if ((env->mmu.tcr & M68K_TCR_ENABLED) == 0) {
+    if (!mmu_enabled) {
         /* MMU disabled */
         tlb_set_page(cs, address & TARGET_PAGE_MASK,
                      address & TARGET_PAGE_MASK,
@@ -1010,7 +1135,10 @@ bool m68k_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
         access_type |= ACCESS_SUPER;
     }
 
-    ret = get_physical_address(env, &physical, &prot,
+    ret = is_030
+        ? get_physical_address_030(env, &physical, &prot,
+                                   address, access_type, &page_size)
+        : get_physical_address(env, &physical, &prot,
                                address, access_type, &page_size);
     if (likely(ret == 0)) {
         tlb_set_page(cs, address & TARGET_PAGE_MASK,
