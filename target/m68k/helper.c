@@ -32,6 +32,7 @@
 #include "gdbstub/helpers.h"
 #include "fpu/softfloat.h"
 #include "qemu/qemu-print.h"
+#include "qemu/log.h"
 
 #define SIGNBIT (1u << 31)
 
@@ -1152,6 +1153,20 @@ bool m68k_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
         return false;
     }
 
+    if (is_030) {
+        /* 030 table walk miss: deliver a data/instruction bus fault */
+        env->mmu.ssw = 0;
+        if (qemu_access_type != MMU_INST_FETCH) {
+            env->mmu.ssw |= M68K_SSW_DF_030;
+        }
+        if (qemu_access_type != MMU_DATA_STORE) {
+            env->mmu.ssw |= M68K_SSW_RW_030;
+        }
+        cs->exception_index = EXCP_ACCESS;
+        env->mmu.ar = address;
+        cpu_loop_exit_restore(cs, retaddr);
+    }
+
     /* page fault */
     env->mmu.ssw = M68K_ATC_040;
     switch (size) {
@@ -1656,6 +1671,12 @@ void HELPER(pflush)(CPUM68KState *env, uint32_t addr, uint32_t opmode)
         tlb_flush(cs);
         break;
     }
+}
+
+/* 030 PMMU register writes and PFLUSH invalidate any cached translation */
+void HELPER(pmmu030_flush)(CPUM68KState *env)
+{
+    tlb_flush(env_cpu(env));
 }
 
 void HELPER(reset)(CPUM68KState *env)

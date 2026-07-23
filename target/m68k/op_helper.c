@@ -24,6 +24,7 @@
 #include "accel/tcg/cpu-loop.h"
 #include "semihosting/semihost.h"
 #include "qemu/plugin.h"
+#include "system/memory.h"
 #include "hw/core/irq.h"
 
 #if !defined(CONFIG_USER_ONLY)
@@ -379,7 +380,24 @@ static void m68k_interrupt_all(CPUM68KState *env, int is_hw)
         }
         env->mmu.fault = true;
         if (!m68k_feature(env, M68K_FEATURE_M68040)) {
-            /* 68020/030 short bus cycle fault, format A */
+            /*
+             * 68020/030 bus cycle fault.  Data faults occur mid
+             * instruction and use the long format B frame (the extra
+             * internal state is not modelled and reads as zero);
+             * instruction faults use the short format A frame.  MacOS
+             * bus-error catchers check the frame format and SSW to
+             * decide whether a fault is recoverable.
+             */
+            bool long_frame = env->mmu.ssw & M68K_SSW_DF_030;
+            int i;
+
+            if (long_frame) {
+                /* version# and internal registers, frame+0x20..0x53 */
+                for (i = 0; i < 15; i++) {
+                    sp -= 4;
+                    cpu_stl_be_mmuidx_ra(env, sp, 0, MMU_KERNEL_IDX, 0);
+                }
+            }
             /* internal registers */
             sp -= 4;
             cpu_stl_be_mmuidx_ra(env, sp, 0, MMU_KERNEL_IDX, 0);
@@ -405,7 +423,8 @@ static void m68k_interrupt_all(CPUM68KState *env, int is_hw)
             sp -= 2;
             cpu_stw_be_mmuidx_ra(env, sp, 0, MMU_KERNEL_IDX, 0);
 
-            do_stack_frame(env, &sp, 0xa, oldsr, 0, env->pc);
+            do_stack_frame(env, &sp, long_frame ? 0xb : 0xa, oldsr, 0,
+                           env->pc);
             env->mmu.fault = false;
             break;
         }
@@ -538,6 +557,11 @@ void m68k_cpu_transaction_failed(CPUState *cs, hwaddr physaddr, vaddr addr,
     CPUM68KState *env = cpu_env(cs);
 
     cpu_restore_state(cs, retaddr);
+
+    qemu_log_mask(CPU_LOG_MMU,
+                  "txn fail: phys=%08x addr=%08x size=%u type=%d resp=%d "
+                  "pc=%08x\n", (uint32_t)physaddr, (uint32_t)addr, size,
+                  (int)access_type, (int)response, env->pc);
 
     if (m68k_feature(env, M68K_FEATURE_M68040)) {
         env->mmu.mmusr = 0;

@@ -4670,9 +4670,9 @@ DISAS_INSN(ptest)
 
 /*
  * 68030 on-chip PMMU coprocessor instructions (cp-id 0): PMOVE,
- * PTEST, PFLUSH, PLOAD.  PMOVE is implemented as plain register
- * storage, which is enough for firmware register probes; the TLB
- * operations are no-ops since 030 translation is not implemented.
+ * PTEST, PFLUSH, PLOAD.  Translation is implemented by
+ * get_physical_address_030(); MMU register writes and PFLUSH must
+ * drop cached TLB entries and end the TB.
  */
 DISAS_INSN(pmmu030)
 {
@@ -4699,7 +4699,22 @@ DISAS_INSN(pmmu030)
             ofs = offsetof(CPUM68KState, mmu.tt030[1]);
         }
         break;
-    case 1: /* PFLUSH/PLOAD: no-op, we hold no 030 TLB state */
+    case 1: /* PFLUSH/PLOAD */
+        /*
+         * PLOAD and the ea-form of PFLUSH carry an effective address
+         * whose extension words must be consumed even though we hold no
+         * ATC state (missing this desynchronizes the instruction
+         * stream).
+         */
+        if ((ext & 0xfde0) == 0x2000 || (ext & 0xfe00) == 0x3800) {
+            addr = gen_lea(env, s, insn, OS_LONG);
+            if (IS_NULL_QREG(addr)) {
+                gen_addr_fault(s);
+                return;
+            }
+        }
+        gen_helper_pmmu030_flush(tcg_env);
+        gen_exit_tb(s);
         return;
     case 2: /* PMOVE to/from TC/SRP/CRP */
         if (preg == 0) {
@@ -4750,6 +4765,16 @@ DISAS_INSN(pmmu030)
             tcg_gen_addi_i32(addr, addr, 4);
             tmp = gen_load(s, opsize, addr, 0, index);
             tcg_gen_st_i32(tmp, tcg_env, ofs2);
+        }
+        /*
+         * The FD (flush disable) bit keeps cached translations alive:
+         * MacOS sequences its MMU-mode switch as PMOVEFD to CRP followed
+         * by PMOVE to TC, relying on ATC entries covering the transient
+         * mismatch between the two.
+         */
+        if (!(ext & 0x100)) {
+            gen_helper_pmmu030_flush(tcg_env);
+            gen_exit_tb(s);
         }
     }
 }
