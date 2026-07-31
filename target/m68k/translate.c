@@ -4733,9 +4733,13 @@ DISAS_INSN(pmmu030)
             opsize = OS_WORD;
         }
         break;
-    case 4: /* PTEST: report translation valid, no faults */
-        tcg_gen_st_i32(tcg_constant_i32(0), tcg_env,
-                       offsetof(CPUM68KState, mmu.mmusr));
+    case 4: /* PTEST: probe the tables, report the result in the PSR */
+        addr = gen_lea(env, s, insn, OS_LONG);
+        if (IS_NULL_QREG(addr)) {
+            gen_addr_fault(s);
+            return;
+        }
+        gen_helper_ptest030(tcg_env, addr, tcg_constant_i32(ext));
         return;
     }
     if (ofs < 0) {

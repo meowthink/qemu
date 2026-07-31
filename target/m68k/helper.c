@@ -945,14 +945,22 @@ txfail:
  * before the index fields are exhausted is an early-terminated (larger)
  * page.
  */
+/* 68030 MMU status register (PSR) bits, as read by PMOVE from PSR */
+#define M68K_MMU030_PSR_B   0x8000  /* bus error during table walk */
+#define M68K_MMU030_PSR_L   0x4000  /* limit violation */
+#define M68K_MMU030_PSR_S   0x2000  /* supervisor-only violation */
+#define M68K_MMU030_PSR_W   0x0800  /* write protected */
+#define M68K_MMU030_PSR_I   0x0400  /* invalid descriptor */
+
 static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
                                     int *prot, target_ulong address,
                                     int access_type, target_ulong *page_size)
 {
     CPUState *cs = env_cpu(env);
     uint32_t tc = env->mmu.tc030;
-    uint32_t *rp, table, desc;
+    uint32_t *rp, table, desc = 0;
     int dt, is, shift, wp = 0, super_only = 0, level, i;
+    bool ptest = access_type & ACCESS_PTEST;
     MemTxResult txres;
 
     /* transparent translation: the 030 TT registers match the 040 TTR */
@@ -993,6 +1001,9 @@ static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
         int index;
 
         if (dt == M68K_DT_INVALID) {
+            if (ptest) {
+                env->mmu.mmusr |= M68K_MMU030_PSR_I;
+            }
             return -1;
         }
         if (dt == M68K_DT_PAGE || tw == 0) {
@@ -1005,10 +1016,16 @@ static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
 
             if (limit_word & 0x80000000) {
                 if ((uint32_t)index < limit) {
+                    if (ptest) {
+                        env->mmu.mmusr |= M68K_MMU030_PSR_L;
+                    }
                     return -1;
                 }
             } else {
                 if ((uint32_t)index > limit) {
+                    if (ptest) {
+                        env->mmu.mmusr |= M68K_MMU030_PSR_L;
+                    }
                     return -1;
                 }
             }
@@ -1017,12 +1034,18 @@ static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
 
         desc = address_space_ldl(cs->as, entry, MEMTXATTRS_UNSPECIFIED, &txres);
         if (txres != MEMTX_OK) {
+            if (ptest) {
+                env->mmu.mmusr |= M68K_MMU030_PSR_B;
+            }
             return -1;
         }
         if (dt == M68K_DT_LONG) {
             uint32_t lo = address_space_ldl(cs->as, entry + 4,
                                             MEMTXATTRS_UNSPECIFIED, &txres);
             if (txres != MEMTX_OK) {
+                if (ptest) {
+                    env->mmu.mmusr |= M68K_MMU030_PSR_B;
+                }
                 return -1;
             }
             table = lo & M68K_DESC030_ADDR;
@@ -1043,8 +1066,9 @@ static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
         /*
          * Set the descriptor's Used bit (and Modified on the leaf page
          * for a store) so the guest sees the MMU exercising its tables.
+         * PTEST is a probe and must leave the tables untouched.
          */
-        if (!(access_type & ACCESS_DEBUG)) {
+        if (!(access_type & (ACCESS_DEBUG | ACCESS_PTEST))) {
             uint32_t nd = desc | M68K_DESC030_U;
             if (dt == M68K_DT_PAGE && (access_type & ACCESS_STORE) &&
                 !(desc & M68K_DESC030_WP)) {
@@ -1058,9 +1082,18 @@ static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
     }
 
     if (dt != M68K_DT_PAGE) {
+        if (ptest) {
+            env->mmu.mmusr |= M68K_MMU030_PSR_I;
+        }
         return -1;
     }
+    if (ptest && wp) {
+        env->mmu.mmusr |= M68K_MMU030_PSR_W;
+    }
     if (super_only && !(access_type & ACCESS_SUPER)) {
+        if (ptest) {
+            env->mmu.mmusr |= M68K_MMU030_PSR_S;
+        }
         return -1;
     }
 
@@ -1185,8 +1218,16 @@ bool m68k_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
     }
 
     if (is_030) {
-        /* 030 table walk miss: deliver a data/instruction bus fault */
-        env->mmu.ssw = 0;
+        /*
+         * 030 table walk miss: deliver a data/instruction bus fault.
+         * The SSW carries the function code of the faulted cycle;
+         * Linux keys its user/kernel fault split off it and feeds it
+         * back into PTEST when it re-probes the address.
+         */
+        int fc = (qemu_access_type == MMU_INST_FETCH ? 2 : 1) |
+                 (mmu_idx == MMU_USER_IDX ? 0 : 4);
+
+        env->mmu.ssw = M68K_SSW_FC_030(fc);
         if (qemu_access_type != MMU_INST_FETCH) {
             env->mmu.ssw |= M68K_SSW_DF_030;
         }
@@ -1684,6 +1725,46 @@ void HELPER(ptest)(CPUM68KState *env, uint32_t addr, uint32_t is_read)
                      prot, access_type & ACCESS_SUPER ?
                      MMU_KERNEL_IDX : MMU_USER_IDX, page_size);
     }
+}
+
+/*
+ * 68030 PTEST: walk the translation tables for the address in the
+ * function code named by the extension word and report the result in
+ * the PSR (mmusr).  Linux's bus-error handler re-probes every data
+ * fault this way and keys the page-fault path off the I and WP bits.
+ */
+void HELPER(ptest030)(CPUM68KState *env, uint32_t addr, uint32_t ext)
+{
+    hwaddr physical;
+    int prot;
+    target_ulong page_size;
+    int access_type = ACCESS_PTEST | ACCESS_DATA;
+    int fcfield = ext & 0x1f;
+    int fc;
+
+    /* the fc operand: immediate, data register, or SFC/DFC */
+    if (fcfield & 0x10) {
+        fc = fcfield & 7;
+    } else if (fcfield & 0x08) {
+        fc = env->dregs[fcfield & 7] & 7;
+    } else if (fcfield & 0x01) {
+        fc = env->dfc & 7;
+    } else {
+        fc = env->sfc & 7;
+    }
+    if (fc & 4) {
+        access_type |= ACCESS_SUPER;
+    }
+    if ((fc & 3) == 2) {
+        access_type |= ACCESS_CODE;
+    }
+    if (!(ext & (1 << 9))) {            /* PTESTW */
+        access_type |= ACCESS_STORE;
+    }
+
+    env->mmu.mmusr = 0;
+    get_physical_address_030(env, &physical, &prot, addr,
+                             access_type, &page_size);
 }
 
 void HELPER(pflush)(CPUM68KState *env, uint32_t addr, uint32_t opmode)
