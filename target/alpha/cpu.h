@@ -460,6 +460,7 @@ typedef enum AlphaMMUIdx {
     AlphaMMUIdx_PrivilegedVPTE,
     AlphaMMUIdx_PrivilegedWChk,
     AlphaMMUIdx_AltMode,
+    AlphaMMUIdx_AltModeVPTE,
     AlphaMMUIdx_AltModeWChk,
 } AlphaMMUIdx;
 
@@ -484,6 +485,7 @@ typedef enum AlphaMMUIdxBit {
     MMUIDX_TO_BIT(PrivilegedVPTE),
     MMUIDX_TO_BIT(PrivilegedWChk),
     MMUIDX_TO_BIT(AltMode),
+    MMUIDX_TO_BIT(AltModeVPTE),
     MMUIDX_TO_BIT(AltModeWChk),
 } AlphaMMUIdxBit;
 

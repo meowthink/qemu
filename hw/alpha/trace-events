@@ -28,6 +28,21 @@ tsunami_iommu_translate_success(const char *n, uint64_t iova, uint64_t translate
 tsunami_iommu_invalid_pte(uint64_t pte) "pte=0x%" PRIx64
 tsunami_iommu_get_pte(uint64_t pte_addr, uint64_t pte) "pte_addr=0x%" PRIx64 " pte=0x%" PRIx64
 
+# pyxis.c
+pyxis_csr_write(uint64_t addr, uint64_t val, unsigned len) "addr=0x%"PRIx64 " val=0x%"PRIx64 " len=%u"
+pyxis_csr_read(uint64_t addr, uint64_t val, unsigned len) "addr=0x%"PRIx64 " val=0x%"PRIx64 " len=%u"
+pyxis_mctl_write(uint64_t addr, uint64_t val, unsigned len) "addr=0x%"PRIx64 " val=0x%"PRIx64 " len=%u"
+pyxis_mctl_read(uint64_t addr, uint64_t val, unsigned len) "addr=0x%"PRIx64 " val=0x%"PRIx64 " len=%u"
+pyxis_irq_write(uint64_t addr, uint64_t val, unsigned len) "addr=0x%"PRIx64 " val=0x%"PRIx64 " len=%u"
+pyxis_irq_read(uint64_t addr, uint64_t val, unsigned len) "addr=0x%"PRIx64 " val=0x%"PRIx64 " len=%u"
+pyxis_blackhole_write(uint64_t addr, uint64_t val, unsigned len) "addr=0x%"PRIx64 " val=0x%"PRIx64 " len=%u"
+pyxis_device_irq_update(int irq, int level) "irq=%d level=%d"
+pyxis_pcihost_set_irq(int irq, int level) "irq=%d level=%d"
+pyxis_iommu_translate_abort(const char *n, uint64_t iova) "%s translation abort on iova=0x%" PRIx64
+pyxis_iommu_translate_success(const char *n, uint64_t iova, uint64_t translated) "%s translation success iova=0x%" PRIx64 " translated=0x%" PRIx64
+pyxis_iommu_invalid_pte(uint64_t pte) "pte=0x%" PRIx64
+pyxis_iommu_get_pte(uint64_t pte_addr, uint64_t pte) "pte_addr=0x%" PRIx64 " pte=0x%" PRIx64
+
 # tigbus.c
 tigbus_unassigned_read(uint64_t addr, int size) "reading unassigned addr 0x%"PRIx64 " size %d"
 tigbus_unassigned_write(uint64_t addr, uint64_t val, int size) "writing unassigned addr 0x%"PRIx64 " value 0x%"PRIx64 " size %d"

@@ -948,6 +948,17 @@ bool alpha_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
                access_type == MMU_DATA_STORE);
         map_idx = alpha_mmu_index_altmode(env);
         break;
+    case AlphaMMUIdx_AltModeVPTE:
+        /*
+         * HW_LD with both VPTE and ALT set (hw_ld/av): the address is
+         * virtual with access checks using the DTB_ALT_MODE IPR, and the
+         * VPTE bit flags a virtual PTE fetch so a TBMISS is classified as
+         * a double TBMISS (21164 HRM table 6-4).
+         */
+        assert(access_type == MMU_DATA_LOAD);
+        map_idx = alpha_mmu_index_altmode(env);
+        gpaf.vpte_fetch = true;
+        break;
     case AlphaMMUIdx_AltModeWChk:
         /*
          * Table 6–3 HW_LD Instruction Fields Descriptions

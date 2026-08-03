@@ -952,6 +952,14 @@ void alpha_cpu_do_interrupt(CPUState *cs)
         break;
 
     case EXCP_ITB_MISS:
+        /*
+         * The 21164 latches the faulting virtual address into ITB_TAG
+         * on an ITBMISS (HRM 5.1.1); the SRM PALcode relies on this and
+         * writes only ITB_PTE after the miss.
+         */
+        if (env->implver == IMPLVER_21164) {
+            env->ipr.itb_tag = env->pc & R_EV5_ITB_TAG_VA_MASK;
+        }
         alpha_update_exception_state(env, flags, 0);
         break;
 
@@ -1931,7 +1939,7 @@ static const AlphaIPRegInfo ev5_ibox_ip_reginfo[] = {
       .resetvalue = 0,
       .fieldoffset = offsetof(CPUAlphaState, ipr.itb_pte_temp) },
     { .name = "ITB_ASN", .ipr = EV5_IPR_ITB_ASN,
-      .access = IPR_W,
+      .access = IPR_RW,
       .resetvalue = 0,
       .fieldoffset = offsetof(CPUAlphaState, ipr.itb_asn),
       .writefn = ev5_itb_asn_write, .raw_writefn = raw_write },
@@ -2048,14 +2056,22 @@ static void ev5_dtb_cm_write(CPUAlphaState *env, const AlphaIPRegInfo *ri,
 static void ev5_dtb_tag_write(CPUAlphaState *env, const AlphaIPRegInfo *ri,
                           uint64_t value)
 {
-    raw_write(env, ri, value & R_EV5_DTB_TAG_VA_MASK);
+    AlphaTLBType type = AlphaTLBType_Data;
+    int asn = alpha_cur_asn(env, type, 0);
+    uint64_t tag = value & R_EV5_DTB_TAG_VA_MASK;
+
+    /*
+     * HRM 5.2.3: writing DTB_TAG writes the tag and the contents of the
+     * DTB_PTE register to the DTB.  The PTE is not transferred until the
+     * DTB_TAG write, so the fill happens here with the pending PTE.
+     */
+    raw_write(env, ri, tag);
+    alpha_tlb_fill(env, type, tag, env->ipr.dtb_pte, asn);
 }
 
 static void ev5_dtb_pte_write(CPUAlphaState *env, const AlphaIPRegInfo *ri,
                               uint64_t value)
 {
-    AlphaTLBType type = AlphaTLBType_Data;
-    int asn = alpha_cur_asn(env, type, 0);
     uint64_t mask = R_EV5_DTB_PTE_FOR_MASK | R_EV5_DTB_PTE_FOW_MASK |
                     R_EV5_DTB_PTE_ASM_MASK | R_EV5_DTB_PTE_GH_MASK |
                     R_EV5_DTB_PTE_KRE_MASK | R_EV5_DTB_PTE_ERE_MASK |
@@ -2064,9 +2080,11 @@ static void ev5_dtb_pte_write(CPUAlphaState *env, const AlphaIPRegInfo *ri,
                     R_EV5_DTB_PTE_SWE_MASK | R_EV5_DTB_PTE_UWE_MASK |
                     R_EV5_DTB_PTE_PFN_MASK;
 
-    value &= mask;
-    alpha_tlb_fill(env, type, env->ipr.dtb_tag[0], value, asn);
-    env->ipr.dtb_pte = value;
+    /*
+     * HRM 5.2.4: writing DTB_PTE only updates the pending PTE; it is not
+     * transferred to the DTB until the DTB_TAG register is written.
+     */
+    env->ipr.dtb_pte = value & mask;
     env->ipr.dtb_pte_temp = env->ipr.dtb_pte;
 }
 
@@ -2202,7 +2220,7 @@ static const AlphaIPRegInfo ev5_mbox_ip_reginfo[] = {
       .fieldoffset = offsetof(CPUAlphaState, ipr.cc_ctl),
       .writefn = cc_ctl_write, .raw_writefn = raw_write },
     { .name = "MCSR", .ipr = EV5_IPR_MCSR,
-      .access = IPR_W,
+      .access = IPR_RW,
       .resetvalue = 0,
       .fieldoffset = offsetof(CPUAlphaState, ipr.mcsr),
       .writefn = ev5_mcsr_write, .raw_writefn = raw_write },

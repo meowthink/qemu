@@ -12,7 +12,7 @@
 %off21          0:s21
 %func26         0:26
 %func16         0:16
-%func10_2_13_3  10:2 13:3
+%func13_3_10_2  13:3 10:2
 %func13_3       13:3
 %func12_1       12:1
 %func11_2       11:2
@@ -55,7 +55,7 @@
 @hw_ldst_ev4    ...... ..... .....  ... . ............ \
                 &hwldst ra=%ra rb=%rb type=%func13_3 len=%func12_1 disp=%off12
 @hw_ldst_ev5    ...... ..... ..... ... . .. .......... \
-                &hwldst ra=%ra rb=%rb type=%func10_2_13_3 len=%func12_1 \
+                &hwldst ra=%ra rb=%rb type=%func13_3_10_2 len=%func12_1 \
                         disp=%off10
 @hw_ldst_ev6    ...... ..... .....  ... . ............ \
                 &hwldst ra=%ra rb=%rb type=%func13_3 len=%func12_1 disp=%off12

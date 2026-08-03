@@ -24,3 +24,23 @@ config AM29F016
 
 config TIGBUS
     bool
+
+config LX164
+    bool
+    default y
+    depends on ALPHA
+    imply PCI_DEVICES
+    imply TEST_DEVICES
+    select PFLASH_CFI01
+    select PYXIS
+    select I82378
+    select SMC37C669
+    select IDE_CMD646
+    select MC146818RTC
+    select LSI_SCSI_PCI
+
+config PYXIS
+    bool
+    default y
+    depends on ALPHA
+    select PCI
