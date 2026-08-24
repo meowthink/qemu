@@ -972,6 +972,41 @@ static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
         }
     }
 
+    /*
+     * Software ATC (see cpu.h): serve repeat translations of a guest
+     * page from the cache without touching the tables, like the real
+     * 22-entry ATC.  PTEST must really probe the tables, and a first
+     * STORE to a page cached by a read re-walks so the M bit lands in
+     * the descriptor.
+     */
+    /*
+     * The IS field's initial shift removes the top address bits from
+     * translation entirely, so they must not distinguish ATC entries
+     * either (MacOS reaches the same page through plain and through
+     * 24-bit-tagged pointers, e.g. 0x004F9E vs 0x80004F9E under IS=8).
+     */
+    uint32_t vkey = address & (0xffffffffu >> M68K_TC030_IS(tc));
+
+    if (!(access_type & (ACCESS_PTEST | ACCESS_DEBUG))) {
+        for (i = 0; i < ARRAY_SIZE(env->mmu.atc030); i++) {
+            typeof(env->mmu.atc030[0]) *e = &env->mmu.atc030[i];
+
+            if (e->mask && (vkey & ~e->mask) == e->vaddr) {
+                if (e->super_only && !(access_type & ACCESS_SUPER)) {
+                    break;      /* re-walk for the correct violation */
+                }
+                if ((access_type & ACCESS_STORE) &&
+                    (!(e->prot & PAGE_WRITE) || !e->dirty)) {
+                    break;      /* WP fault or M-bit update: re-walk */
+                }
+                *physical = e->paddr | (address & e->mask);
+                *page_size = e->mask + 1;
+                *prot = e->prot;
+                return 0;
+            }
+        }
+    }
+
     uint32_t limit_word;
     bool limited;
 
@@ -1087,6 +1122,17 @@ static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
         }
         return -1;
     }
+    /*
+     * PAGE descriptors (both formats) hold the page address in bits
+     * 31-8; bits 7-4 are status (M, CI, ...), unlike table descriptors
+     * whose address field extends down to bit 4.  Masking only the low
+     * nibble leaked a set M/U bit (e.g. short page descriptor
+     * 0x007F8019 -> "frame" 0x7F8010) into the physical address: the
+     * Mac IIsi System boot then wrote its MMU-table wipe 16 bytes
+     * high, which crossed a 4K boundary at offset 0xFFC and corrupted
+     * the live level-A table.
+     */
+    table &= 0xffffff00;
     if (ptest && wp) {
         env->mmu.mmusr |= M68K_MMU030_PSR_W;
     }
@@ -1109,14 +1155,56 @@ static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
         *physical = table + address;
         *page_size = TARGET_PAGE_SIZE;
     } else {
-        *page_size = 1u << shift;
-        *physical = (table & ~(*page_size - 1)) | (address & (*page_size - 1));
+        /*
+         * Early termination: the descriptor's page address is only
+         * required to be page-size (PS) aligned, NOT aligned to the
+         * whole span covered by the remaining logical bits, which are
+         * ADDED to it (68030 UM 9.5.3).  The Mac IIsi ROM relies on
+         * this: its 24-bit map relocates each 1 MB of logical RAM to
+         * frame N*0x100000 + 0x50000 (the bottom 320 KiB of RAM is the
+         * onboard video frame buffer).  Masking the frame down to the
+         * span made that map an identity map, so the PrimaryInit gray
+         * fill of the screen destroyed low memory.  Only advertise the
+         * full span to the TLB when the frame is span-aligned (the
+         * addend is span-constant either way, but tlb_set_page expects
+         * aligned large pages).
+         */
+        uint32_t span = 1u << shift;
+
+        *physical = table + (address & (span - 1));
+        *page_size = (table & (span - 1)) ? TARGET_PAGE_SIZE : span;
     }
     *prot = PAGE_READ | PAGE_EXEC;
     if (!wp) {
         *prot |= PAGE_WRITE;
     } else if (access_type & ACCESS_STORE) {
         return -1;
+    }
+
+    /* record the walk in the software ATC */
+    if (!(access_type & (ACCESS_PTEST | ACCESS_DEBUG))) {
+        uint32_t mask = *page_size - 1;
+        uint32_t vpage = vkey & ~mask;
+        typeof(env->mmu.atc030[0]) *e = NULL;
+
+        for (i = 0; i < ARRAY_SIZE(env->mmu.atc030); i++) {
+            if (env->mmu.atc030[i].mask &&
+                env->mmu.atc030[i].vaddr == vpage) {
+                e = &env->mmu.atc030[i];
+                break;
+            }
+        }
+        if (!e) {
+            e = &env->mmu.atc030[env->mmu.atc030_next];
+            env->mmu.atc030_next = (env->mmu.atc030_next + 1) %
+                                   ARRAY_SIZE(env->mmu.atc030);
+        }
+        e->vaddr = vpage;
+        e->mask = mask;
+        e->paddr = *physical & ~mask;
+        e->prot = *prot;
+        e->super_only = super_only;
+        e->dirty = (access_type & ACCESS_STORE) != 0;
     }
     return 0;
 }
@@ -1788,6 +1876,7 @@ void HELPER(pflush)(CPUM68KState *env, uint32_t addr, uint32_t opmode)
 /* 030 PMMU register writes and PFLUSH invalidate any cached translation */
 void HELPER(pmmu030_flush)(CPUM68KState *env)
 {
+    memset(env->mmu.atc030, 0, sizeof(env->mmu.atc030));
     tlb_flush(env_cpu(env));
 }
 

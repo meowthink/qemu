@@ -151,6 +151,26 @@ typedef struct CPUArchState {
         uint32_t tt030[2];
         uint32_t srp030[2];
         uint32_t crp030[2];
+        /*
+         * Software model of the 030 ATC: successful table walks are
+         * cached at guest page granularity and reused without
+         * re-walking until the next PMOVE/PFLUSH.  Guests genuinely
+         * rely on translations surviving table updates: MacOS zeroes
+         * the region holding its LIVE tables (whose own translation it
+         * just used) while rebuilding the MMU maps in place, before
+         * loading the new root pointer.  QEMU's TLB fills at
+         * TARGET_PAGE (4K) granularity, so without this cache a 32K
+         * guest page gets re-walked mid-wipe.
+         */
+        struct {
+            uint32_t vaddr;     /* page base */
+            uint32_t mask;      /* page_size - 1, 0 = entry invalid */
+            uint32_t paddr;     /* physical page base */
+            uint8_t prot;
+            uint8_t super_only;
+            uint8_t dirty;      /* store walk (M bit) already done */
+        } atc030[16];
+        int atc030_next;
     } mmu;
 
     /* Control registers.  */
