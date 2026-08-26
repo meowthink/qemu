@@ -4669,8 +4669,9 @@ DISAS_INSN(ptest)
 }
 
 /*
- * 68030 on-chip PMMU coprocessor instructions (cp-id 0): PMOVE,
- * PTEST, PFLUSH, PLOAD.  Translation is implemented by
+ * 68030 on-chip PMMU / MC68851 coprocessor instructions (cp-id 0):
+ * PMOVE, PTEST, PFLUSH, PLOAD, plus PFLUSHR/PVALID and the extra
+ * registers on the 68851.  Translation is implemented by
  * get_physical_address_030(); MMU register writes and PFLUSH must
  * drop cached TLB entries and end the TB.
  */
@@ -4682,6 +4683,7 @@ DISAS_INSN(pmmu030)
     int reg_to_mem, preg;
     int ofs = -1, ofs2 = -1;
     int opsize = OS_LONG;
+    bool is_68851 = m68k_feature(env, M68K_FEATURE_M68851);
 
     if (IS_USER(s)) {
         gen_exception(s, s->base.pc_next, EXCP_PRIVILEGE);
@@ -4692,21 +4694,40 @@ DISAS_INSN(pmmu030)
     preg = (ext >> 10) & 7;
 
     switch (ext >> 13) {
-    case 0: /* PMOVE to/from TT0/TT1 */
-        if (preg == 2) {
-            ofs = offsetof(CPUM68KState, mmu.tt030[0]);
-        } else if (preg == 3) {
-            ofs = offsetof(CPUM68KState, mmu.tt030[1]);
+    case 0: /* PMOVE to/from TT0/TT1 (68030 only; the 68851 has no TTx) */
+        if (!is_68851) {
+            if (preg == 2) {
+                ofs = offsetof(CPUM68KState, mmu.tt030[0]);
+            } else if (preg == 3) {
+                ofs = offsetof(CPUM68KState, mmu.tt030[1]);
+            }
         }
         break;
-    case 1: /* PFLUSH/PLOAD */
+    case 1: /* PFLUSH/PLOAD (68851 also: PVALID, PFLUSHS) */
         /*
-         * PLOAD and the ea-form of PFLUSH carry an effective address
-         * whose extension words must be consumed even though we hold no
+         * 68851 PVALID: compares the access-level bits of the ea
+         * address against VAL (ext 0x2800) or an An (ext 0x2c00+n).
+         * Access levels are modelled as disabled (AC is plain
+         * storage), so no violation can arise: consume the ea and
+         * leave the ATC alone.
+         */
+        if (is_68851 && (ext & 0xfbf8) == 0x2800) {
+            addr = gen_lea(env, s, insn, OS_LONG);
+            if (IS_NULL_QREG(addr)) {
+                gen_addr_fault(s);
+                return;
+            }
+            return;
+        }
+        /*
+         * PLOAD and the ea-form of PFLUSH (and of the 68851-only
+         * PFLUSHS, ext 0x3c00) carry an effective address whose
+         * extension words must be consumed even though we hold no
          * ATC state (missing this desynchronizes the instruction
          * stream).
          */
-        if ((ext & 0xfde0) == 0x2000 || (ext & 0xfe00) == 0x3800) {
+        if ((ext & 0xfde0) == 0x2000 || (ext & 0xfe00) == 0x3800 ||
+            (is_68851 && (ext & 0xfe00) == 0x3c00)) {
             addr = gen_lea(env, s, insn, OS_LONG);
             if (IS_NULL_QREG(addr)) {
                 gen_addr_fault(s);
@@ -4716,7 +4737,7 @@ DISAS_INSN(pmmu030)
         gen_helper_pmmu030_flush(tcg_env);
         gen_exit_tb(s);
         return;
-    case 2: /* PMOVE to/from TC/SRP/CRP */
+    case 2: /* PMOVE to/from TC/SRP/CRP (68851 also: DRP/CAL/VAL/SCC/AC) */
         if (preg == 0) {
             ofs = offsetof(CPUM68KState, mmu.tc030);
         } else if (preg == 2) {
@@ -4725,12 +4746,61 @@ DISAS_INSN(pmmu030)
         } else if (preg == 3) {
             ofs = offsetof(CPUM68KState, mmu.crp030[0]);
             ofs2 = offsetof(CPUM68KState, mmu.crp030[1]);
+        } else if (is_68851) {
+            switch (preg) {
+            case 1: /* DMA root pointer; nothing translates through it */
+                ofs = offsetof(CPUM68KState, mmu.drp851[0]);
+                ofs2 = offsetof(CPUM68KState, mmu.drp851[1]);
+                break;
+            case 4:
+                ofs = offsetof(CPUM68KState, mmu.cal851);
+                opsize = OS_BYTE;
+                break;
+            case 5:
+                ofs = offsetof(CPUM68KState, mmu.val851);
+                opsize = OS_BYTE;
+                break;
+            case 6:
+                ofs = offsetof(CPUM68KState, mmu.scc851);
+                opsize = OS_BYTE;
+                break;
+            case 7:
+                ofs = offsetof(CPUM68KState, mmu.ac851);
+                opsize = OS_WORD;
+                break;
+            }
         }
         break;
-    case 3: /* PMOVE to/from MMUSR (PSR) */
+    case 3: /* PMOVE to/from MMUSR (PSR) (68851 also: PCSR/BADx/BACx) */
         if (preg == 0) {
             ofs = offsetof(CPUM68KState, mmu.mmusr);
             opsize = OS_WORD;
+        } else if (is_68851) {
+            int bpn = (ext >> 2) & 7;
+
+            if (preg == 1) {
+                ofs = offsetof(CPUM68KState, mmu.pcsr851);
+                opsize = OS_WORD;
+            } else if (preg == 4) {
+                ofs = offsetof(CPUM68KState, mmu.bad851[bpn]);
+                opsize = OS_WORD;
+            } else if (preg == 5) {
+                ofs = offsetof(CPUM68KState, mmu.bac851[bpn]);
+                opsize = OS_WORD;
+            }
+        }
+        break;
+    case 5: /* 68851 PFLUSHR: flush entries loaded via a root pointer */
+        if (is_68851 && (ext & 0x1c00) == 0) {
+            /* the ea names an 8-byte RP descriptor; we flush everything */
+            addr = gen_lea(env, s, insn, OS_LONG);
+            if (IS_NULL_QREG(addr)) {
+                gen_addr_fault(s);
+                return;
+            }
+            gen_helper_pmmu030_flush(tcg_env);
+            gen_exit_tb(s);
+            return;
         }
         break;
     case 4: /* PTEST: probe the tables, report the result in the PSR */
@@ -4744,6 +4814,39 @@ DISAS_INSN(pmmu030)
     }
     if (ofs < 0) {
         disas_undef(env, s, insn);
+        return;
+    }
+
+    if (ofs2 < 0 && (insn & 0x38) == 0) {
+        /*
+         * Data-register-direct PMOVE for the 16/32-bit registers.
+         * The 68030 only takes memory EAs, but the external MC68851
+         * allows Dn (the Apollo DN3000 boot PROM probes the PMMU
+         * with "pmove %d0,%tc").
+         */
+        TCGv reg = DREG(insn, 0);
+
+        if (reg_to_mem) {
+            tmp = tcg_temp_new();
+            tcg_gen_ld_i32(tmp, tcg_env, ofs);
+            if (opsize == OS_WORD) {
+                tcg_gen_deposit_i32(reg, reg, tmp, 0, 16);
+            } else {
+                tcg_gen_mov_i32(reg, tmp);
+            }
+        } else {
+            if (opsize == OS_WORD) {
+                tmp = tcg_temp_new();
+                tcg_gen_ext16u_i32(tmp, reg);
+            } else {
+                tmp = reg;
+            }
+            tcg_gen_st_i32(tmp, tcg_env, ofs);
+            if (!(ext & 0x100)) {
+                gen_helper_pmmu030_flush(tcg_env);
+                gen_exit_tb(s);
+            }
+        }
         return;
     }
 
@@ -6193,6 +6296,8 @@ void register_m68k_insns (CPUM68KState *env)
     INSN(frestore,  f340, ffc0, FPU);
     INSN(fsave,     f300, ffc0, FPU);
     INSN(pmmu030,   f000, ffc0, M68030);
+    /* MC68851 PMMU: same cp-id 0 encodings, decoded by feature inside */
+    INSN(pmmu030,   f000, ffc0, M68851);
     INSN(intouch,   f340, ffc0, CF_ISA_A);
     INSN(cpushl,    f428, ff38, CF_ISA_A);
     INSN(cpush,     f420, ff20, M68040);

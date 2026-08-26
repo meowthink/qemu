@@ -1,6 +1,9 @@
 config ESCC
     bool
 
+config SCN2681
+    bool
+
 config HTIF
     bool
 

@@ -391,6 +391,27 @@ static void m68k_interrupt_all(CPUM68KState *env, int is_hw)
             bool long_frame = env->mmu.ssw & M68K_SSW_DF_030;
             int i;
 
+            if (!long_frame) {
+                /*
+                 * Instruction fetch fault: the 020/030 report these as
+                 * a fault on instruction-pipe stage C or B.  Linux's
+                 * bus_error030 only treats a fault as an instruction
+                 * fault at all if SSW FC or FB is set, and computes
+                 * the fault address as pc+2 (FC) or pc+4 (FB) from the
+                 * format A frame -- pick whichever stage lands on the
+                 * page that actually missed, otherwise the fetch of an
+                 * unmapped first user page loops forever.
+                 */
+                uint32_t pmask = -1u << TARGET_PAGE_BITS;
+
+                if ((((env->pc + 4) ^ env->mmu.ar) & pmask) == 0 &&
+                    (((env->pc + 2) ^ env->mmu.ar) & pmask) != 0) {
+                    env->mmu.ssw |= M68K_SSW_FB_030;
+                } else {
+                    env->mmu.ssw |= M68K_SSW_FC_BIT_030;
+                }
+            }
+
             if (long_frame) {
                 /* version# and internal registers, frame+0x20..0x53 */
                 for (i = 0; i < 15; i++) {

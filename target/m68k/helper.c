@@ -1086,6 +1086,17 @@ static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
             table = lo & M68K_DESC030_ADDR;
             limit_word = desc;
             limited = true;
+            /*
+             * The S (supervisor-only) bit exists ONLY in long-format
+             * descriptors (bit 8 of the first long word).  In short
+             * descriptors bit 8 is part of the table/page address, so
+             * testing it there marked any user page whose physical
+             * address had bit 8 set as supervisor-only -- Linux user
+             * pages faulted at random and execve() died with EFAULT.
+             */
+            if (desc & 0x100) {
+                super_only = 1;
+            }
         } else {
             table = desc & M68K_DESC030_ADDR;
             limited = false;
@@ -1093,17 +1104,23 @@ static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
         if (desc & M68K_DESC030_WP) {
             wp = 1;
         }
-        if (desc & 0x100) {           /* long descriptor supervisor bit */
-            super_only = 1;
-        }
         dt = desc & 3;
 
         /*
          * Set the descriptor's Used bit (and Modified on the leaf page
          * for a store) so the guest sees the MMU exercising its tables.
          * PTEST is a probe and must leave the tables untouched.
+         *
+         * INVALID descriptors must never be written back: their upper
+         * bits are software-defined and the walk terminates without a
+         * U-bit update on real silicon.  Writing U into an empty
+         * descriptor broke Linux demand paging: an empty pgd entry
+         * (0) came back as 0x8, pud_none() no longer saw it as empty,
+         * __pmd_alloc was skipped, and the kernel dereferenced a
+         * NULL pointer-table base.
          */
-        if (!(access_type & (ACCESS_DEBUG | ACCESS_PTEST))) {
+        if (dt != M68K_DT_INVALID &&
+            !(access_type & (ACCESS_DEBUG | ACCESS_PTEST))) {
             uint32_t nd = desc | M68K_DESC030_U;
             if (dt == M68K_DT_PAGE && (access_type & ACCESS_STORE) &&
                 !(desc & M68K_DESC030_WP)) {
@@ -1217,14 +1234,27 @@ hwaddr m68k_cpu_get_phys_addr_debug(CPUState *cs, vaddr addr)
     int access_type;
     target_ulong page_size;
 
-    if ((env->mmu.tcr & M68K_TCR_ENABLED) == 0) {
-        /* MMU disabled */
-        return addr;
-    }
-
     access_type = ACCESS_DATA | ACCESS_DEBUG;
     if (env->sr & SR_S) {
         access_type |= ACCESS_SUPER;
+    }
+
+    if (m68k_feature(env, M68K_FEATURE_M68030) ||
+        m68k_feature(env, M68K_FEATURE_M68851)) {
+        /* 68030 on-chip PMMU / 68020+68851: 030-style tables off tc030 */
+        if ((env->mmu.tc030 & M68K_TC030_ENABLE) == 0) {
+            return addr;
+        }
+        if (get_physical_address_030(env, &phys_addr, &prot,
+                                     addr, access_type, &page_size) != 0) {
+            return -1;
+        }
+        return phys_addr;
+    }
+
+    if ((env->mmu.tcr & M68K_TCR_ENABLED) == 0) {
+        /* MMU disabled */
+        return addr;
     }
 
     if (get_physical_address(env, &phys_addr, &prot,
@@ -1265,7 +1295,14 @@ bool m68k_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
     int access_type;
     int ret;
     target_ulong page_size;
-    bool is_030 = m68k_feature(env, M68K_FEATURE_M68030);
+    /*
+     * The MC68851 (on a 68020) uses the same long-format tables and
+     * TC/CRP/SRP registers as the 68030's on-chip PMMU: both translate
+     * through get_physical_address_030() and both fault with 68020/030
+     * format A/B bus-error frames.
+     */
+    bool is_030 = m68k_feature(env, M68K_FEATURE_M68030) ||
+                  m68k_feature(env, M68K_FEATURE_M68851);
     bool mmu_enabled = is_030 ? (env->mmu.tc030 & M68K_TC030_ENABLE)
                               : (env->mmu.tcr & M68K_TCR_ENABLED);
 

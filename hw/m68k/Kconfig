@@ -1,3 +1,12 @@
+config APOLLO
+    bool
+    default y
+    depends on M68K
+    select ISA_BUS
+    select I8259
+    select MC146818RTC
+    select SCN2681
+
 config AN5206
     bool
     default y

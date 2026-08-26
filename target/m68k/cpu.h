@@ -152,6 +152,24 @@ typedef struct CPUArchState {
         uint32_t srp030[2];
         uint32_t crp030[2];
         /*
+         * MC68851-only registers.  The 68030's on-chip PMMU is a
+         * subset of the 68851: TC/CRP/SRP/PSR and the long-format
+         * table walk are shared (tc030/srp030/crp030 above), but the
+         * 68851 additionally has a DMA root pointer, access-level
+         * control (CAL/VAL/SCC/AC) and breakpoint registers
+         * (BAD/BAC), and lacks the 030's TT0/TT1.  Linux only uses
+         * the common subset; these are plain storage so that PMOVE
+         * to/from them round-trips.
+         */
+        uint32_t drp851[2];
+        uint32_t cal851;        /* current access level (byte reg) */
+        uint32_t val851;        /* validate access level (byte reg) */
+        uint32_t scc851;        /* stack change control (byte reg) */
+        uint32_t ac851;         /* access control (word reg) */
+        uint32_t pcsr851;       /* PMMU cache status (word reg) */
+        uint32_t bad851[8];     /* breakpoint acknowledge data (word) */
+        uint32_t bac851[8];     /* breakpoint acknowledge control (word) */
+        /*
          * Software model of the 030 ATC: successful table walks are
          * cached at guest page granularity and reused without
          * re-walking until the next PMOVE/PFLUSH.  Guests genuinely
@@ -323,6 +341,16 @@ typedef enum {
 #define M68K_TM_040_SUPER 0x0004
 
 /* bits for 68020/030 bus fault special status word */
+/*
+ * FC/FB: fault on instruction-pipe stage C/B.  One of them must be
+ * set when an instruction fetch faults: Linux's bus_error030 only
+ * handles an instruction fault if (ssw & (FC | FB)), and computes the
+ * fault address as pc+4 (FB) or pc+2 (FC) from a format A frame --
+ * without them it returns without mapping anything and the fetch
+ * faults forever.
+ */
+#define M68K_SSW_FC_BIT_030 0x8000
+#define M68K_SSW_FB_030   0x4000
 #define M68K_SSW_DF_030   0x0100
 #define M68K_SSW_RW_030   0x0040
 
@@ -606,6 +634,15 @@ enum m68k_features {
     M68K_FEATURE_M68030,
     M68K_FEATURE_M68040,
     M68K_FEATURE_M68060,
+    /*
+     * MC68851 PMMU coprocessor paired with a 68020 (cp-id 0).  The
+     * 68030's on-chip PMMU is a subset of the 68851, so the 030
+     * PMMU machinery (PMOVE/PFLUSH/PTEST/PLOAD decode, the
+     * get_physical_address_030() table walk) is enabled by this
+     * feature too, plus the 68851-only registers.  Never set together
+     * with M68K_FEATURE_M68030.
+     */
+    M68K_FEATURE_M68851,
     /* Base Coldfire set Rev A. */
     M68K_FEATURE_CF_ISA_A,
     /* (ISA B or C). */

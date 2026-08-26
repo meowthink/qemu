@@ -240,7 +240,25 @@ static void virt_init(MachineState *machine)
         param_ptr = param_blob;
 
         BOOTINFO1(param_ptr, BI_MACHTYPE, MACH_VIRT);
-        if (m68k_feature(&cpu->env, M68K_FEATURE_M68020)) {
+        /*
+         * Exactly one BI_CPUTYPE record must be emitted: the kernel's
+         * head.S get_bi_record() returns the FIRST record with a
+         * matching tag, so an unconditional CPU_68000 record ahead of
+         * the real one makes head.S misdetect every CPU (it then
+         * assumes a 68030 and faults on PMOVE %ttx on anything else).
+         */
+        if (m68k_feature(&cpu->env, M68K_FEATURE_M68010)) {
+            BOOTINFO1(param_ptr, BI_CPUTYPE, CPU_68010);
+	}
+        else if (m68k_feature(&cpu->env, M68K_FEATURE_M68020)) {
+            if (m68k_feature(&cpu->env, M68K_FEATURE_M68851)) {
+                /*
+                 * 68020 with 68851 PMMU in the coprocessor socket; the
+                 * FPU the 68020 model exposes is the 68881 coprocessor.
+                 */
+                BOOTINFO1(param_ptr, BI_FPUTYPE, FPU_68881);
+                BOOTINFO1(param_ptr, BI_MMUTYPE, MMU_68851);
+            }
             BOOTINFO1(param_ptr, BI_CPUTYPE, CPU_68020);
         } else if (m68k_feature(&cpu->env, M68K_FEATURE_M68030)) {
             BOOTINFO1(param_ptr, BI_MMUTYPE, MMU_68030);
@@ -253,6 +271,8 @@ static void virt_init(MachineState *machine)
             BOOTINFO1(param_ptr, BI_FPUTYPE, FPU_68060);
             BOOTINFO1(param_ptr, BI_MMUTYPE, MMU_68060);
             BOOTINFO1(param_ptr, BI_CPUTYPE, CPU_68060);
+        } else {
+            BOOTINFO1(param_ptr, BI_CPUTYPE, CPU_68000);
         }
         BOOTINFO2(param_ptr, BI_MEMCHUNK, 0, ram_size);
 

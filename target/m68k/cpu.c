@@ -283,6 +283,22 @@ static void m68020_cpu_initfn(Object *obj)
 }
 
 /*
+ * A 68020 with the MC68851 PMMU coprocessor in its socket: adds the
+ * cp-id 0 coprocessor instructions PMOVE, PTEST, PLOAD, PFLUSH[A],
+ * PFLUSHR, PVALID and paged address translation through the 68851's
+ * long-format tables (shared with the 68030's on-chip PMMU, which is
+ * a subset of the 68851).  This is the Apollo DN3000 / Amiga A2620 /
+ * Mac II A/UX class of machine.
+ */
+static void m68020_68851_cpu_initfn(Object *obj)
+{
+    CPUM68KState *env = cpu_env(CPU(obj));
+
+    m68020_cpu_initfn(obj);
+    m68k_set_feature(env, M68K_FEATURE_M68851);
+}
+
+/*
  * Adds: PFLUSH (*5)
  * 68030 Only: PFLUSHA (*5), PLOAD (*5), PMOVE
  * 68030/40 Only: PTEST
@@ -799,6 +815,12 @@ static const TypeInfo m68k_cpus_type_infos[] = {
     DEFINE_M68K_CPU_TYPE_M68K(m68000),
     DEFINE_M68K_CPU_TYPE_M68K(m68010),
     DEFINE_M68K_CPU_TYPE_M68K(m68020),
+    { /* 68020 with a 68851 PMMU coprocessor ("-cpu m68020-68851") */
+        .name = M68K_CPU_TYPE_NAME("m68020-68851"),
+        .instance_init = m68020_68851_cpu_initfn,
+        .parent = TYPE_M68K_CPU,
+        .class_init = m68k_cpu_class_init_m68k_core
+    },
     DEFINE_M68K_CPU_TYPE_M68K(m68030),
     DEFINE_M68K_CPU_TYPE_M68K(m68040),
     DEFINE_M68K_CPU_TYPE_M68K(m68060),
