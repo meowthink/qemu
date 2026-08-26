@@ -752,6 +752,69 @@ static int check_TTR(uint32_t ttr, int *prot, target_ulong addr,
     return 1;
 }
 
+/*
+ * check_TTR() above decodes the transparent-translation "mode match"
+ * field the way the 68040's TTR registers encode it: a 2-bit S field
+ * at bits 14:13 (M68K_TTR_SFIELD).  The 68030's on-chip PMMU TT0/TT1
+ * registers -- what get_physical_address_030() below actually checks
+ * -- use a completely different encoding at that bit position: bits
+ * 6:4 are a 3-bit function-code "base" and bits 2:0 a 3-bit FC "mask"
+ * (mask bit set = don't-care for that FC bit), per the MC68030 user's
+ * manual.  Reusing check_TTR() for tt030[] silently misreads those FC
+ * bits as an all-zero S field, i.e. M68K_TTR_SFIELD_USER, so it
+ * rejects every supervisor-mode access a 68030 TT register was set up
+ * to transparently map (e.g. Linux/m68k head.S's mmu_map_tt, which
+ * builds exactly this FC-base/FC-mask style record for non-040/060
+ * CPUs) -- the access falls through to the page tables instead, and
+ * faults if they don't separately cover it.  Match the real 68030
+ * format here instead.
+ */
+static int check_TTR030(uint32_t ttr, int *prot, target_ulong addr,
+                        int access_type)
+{
+    uint32_t base, mask, fc, fc_base, fc_mask;
+
+    /* check if transparent translation is enabled */
+    if ((ttr & M68K_TTR_ENABLED) == 0) {
+        return 0;
+    }
+
+    /*
+     * Function code the CPU would drive for this access: FC2 set for
+     * supervisor accesses, FC1 set for program (instruction) space,
+     * FC0 set for data space -- i.e. 1/2/5/6 for user data/user
+     * program/super data/super program.
+     */
+    fc = (access_type & ACCESS_SUPER ? 4 : 0) |
+         (access_type & ACCESS_CODE ? 2 : 1);
+    fc_base = (ttr >> 4) & 7;
+    fc_mask = ttr & 7;
+    if ((fc & ~fc_mask) != (fc_base & ~fc_mask)) {
+        return 0;
+    }
+
+    /* check address matching */
+
+    base = ttr & M68K_TTR_ADDR_BASE;
+    mask = (ttr & M68K_TTR_ADDR_MASK) ^ M68K_TTR_ADDR_MASK;
+    mask <<= M68K_TTR_ADDR_MASK_SHIFT;
+
+    if ((addr & mask) != (base & mask)) {
+        return 0;
+    }
+
+    *prot = PAGE_READ | PAGE_EXEC;
+    /*
+     * bit 8 is RWM (R/W field is a don't-care -- both directions
+     * match); bit 7 is R/W itself (1 = read-only) when RWM is clear.
+     */
+    if ((ttr & 0x0100) || !(ttr & 0x0080)) {
+        *prot |= PAGE_WRITE;
+    }
+
+    return 1;
+}
+
 static int get_physical_address(CPUM68KState *env, hwaddr *physical,
                                 int *prot, target_ulong address,
                                 int access_type, target_ulong *page_size)
@@ -994,7 +1057,11 @@ static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
     bool ptest = access_type & ACCESS_PTEST;
     MemTxResult txres;
 
-    /* transparent translation: the 030 TT registers match the 040 TTR */
+    /*
+     * Transparent translation: the 030 TT registers pack their FC
+     * base/mask mode-match field differently from the 040's TTR, so
+     * this needs check_TTR030(), not check_TTR() -- see its comment.
+     */
     for (i = 0; i < 2; i++) {
         if (check_TTR030(env->mmu.tt030[i], prot, address, access_type)) {
             if (ptest) {
