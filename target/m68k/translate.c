@@ -4809,7 +4809,21 @@ DISAS_INSN(pmmu030)
             gen_addr_fault(s);
             return;
         }
-        gen_helper_ptest030(tcg_env, addr, tcg_constant_i32(ext));
+        {
+            /*
+             * With the A bit set, An receives the physical address of
+             * the last table descriptor fetched (the Sun-3/80 monitor
+             * reads and patches its page tables through this).
+             */
+            TCGv an = AREG(ext, 5);
+            TCGv res = tcg_temp_new();
+
+            gen_helper_ptest030(res, tcg_env, addr,
+                                tcg_constant_i32(ext), an);
+            if (ext & (1 << 8)) {
+                tcg_gen_mov_i32(an, res);
+            }
+        }
         return;
     }
     if (ofs < 0) {
@@ -4844,8 +4858,11 @@ DISAS_INSN(pmmu030)
             tcg_gen_st_i32(tmp, tcg_env, ofs);
             if (!(ext & 0x100)) {
                 gen_helper_pmmu030_flush(tcg_env);
-                gen_exit_tb(s);
+            } else {
+                /* FD: the ATC survives, but QEMU's TLB must not */
+                gen_helper_pmmu030_flush_fd(tcg_env);
             }
+            gen_exit_tb(s);
         }
         return;
     }
@@ -4874,15 +4891,25 @@ DISAS_INSN(pmmu030)
             tcg_gen_st_i32(tmp, tcg_env, ofs2);
         }
         /*
-         * The FD (flush disable) bit keeps cached translations alive:
-         * MacOS sequences its MMU-mode switch as PMOVEFD to CRP followed
-         * by PMOVE to TC, relying on ATC entries covering the transient
-         * mismatch between the two.
+         * The FD (flush disable) bit keeps the guest-visible ATC
+         * (atc030) alive: MacOS sequences its MMU-mode switch as
+         * PMOVEFD to CRP followed by PMOVE to TC, relying on ATC
+         * entries covering the transient mismatch between the two.
+         * QEMU's own softmmu TLB is still flushed on either form --
+         * it holds translations the real ATC never did (identity
+         * mappings from TC.E=0 periods, unbounded entry count); a
+         * refill after the flush is served from atc030, which is
+         * what FD really preserves.  The Sun-3/80 PROM loads
+         * TC/CRP/SRP exclusively with PMOVEFD (using PFLUSHA
+         * separately), so the FD form must not leave stale QEMU TLB
+         * entries behind.
          */
         if (!(ext & 0x100)) {
             gen_helper_pmmu030_flush(tcg_env);
-            gen_exit_tb(s);
+        } else {
+            gen_helper_pmmu030_flush_fd(tcg_env);
         }
+        gen_exit_tb(s);
     }
 }
 #endif
@@ -6522,5 +6549,8 @@ void m68k_cpu_dump_state(CPUState *cs, FILE *f, int flags)
                  env->mmu.ttr[M68K_ITTR0], env->mmu.ttr[M68K_ITTR1]);
     qemu_fprintf(f, "MMUSR %08x, fault at %08x\n",
                  env->mmu.mmusr, env->mmu.ar);
+    qemu_fprintf(f, "TC030 %08x CRP %08x/%08x SRP030 %08x/%08x\n",
+                 env->mmu.tc030, env->mmu.crp030[0], env->mmu.crp030[1],
+                 env->mmu.srp030[0], env->mmu.srp030[1]);
 #endif /* !CONFIG_USER_ONLY */
 }

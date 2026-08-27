@@ -362,9 +362,15 @@ static void m68k_interrupt_all(CPUM68KState *env, int is_hw)
     sr |= SR_S;
     /* "suppress tracing" */
     sr &= ~SR_T;
-    /* "sets the processor interrupt mask" */
+    /*
+     * "sets the processor interrupt mask" -- to the level being
+     * serviced.  This must replace the old I field, not OR into it:
+     * `sr |= ...` left the old mask bits set, so e.g. taking a level 5
+     * interrupt at mask 3 yielded mask 7 and wrongly blocked levels
+     * 4-6 (and level-triggered 7s) until the handler returned.
+     */
     if (is_hw) {
-        sr |= (env->sr & ~SR_I) | (env->pending_level << SR_I_SHIFT);
+        sr = (sr & ~SR_I) | (env->pending_level << SR_I_SHIFT);
     }
     cpu_m68k_set_sr(env, sr);
     sp = env->aregs[7];

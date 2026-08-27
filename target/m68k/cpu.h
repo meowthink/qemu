@@ -187,6 +187,14 @@ typedef struct CPUArchState {
             uint8_t prot;
             uint8_t super_only;
             uint8_t dirty;      /* store walk (M bit) already done */
+            /*
+             * Which root pointer the walk went through: 1 = SRP (a
+             * supervisor access with TC.SRE set), 0 = CRP.  The real
+             * ATC tags entries with the function code, so with SRE
+             * enabled a supervisor and a user translation of the same
+             * vaddr coexist; without the tag one aliased the other.
+             */
+            uint8_t sroot;
         } atc030[16];
         int atc030_next;
     } mmu;

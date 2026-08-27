@@ -951,10 +951,30 @@ txfail:
 #define M68K_MMU030_PSR_S   0x2000  /* supervisor-only violation */
 #define M68K_MMU030_PSR_W   0x0800  /* write protected */
 #define M68K_MMU030_PSR_I   0x0400  /* invalid descriptor */
+#define M68K_MMU030_PSR_M   0x0200  /* page modified */
+#define M68K_MMU030_PSR_T   0x0040  /* transparent (TTx hit) */
+#define M68K_MMU030_PSR_N   0x0007  /* number of levels searched */
+
+/*
+ * PTEST walk bookkeeping.  A PTEST names a table level 0-7: the search
+ * stops after that many descriptor fetches, the PSR N field reports how
+ * many were done, and with the instruction's A bit set the *physical
+ * address of the last descriptor fetched* is returned in An.  The
+ * Sun-3/80 PROM's entire page-table read/modify API is built on this:
+ * its get/set-descriptor routines run PTESTR with A=1 at levels 1..3
+ * and then map the returned descriptor's page to patch entries.
+ */
+typedef struct PTest030Info {
+    int max_level;          /* stop after this many descriptor fetches */
+    int levels;             /* out: descriptor fetches performed */
+    uint32_t last_desc;     /* out: phys addr of last descriptor fetched */
+    bool desc_valid;        /* out: last_desc holds a fetched address */
+} PTest030Info;
 
 static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
                                     int *prot, target_ulong address,
-                                    int access_type, target_ulong *page_size)
+                                    int access_type, target_ulong *page_size,
+                                    PTest030Info *info)
 {
     CPUState *cs = env_cpu(env);
     uint32_t tc = env->mmu.tc030;
@@ -965,7 +985,11 @@ static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
 
     /* transparent translation: the 030 TT registers match the 040 TTR */
     for (i = 0; i < 2; i++) {
-        if (check_TTR(env->mmu.tt030[i], prot, address, access_type)) {
+        if (check_TTR030(env->mmu.tt030[i], prot, address, access_type)) {
+            if (ptest) {
+                /* transparent hit: T alone, no levels searched */
+                env->mmu.mmusr |= M68K_MMU030_PSR_T;
+            }
             *physical = address;
             *page_size = TARGET_PAGE_SIZE;
             return 0;
@@ -986,12 +1010,16 @@ static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
      * 24-bit-tagged pointers, e.g. 0x004F9E vs 0x80004F9E under IS=8).
      */
     uint32_t vkey = address & (0xffffffffu >> M68K_TC030_IS(tc));
+    /* which root this access walks: SRP only for supervisor with SRE */
+    uint8_t sroot = ((access_type & ACCESS_SUPER) && (tc & M68K_TC030_SRE))
+                    ? 1 : 0;
 
     if (!(access_type & (ACCESS_PTEST | ACCESS_DEBUG))) {
         for (i = 0; i < ARRAY_SIZE(env->mmu.atc030); i++) {
             typeof(env->mmu.atc030[0]) *e = &env->mmu.atc030[i];
 
-            if (e->mask && (vkey & ~e->mask) == e->vaddr) {
+            if (e->mask && e->sroot == sroot &&
+                (vkey & ~e->mask) == e->vaddr) {
                 if (e->super_only && !(access_type & ACCESS_SUPER)) {
                     break;      /* re-walk for the correct violation */
                 }
@@ -1067,12 +1095,19 @@ static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
         }
         entry = table + index * (dt == M68K_DT_LONG ? 8 : 4);
 
+        if (info) {
+            info->levels++;
+        }
         desc = address_space_ldl(cs->as, entry, MEMTXATTRS_UNSPECIFIED, &txres);
         if (txres != MEMTX_OK) {
             if (ptest) {
                 env->mmu.mmusr |= M68K_MMU030_PSR_B;
             }
             return -1;
+        }
+        if (info) {
+            info->last_desc = entry;
+            info->desc_valid = true;
         }
         if (dt == M68K_DT_LONG) {
             uint32_t lo = address_space_ldl(cs->as, entry + 4,
@@ -1131,6 +1166,23 @@ static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
                                   MEMTXATTRS_UNSPECIFIED, &txres);
             }
         }
+
+        /*
+         * A PTEST names the table level (= descriptor fetch count) the
+         * search must stop at; the PSR then reports the status of the
+         * descriptor reached, and An (via PTest030Info) its physical
+         * address.  A page descriptor at that level ends the walk
+         * anyway (the next iteration would break) and an invalid one is
+         * caught at the loop top, so only a still-valid intermediate
+         * table descriptor needs the early stop.
+         */
+        if (info && info->levels >= info->max_level &&
+            (dt == M68K_DT_SHORT || dt == M68K_DT_LONG)) {
+            if (wp) {
+                env->mmu.mmusr |= M68K_MMU030_PSR_W;
+            }
+            return -1;
+        }
     }
 
     if (dt != M68K_DT_PAGE) {
@@ -1138,6 +1190,10 @@ static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
             env->mmu.mmusr |= M68K_MMU030_PSR_I;
         }
         return -1;
+    }
+    /* report the page descriptor's Modified bit to PTEST (PSR M) */
+    if (ptest && level > 0 && (desc & M68K_DESC030L_M)) {
+        env->mmu.mmusr |= M68K_MMU030_PSR_M;
     }
     /*
      * PAGE descriptors (both formats) hold the page address in bits
@@ -1206,6 +1262,7 @@ static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
 
         for (i = 0; i < ARRAY_SIZE(env->mmu.atc030); i++) {
             if (env->mmu.atc030[i].mask &&
+                env->mmu.atc030[i].sroot == sroot &&
                 env->mmu.atc030[i].vaddr == vpage) {
                 e = &env->mmu.atc030[i];
                 break;
@@ -1222,6 +1279,7 @@ static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
         e->prot = *prot;
         e->super_only = super_only;
         e->dirty = (access_type & ACCESS_STORE) != 0;
+        e->sroot = sroot;
     }
     return 0;
 }
@@ -1246,7 +1304,8 @@ hwaddr m68k_cpu_get_phys_addr_debug(CPUState *cs, vaddr addr)
             return addr;
         }
         if (get_physical_address_030(env, &phys_addr, &prot,
-                                     addr, access_type, &page_size) != 0) {
+                                     addr, access_type, &page_size,
+                                     NULL) != 0) {
             return -1;
         }
         return phys_addr;
@@ -1329,7 +1388,7 @@ bool m68k_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
 
     ret = is_030
         ? get_physical_address_030(env, &physical, &prot,
-                                   address, access_type, &page_size)
+                                   address, access_type, &page_size, NULL)
         : get_physical_address(env, &physical, &prot,
                                address, access_type, &page_size);
     if (likely(ret == 0)) {
@@ -1853,19 +1912,34 @@ void HELPER(ptest)(CPUM68KState *env, uint32_t addr, uint32_t is_read)
 }
 
 /*
- * 68030 PTEST: walk the translation tables for the address in the
+ * 68030/68851 PTEST: walk the translation tables for the address in the
  * function code named by the extension word and report the result in
  * the PSR (mmusr).  Linux's bus-error handler re-probes every data
  * fault this way and keys the page-fault path off the I and WP bits.
+ *
+ * The extension word also carries a level field (stop the search after
+ * that many descriptor fetches; 0 = probe the ATC only) and an A/An
+ * field: with A set, An receives the physical address of the last
+ * descriptor fetched.  The Sun-3/80 monitor's page-table get/set
+ * accessors are built entirely on PTESTR with A=1 at levels 1..3 -- it
+ * patches its per-context mappings through the descriptor addresses
+ * this returns -- so an_in must really come back as the descriptor's
+ * physical address, not stay the probed virtual address.
+ *
+ * Returns the new An value (an_in unchanged if no descriptor fetched).
  */
-void HELPER(ptest030)(CPUM68KState *env, uint32_t addr, uint32_t ext)
+uint32_t HELPER(ptest030)(CPUM68KState *env, uint32_t addr, uint32_t ext,
+                          uint32_t an_in)
 {
     hwaddr physical;
     int prot;
     target_ulong page_size;
     int access_type = ACCESS_PTEST | ACCESS_DATA;
     int fcfield = ext & 0x1f;
+    int level = (ext >> 10) & 7;
     int fc;
+    int i;
+    PTest030Info info = { .max_level = level ? level : 7 };
 
     /* the fc operand: immediate, data register, or SFC/DFC */
     if (fcfield & 0x10) {
@@ -1888,8 +1962,46 @@ void HELPER(ptest030)(CPUM68KState *env, uint32_t addr, uint32_t ext)
     }
 
     env->mmu.mmusr = 0;
+
+    if (level == 0) {
+        /*
+         * Level 0: report on the ATC entry for the address (no table
+         * search, N stays 0).  A TTx hit is transparent; otherwise a
+         * cached translation reports W/M, and a miss reports I.
+         */
+        uint32_t tc = env->mmu.tc030;
+        uint32_t vkey = addr & (0xffffffffu >> M68K_TC030_IS(tc));
+        uint8_t sroot = ((access_type & ACCESS_SUPER) &&
+                         (tc & M68K_TC030_SRE)) ? 1 : 0;
+
+        if (check_TTR030(env->mmu.tt030[0], &prot, addr, access_type) ||
+            check_TTR030(env->mmu.tt030[1], &prot, addr, access_type)) {
+            env->mmu.mmusr = M68K_MMU030_PSR_T;
+            return an_in;
+        }
+        env->mmu.mmusr = M68K_MMU030_PSR_I;
+        for (i = 0; i < ARRAY_SIZE(env->mmu.atc030); i++) {
+            typeof(env->mmu.atc030[0]) *e = &env->mmu.atc030[i];
+
+            if (e->mask && e->sroot == sroot &&
+                (vkey & ~e->mask) == e->vaddr) {
+                env->mmu.mmusr = 0;
+                if (!(e->prot & PAGE_WRITE)) {
+                    env->mmu.mmusr |= M68K_MMU030_PSR_W;
+                }
+                if (e->dirty) {
+                    env->mmu.mmusr |= M68K_MMU030_PSR_M;
+                }
+                break;
+            }
+        }
+        return an_in;
+    }
+
     get_physical_address_030(env, &physical, &prot, addr,
-                             access_type, &page_size);
+                             access_type, &page_size, &info);
+    env->mmu.mmusr |= info.levels & M68K_MMU030_PSR_N;
+    return info.desc_valid ? info.last_desc : an_in;
 }
 
 void HELPER(pflush)(CPUM68KState *env, uint32_t addr, uint32_t opmode)
@@ -1914,6 +2026,24 @@ void HELPER(pflush)(CPUM68KState *env, uint32_t addr, uint32_t opmode)
 void HELPER(pmmu030_flush)(CPUM68KState *env)
 {
     memset(env->mmu.atc030, 0, sizeof(env->mmu.atc030));
+    tlb_flush(env_cpu(env));
+}
+
+/*
+ * PMOVEFD (FD=1) to TC/CRP/SRP/TTx: the guest-visible ATC is preserved
+ * across the register load, but QEMU's softmmu TLB must still be
+ * dropped.  It caches translations the real ATC never held -- identity
+ * mappings installed while translation was disabled (real hardware
+ * bypasses the ATC entirely with TC.E=0, so nothing survives an enable)
+ * and an unbounded number of pages versus the real 22-entry ATC.  The
+ * QEMU TLB is invisible to the guest: after the flush, misses refill
+ * through atc030, which holds exactly what FD semantically preserves.
+ * The Sun-3/80 PROM performs *every* TC/CRP/SRP load with FD set
+ * (flushing separately with PFLUSHA), so skipping this flush leaked
+ * pre-enable identity translations into its MMU-on monitor contexts.
+ */
+void HELPER(pmmu030_flush_fd)(CPUM68KState *env)
+{
     tlb_flush(env_cpu(env));
 }
 
