@@ -57,6 +57,7 @@
 #include "hw/isa/i8259_internal.h"
 #include "hw/intc/i8259.h"
 #include "hw/rtc/mc146818rtc.h"
+#include "hw/display/apollo-fb.h"
 #include "target/m68k/cpu.h"
 #include "elf.h"
 #include "standard-headers/asm-m68k/bootinfo.h"
@@ -1086,6 +1087,21 @@ static void apollo_dn3000_init(MachineState *machine)
     memory_region_init_ram(&s->xlat_mem, NULL, "apollo.xlat-map",
                            APOLLO_XLAT_SIZE, &error_fatal);
     memory_region_add_subregion(sysmem, APOLLO_XLAT_ADDR, &s->xlat_mem);
+
+    /*
+     * Display: a linear xrgb8888 framebuffer in a dedicated high-memory
+     * window, scanned out to the QEMU display.  Presented to Linux as a
+     * "simple-framebuffer" (see apollo-fb.c) so the in-tree simplefb/
+     * simpledrm driver binds without a native DRM driver.  Region 0 is the
+     * linear buffer (APOLLO_FB_BASE), region 1 the MCR/Bt458 control window.
+     */
+    {
+        DeviceState *fb_dev = qdev_new(TYPE_APOLLO_FB);
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(fb_dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(fb_dev), 0, APOLLO_FB_BASE);
+        sysbus_mmio_map(SYS_BUS_DEVICE(fb_dev), 1, APOLLO_FB_CTRL_BASE);
+    }
 
     /*
      * -kernel: load a raw vmlinux ELF into RAM and hand it a classic

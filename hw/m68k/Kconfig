@@ -6,6 +6,7 @@ config APOLLO
     select I8259
     select MC146818RTC
     select SCN2681
+    select FRAMEBUFFER
 
 config AN5206
     bool
