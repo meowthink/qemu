@@ -1399,6 +1399,18 @@ F: hw/net/mcf_fec.c
 F: include/hw/m68k/mcf*.h
 F: tests/functional/m68k/test_mcf5208evb.py
 
+Apollo DN3000
+M: Daniel Palmer <daniel@0x0f.com>
+S: Odd Fixes
+F: hw/char/scn2681.c
+F: hw/display/apollo-fb.c
+F: hw/display/apollo-fb.h
+F: hw/m68k/apollo.c
+F: include/hw/char/scn2681.h
+F: scripts/apollo-domainos-drive.py
+F: tests/tcg/m68k/system/apollo-smoke.S
+F: tests/tcg/m68k/system/run-apollo-smoke.sh
+
 NeXT system emulators
 M: Thomas Huth <th.huth+qemu@posteo.eu>
 S: Odd Fixes

@@ -17,6 +17,7 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 #include "qemu/osdep.h"
+#include "qemu/cutils.h"
 #include "qemu/log.h"
 #include "cpu.h"
 #include "exec/helper-proto.h"
@@ -381,6 +382,47 @@ static void m68k_interrupt_all(CPUM68KState *env, int is_hw)
 
     switch (cs->exception_index) {
     case EXCP_ACCESS:
+        /*
+         * Debug affordance (opt-in via env, no effect when unset): instead of
+         * aborting QEMU on an otherwise-fatal fault, park the CPU in a gdb
+         * debug stop so the crashed/faulting state can be inspected.
+         *   APOLLO_DFHALT       -- park on the *double* access fault (the one
+         *                          that normally cpu_abort()s "DOUBLE MMU
+         *                          FAULT"), i.e. the storm.
+         *   APOLLO_FAULTPC=<hex> -- park on the *first* access fault taken at
+         *                          faulting PC == <hex>, before the frame is
+         *                          built (clean pre-storm state).
+         * Attach with -gdb/-s; the parked CPU is fully inspectable.
+         */
+        {
+            /* env read once and cached (-2 = not yet read; then 0/1) */
+            static int dfh_cached = -2;
+            static uint32_t fpc_cached;
+            bool park;
+
+            if (dfh_cached == -2) {
+                const char *fpc = getenv("APOLLO_FAULTPC");
+                dfh_cached = getenv("APOLLO_DFHALT") ? 1 : 0;
+                if (fpc) {
+                    unsigned long value;
+
+                    if (qemu_strtoul(fpc, NULL, 16, &value) == 0) {
+                        fpc_cached = value;
+                    }
+                }
+            }
+            park = (dfh_cached && env->mmu.fault) ||
+                   (fpc_cached && env->pc == fpc_cached);
+            if (park) {
+                fprintf(stderr,
+                    "[DFHALT] park EXCP_ACCESS pc=%08x fault_ar=%08x "
+                    "ssw=%04x a7=%08x mmu.fault=%d -> gdb debug stop\n",
+                    env->pc, env->mmu.ar, env->mmu.ssw,
+                    env->aregs[7], env->mmu.fault);
+                cs->exception_index = EXCP_DEBUG;
+                cpu_loop_exit(cs);
+            }
+        }
         if (env->mmu.fault) {
             cpu_abort(cs, "DOUBLE MMU FAULT\n");
         }

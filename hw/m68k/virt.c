@@ -249,8 +249,7 @@ static void virt_init(MachineState *machine)
          */
         if (m68k_feature(&cpu->env, M68K_FEATURE_M68010)) {
             BOOTINFO1(param_ptr, BI_CPUTYPE, CPU_68010);
-	}
-        else if (m68k_feature(&cpu->env, M68K_FEATURE_M68020)) {
+        } else if (m68k_feature(&cpu->env, M68K_FEATURE_M68020)) {
             if (m68k_feature(&cpu->env, M68K_FEATURE_M68851)) {
                 /*
                  * 68020 with 68851 PMMU in the coprocessor socket; the

@@ -6,8 +6,8 @@
  * Bt458 RAMDAC.  simpledrm/simplefb only consume linear RGB, so instead of the
  * planar blitter path we model the *post-scanout* view: a linear xrgb8888
  * framebuffer that Linux drives directly as a "simple-framebuffer".  A small
- * MCR (display enable) register and a Bt458 CLUT are modelled for faithfulness;
- * the CLUT is bypassed in the truecolor scanout (documented, unused by simplefb).
+ * MCR (display enable) register and a Bt458 CLUT are modelled for
+ * faithfulness; the CLUT is bypassed in truecolor scanout.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */

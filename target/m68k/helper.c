@@ -1016,7 +1016,7 @@ static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
 
     if (!(access_type & (ACCESS_PTEST | ACCESS_DEBUG))) {
         for (i = 0; i < ARRAY_SIZE(env->mmu.atc030); i++) {
-            typeof(env->mmu.atc030[0]) *e = &env->mmu.atc030[i];
+            typeof(env->mmu.atc030[0]) * e = &env->mmu.atc030[i];
 
             if (e->mask && e->sroot == sroot &&
                 (vkey & ~e->mask) == e->vaddr) {
@@ -1258,7 +1258,7 @@ static int get_physical_address_030(CPUM68KState *env, hwaddr *physical,
     if (!(access_type & (ACCESS_PTEST | ACCESS_DEBUG))) {
         uint32_t mask = *page_size - 1;
         uint32_t vpage = vkey & ~mask;
-        typeof(env->mmu.atc030[0]) *e = NULL;
+        typeof(env->mmu.atc030[0]) * e = NULL;
 
         for (i = 0; i < ARRAY_SIZE(env->mmu.atc030); i++) {
             if (env->mmu.atc030[i].mask &&
@@ -1981,7 +1981,7 @@ uint32_t HELPER(ptest030)(CPUM68KState *env, uint32_t addr, uint32_t ext,
         }
         env->mmu.mmusr = M68K_MMU030_PSR_I;
         for (i = 0; i < ARRAY_SIZE(env->mmu.atc030); i++) {
-            typeof(env->mmu.atc030[0]) *e = &env->mmu.atc030[i];
+            typeof(env->mmu.atc030[0]) * e = &env->mmu.atc030[i];
 
             if (e->mask && e->sroot == sroot &&
                 (vkey & ~e->mask) == e->vaddr) {
