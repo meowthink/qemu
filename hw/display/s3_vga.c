@@ -22,19 +22,25 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/datadir.h"
 #include "hw/pci/pci_device.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "ui/console.h"
+#include "ui/pixel_ops.h"
 #include "vga_int.h"
 #include "hw/display/vga.h"
 #include "hw/display/vga_regs.h"
 #include "qom/object.h"
 #include "trace.h"
 #include "qemu/log.h"
+#include "qemu/error-report.h"
 #include "system/reset.h"
+#include "system/memory.h"
+#include "hw/core/loader.h"
 
 #define TYPE_S3_TRIO "s3-trio"
+#define TYPE_S3_V864 "s3-v864"
 
 enum {
     REG_DISP_STAT      = 0x00,
@@ -77,6 +83,8 @@ enum {
 
 enum {
     GP_STAT_BUSY = 0x0200,
+    GP_STAT_DATA_AVAIL = 0x0100,
+    GP_STAT_FIFO_EMPTY = 0x0400,
 };
 
 enum {
@@ -102,6 +110,7 @@ enum {
     CMD_CMD_RECTV2 = 0x8000,
     CMD_CMD_LINEAF = 0xA000,
     CMD_CMD_BITBLT = 0xC000,
+    CMD_CMD_PATBLT = 0xE000,
 };
 
 #define BKGD_MIX_BSS_MASK 0x0060
@@ -131,8 +140,12 @@ enum {
 typedef struct S3TrioState {
     PCIDevice dev;
     VGACommonState vga;
+    MemoryRegion rom;
+    MemoryRegion rom_bar;
+    MemoryRegion vram_iomem;
     uint16_t maj_axis, min_axis;
     PortioList portio;
+    bool crtc_seq_shared;
 
     uint32_t dclk;
     uint32_t mclk;
@@ -170,6 +183,16 @@ typedef struct S3TrioState {
     uint16_t mfc[16]; /* bee8 */
     uint16_t pix_trans; /* e2e8 */
 
+    /* S3 hardware graphics cursor */
+    uint8_t cursor_fg[4];
+    uint8_t cursor_bg[4];
+    uint8_t cursor_color_pos;
+    int last_cursor_x;
+    int last_cursor_y;
+    bool last_cursor_on;
+    uint32_t last_cursor_hash;
+    uint32_t last_cursor_addr;
+
     uint8_t origin_x;
     uint8_t origin_y;
     uint8_t unlock_pll;
@@ -182,6 +205,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(S3TrioState, S3_TRIO)
 
 /* FIXME: remove forward declarations */
 static uint16_t get_color_from_mix(S3TrioState *s, uint16_t mix);
+static uint16_t raster_op(S3TrioState *s, uint16_t mix);
 
 #define min_axis_pcnt mfc[0]
 #define scissors_t    mfc[1]
@@ -205,9 +229,30 @@ static inline uint32_t reg_to_address(int reg)
     return (reg << 10) + 0x2e8;
 }
 
+/*
+ * V864 specific feature:
+ * shadowed extended CRTC registers into the sequencer registers
+ * 0x1/0x7/0x12/0x42/0x5D/0x5E
+ */
+static bool s3_crtc_seq_shared(S3TrioState *s, unsigned int idx)
+{
+    if (s->crtc_seq_shared) {
+        switch (idx) {
+            case 0x01: /* CR1: horizontal display end */
+            case 0x07: /* CR7: vertical overflow */
+            case 0x12: /* CR12: vertical display end (low) */
+            case 0x42: /* CR42: mode control */
+            case 0x5d: /* CR5D: horizontal overflow */
+            case 0x5e: /* CR5E: vertical overflow high */
+                return true;
+        }
+    }
+    return false;
+}
+
 static inline void do_cmd_done(S3TrioState *s)
 {
-    s->gp_stat &= ~GP_STAT_BUSY;
+    s->gp_stat = GP_STAT_FIFO_EMPTY;
 }
 
 static void move_to_next_pixel(S3TrioState *s)
@@ -276,42 +321,169 @@ static void do_cmd_write_one_pixel(S3TrioState *s, uint8_t value)
     if ((s->maj_axis < s->maj_axis_pcnt) ||
         (s->maj_axis == s->maj_axis_pcnt && !(s->cmd & CMD_LASTPIX))) {
         offset = s->cur_y * width + s->cur_x;
+        trace_s3_vga_pixel(offset, value, s->cur_x, s->cur_y, s->maj_axis,
+                           s->maj_axis_pcnt, s->min_axis, s->mfc[0],
+                           s->gp_stat, s->cmd);
         p8 = s->vga.vram_ptr + offset;
         p8[0] = value;
         memory_region_set_dirty(&s->vga.vram, offset, 1);
     }
 }
 
-static void do_cmd_write_pixel(S3TrioState *s, uint16_t value)
+static void do_cmd_write_pixel(S3TrioState *s, uint32_t value, int data_bits)
 {
     int i, size;
     uint16_t color;
 
-    if (!(s->gp_stat & GP_STAT_BUSY)) {
+    if (!(s->gp_stat & (GP_STAT_BUSY | GP_STAT_DATA_AVAIL))) {
         qemu_log_mask(LOG_GUEST_ERROR,
-                      "s3_trio: %s called while GP_STAT_BUSY not set\n",
+                      "s3_trio: %s called with no command expecting data\n",
                       __func__);
         return;
     }
 
+    s->gp_stat |= GP_STAT_BUSY;
+
+    if ((s->cmd & CMD_BYTSEQ) && data_bits > 8) {
+        value = (data_bits == 16) ? bswap16(value) : bswap32(value);
+    }
+
     if (s->cmd & CMD_PLANAR) {
-        size = (s->cmd & CMD_16BIT) ? 16 : 8;
+        size = data_bits;
         for (i = 0; i < size; i++) {
-            if (value & (1 << (size - i - 1))) {
-                color = get_color_from_mix(s, s->frgd_mix);
+            int min_axis = s->min_axis;
+
+            if (value & (1u << (size - i - 1))) {
+                color = raster_op(s, s->frgd_mix);
             } else {
-                color = get_color_from_mix(s, s->bkgd_mix);
+                color = raster_op(s, s->bkgd_mix);
             }
             do_cmd_write_one_pixel(s, color);
             move_to_next_pixel(s);
+            if (!(s->gp_stat & GP_STAT_BUSY)) {
+                break;
+            }
+            if (s->min_axis != min_axis) {
+                break;
+            }
         }
     } else {
-        if (s->cmd & CMD_16BIT) {
-            do_cmd_write_one_pixel(s, value >> 8);
+        size = data_bits / 8;
+        for (i = 0; i < size; i++) {
+            color = (value >> (8 * (size - i - 1))) & 0xff;
+            do_cmd_write_one_pixel(s, color);
             move_to_next_pixel(s);
+            if (!(s->gp_stat & GP_STAT_BUSY)) {
+                break;
+            }
         }
-        do_cmd_write_one_pixel(s, value & 0xff);
-        move_to_next_pixel(s);
+    }
+}
+
+/* Apply a color mix (foreground or background) to an explicit src/dst pair. */
+static uint8_t s3_mix_pixel(S3TrioState *s, uint16_t mix, uint8_t src,
+                            uint8_t dst)
+{
+    uint8_t color;
+
+    switch (mix & FRGD_MIX_FSS_MASK) {
+    case FRGD_MIX_FSS_BKGD:
+        color = s->bkgd_color;
+        break;
+    case FRGD_MIX_FSS_FRGD:
+        color = s->frgd_color;
+        break;
+    case FRGD_MIX_FSS_PIX:
+        color = s->pix_trans;
+        break;
+    case FRGD_MIX_FSS_BMP:
+    default:
+        color = src;
+        break;
+    }
+
+    switch (mix & 0x0f) {
+    case 0x00: return ~dst;
+    case 0x01: return 0;
+    case 0x02: return ~0;
+    case 0x03: return dst;
+    case 0x04: return ~color;
+    case 0x05: return color ^ dst;
+    case 0x06: return ~(color ^ dst);
+    case 0x07: return color;
+    case 0x08: return ~(color & dst);
+    case 0x09: return ~color | dst;
+    case 0x0a: return color | ~dst;
+    case 0x0b: return color | dst;
+    case 0x0c: return color & dst;
+    case 0x0d: return color & ~dst;
+    case 0x0e: return ~color & dst;
+    case 0x0f: return ~(color | dst);
+    }
+    return color;
+}
+
+static void s3_do_cmd_patblt(S3TrioState *s)
+{
+    int width = s->maj_axis_pcnt + 1;
+    int height = s->min_axis_pcnt + 1;
+    int dx = (s->cmd & CMD_INC_X) ? 1 : -1;
+    int dy = (s->cmd & CMD_INC_Y) ? 1 : -1;
+    int src_x = s->cur_x;
+    int src_y = s->cur_y;
+    int dst_x = s->destx_diastp;
+    int dst_y = s->desty_axstep;
+    int res_width, res_height;
+    int x, y;
+
+    s->vga.get_resolution(&s->vga, &res_width, &res_height);
+
+    for (y = 0; y < height; y++) {
+        for (x = 0; x < width; x++) {
+            int px = dst_x + dx * x;
+            int py = dst_y + dy * y;
+            int sx = src_x + ((dst_x + dx * x) & 7);
+            int sy = src_y + ((dst_y + dy * y) & 7);
+            uint8_t src, dst, out;
+
+            if (px < 0 || py < 0 || px >= res_width || py >= res_height) {
+                continue;
+            }
+            /*
+             * The pattern is usually kept in off-screen display memory, so
+             * only screen bounds apply to the destination; the source may be
+             * outside the visible area.
+             */
+            if (sx < 0 || sx >= res_width || sy < 0 ||
+                (uint32_t)sy * res_width + sx >= s->vga.vram_size) {
+                continue;
+            }
+            src = s->vga.vram_ptr[sy * res_width + sx];
+            dst = s->vga.vram_ptr[py * res_width + px];
+
+            switch (s->pix_cntl & PIX_CNTL_MIXSEL_MASK) {
+            case PIX_CNTL_MIXSEL_TRANS: {
+                uint8_t mask = s->rd_mask ? (s->rd_mask & 0xff) : 0xff;
+                bool use_fg = ((src & mask) == mask) || !mask;
+
+                out = s3_mix_pixel(s, use_fg ? s->frgd_mix : s->bkgd_mix,
+                                   src, dst);
+                break;
+            }
+            case PIX_CNTL_MIXSEL_FOREMIX:
+                out = s3_mix_pixel(s, s->frgd_mix, src, dst);
+                break;
+            default:
+                qemu_log_mask(LOG_UNIMP,
+                              "s3_trio: PatBLT MIXSEL 0x%x unimplemented\n",
+                              (s->pix_cntl & PIX_CNTL_MIXSEL_MASK) >> 6);
+                out = s3_mix_pixel(s, s->frgd_mix, src, dst);
+                break;
+            }
+
+            s->vga.vram_ptr[py * res_width + px] = out;
+            memory_region_set_dirty(&s->vga.vram, py * res_width + px, 1);
+        }
     }
 }
 
@@ -324,9 +496,15 @@ static uint16_t get_current_source_bitmap(S3TrioState *s)
 
 static uint16_t get_current_destination_bitmap(S3TrioState *s)
 {
-    qemu_log_mask(LOG_UNIMP,
-                  "s3_trio: unimplemented destination operand BMP\n");
-    return 0;
+    int width, height;
+    uint32_t off;
+
+    s->vga.get_resolution(&s->vga, &width, &height);
+    off = (uint32_t)s->cur_y * width + s->cur_x;
+    if (s->cur_x >= width || off >= s->vga.vram_size) {
+        return 0;
+    }
+    return s->vga.vram_ptr[off];
 }
 
 static uint16_t get_color_from_mix(S3TrioState *s, uint16_t mix)
@@ -350,17 +528,26 @@ static uint16_t get_color_from_mix(S3TrioState *s, uint16_t mix)
 static uint16_t raster_op(S3TrioState *s, uint16_t mix)
 {
     uint16_t src = get_color_from_mix(s, mix);
-    uint16_t op = mix & 0x1f;
+    uint16_t dst = get_current_destination_bitmap(s);
+    uint16_t op = mix & 0x0f;
 
     switch (op) {
-    case 0x00: return ~get_current_destination_bitmap(s);
+    case 0x00: return ~dst;
     case 0x01: return 0;
-    case 0x02: return 1;
-    case 0x03: return ~get_current_destination_bitmap(s);
-    case 0x04: return ~get_color_from_mix(s, mix);
-    case 0x05: return get_color_from_mix(s, mix) ^ get_current_destination_bitmap(s);
-    case 0x06: return ~(get_color_from_mix(s, mix) ^ get_current_destination_bitmap(s));
-    case 0x07: return get_color_from_mix(s, mix);
+    case 0x02: return ~0;
+    case 0x03: return dst;
+    case 0x04: return ~src;
+    case 0x05: return src ^ dst;
+    case 0x06: return ~(src ^ dst);
+    case 0x07: return src;
+    case 0x08: return ~(src & dst);
+    case 0x09: return ~src | dst;
+    case 0x0a: return src | ~dst;
+    case 0x0b: return src | dst;
+    case 0x0c: return src & dst;
+    case 0x0d: return src & ~dst;
+    case 0x0e: return ~src & dst;
+    case 0x0f: return ~(src | dst);
     default:
         qemu_log_mask(LOG_GUEST_ERROR, "s3_trio: invalid MIX operation 0x%x\n",
                       op);
@@ -453,7 +640,17 @@ static void s3_do_cmd_bitblt(S3TrioState *s)
 
 static void do_cmd_init(S3TrioState *s)
 {
-    s->gp_stat |= GP_STAT_BUSY;
+    /*
+     * GP_STAT bit 9 is GE (graphics engine busy), bit 10 the host data
+     * FIFO empty flag.  The host data path in this model consumes each
+     * write immediately, so the FIFO is empty even while a PCDATA
+     * command is still waiting for its pixel data, and such a command
+     * does not make the engine busy until the first data word arrives.
+     */
+    s->gp_stat = GP_STAT_FIFO_EMPTY;
+    if (!(s->cmd & CMD_PCDATA)) {
+        s->gp_stat |= GP_STAT_BUSY;
+    }
     s->maj_axis = 0;
     s->min_axis = 0;
 }
@@ -464,6 +661,10 @@ static void do_cmd(S3TrioState *s)
 
     do_cmd_init(s);
 
+    if (s->cmd & CMD_PCDATA) {
+        s->gp_stat |= GP_STAT_DATA_AVAIL;
+    }
+
     if ((s->cmd & CMD_WRTDATA) == 0) {
         qemu_log_mask(LOG_UNIMP,
                       "s3_trio: CMD_WRTDATA=0 not implemented (%04x)\n", s->cmd);
@@ -473,6 +674,7 @@ static void do_cmd(S3TrioState *s)
     case CMD_CMD_NOP:
         qemu_log_mask(LOG_UNIMP, "s3_trio: CMD_NOP not implemented (%04x)\n",
                       s->cmd);
+        do_cmd_done(s);
         break;
     case CMD_CMD_LINE:
         if ((s->cmd & CMD_LINETYPE) == 0) {
@@ -484,12 +686,13 @@ static void do_cmd(S3TrioState *s)
             qemu_log_mask(LOG_UNIMP,
                           "s3_trio: CMD_LINE (Bresenham) not implemented (%04x)\n",
                           s->cmd);
+            do_cmd_done(s);
         } else {
             trace_s3_vga_cmd_line_vector(s->cur_x, s->cur_y, (s->cmd >> 5) & 3,
                                          s->maj_axis_pcnt);
             if (!(s->cmd & CMD_PCDATA)) {
                 while (s->gp_stat & GP_STAT_BUSY) {
-                    do_cmd_write_pixel(s, get_color(s));
+                    do_cmd_write_pixel(s, get_color(s), 8);
                 }
             }
         }
@@ -500,30 +703,39 @@ static void do_cmd(S3TrioState *s)
                               s->min_axis_pcnt);
         if (!(s->cmd & CMD_PCDATA)) {
             while (s->gp_stat & GP_STAT_BUSY) {
-                do_cmd_write_pixel(s, get_color(s));
+                do_cmd_write_pixel(s, get_color(s), 8);
             }
         }
         break;
     case CMD_CMD_RECTV1:
         qemu_log_mask(LOG_UNIMP, "s3_trio: CMD_RECTV1 not implemented (%04x)\n",
                       s->cmd);
+        do_cmd_done(s);
         break;
     case CMD_CMD_RECTV2:
         qemu_log_mask(LOG_UNIMP, "s3_trio: CMD_RECTV2 not implemented (%04x)\n",
                       s->cmd);
+        do_cmd_done(s);
         break;
     case CMD_CMD_LINEAF:
         qemu_log_mask(LOG_UNIMP, "s3_trio: CMD_LINEAF not implemented (%04x)\n",
                       s->cmd);
+        do_cmd_done(s);
         break;
     case CMD_CMD_BITBLT:
         trace_s3_vga_cmd_bitblt(s->cur_x, s->cur_y, s->destx_diastp, s->desty_axstep,
                                 s->maj_axis_pcnt, s->min_axis_pcnt);
         s3_do_cmd_bitblt(s);
+        do_cmd_done(s);
+        break;
+    case CMD_CMD_PATBLT:
+        s3_do_cmd_patblt(s);
+        do_cmd_done(s);
         break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR, "s3_trio: illegal command %04x\n",
                       s->cmd);
+        do_cmd_done(s);
         break;
     }
 }
@@ -555,6 +767,16 @@ static void s3_trio_dac_ioport_writeb(void *opaque, uint32_t addr, uint32_t val)
 {
     S3TrioState *s = opaque;
     trace_s3_vga_dac_writeb(addr, val);
+    /*
+     * V864's RAMDAC is 8 bits per channel, but VGA-compatible software
+     * writes 6-bit palette values and expects the RAMDAC expands.  Take
+     * the two conventions apart from the values themselves by 0x3f.
+     */
+    if (addr == 0x2ec) {
+        s->vga.dac_8bit = 0;
+    } else if (addr == 0x2ed && val > 0x3f) {
+        s->vga.dac_8bit = 1;
+    }
     vga_ioport_write(&s->vga, addr - 0x2ea + VGA_PEL_MSK, val);
 }
 
@@ -713,10 +935,7 @@ static void s3_trio_post_write(S3TrioState* s, uint32_t addr)
         qemu_log_mask(LOG_UNIMP, "s3_trio: unimplemented write to V_DISP\n");
         break;
     case REG_SUBSYS_CNTL:
-        s->subsys_cntl &= ~(1 << 12); /* clear CHPTST */
-        break;
-    case REG_PIX_TRANS:
-        do_cmd_write_pixel(s, s->pix_trans);
+        s->subsys_stat &= ~(s->subsys_cntl & 0x000f); /* clear interrupts */
         break;
     case REG_CMD:
         do_cmd(s);
@@ -740,6 +959,9 @@ static void s3_trio_ioport_writeb(void *opaque, uint32_t addr, uint32_t val)
         c[~addr & 1] = val;
     }
 
+    if (address_to_reg(addr & ~0x1) == REG_PIX_TRANS) {
+        do_cmd_write_pixel(s, val & 0xff, 8);
+    }
     s3_trio_post_write(s, addr & ~0x1);
 }
 
@@ -755,6 +977,9 @@ static void s3_trio_ioport_writew(void *opaque, uint32_t addr, uint32_t val)
         *p = val & 0xffff;
     }
 
+    if (address_to_reg(addr) == REG_PIX_TRANS) {
+        do_cmd_write_pixel(s, val & 0xffff, 16);
+    }
     s3_trio_post_write(s, addr & ~0x1);
 }
 
@@ -787,6 +1012,11 @@ static uint32_t s3_trio_vga_ioport_read(void *opaque, uint32_t addr)
             val = val << 5;
             break;
         }
+        case 0x45:
+            /* reading CR45 resets the cursor color stack pointer */
+            s->cursor_color_pos = 0;
+            val = vga_ioport_read(&s->vga, addr);
+            break;
         case 0x47:
             val = s->origin_x;
             break;
@@ -818,7 +1048,11 @@ static uint32_t s3_trio_vga_ioport_read(void *opaque, uint32_t addr)
             break;
         }
         default:
-            val = vga_ioport_read(&s->vga, addr);
+            if (s3_crtc_seq_shared(s, s->vga.sr_index)) {
+                val = s->vga.cr[s->vga.sr_index];
+            } else {
+                val = vga_ioport_read(&s->vga, addr);
+            }
             break;
         }
         break;
@@ -868,6 +1102,17 @@ static void s3_trio_vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
         case 0x47:
             s->origin_x = val;
             break;
+        case 0x4a:
+        case 0x4b:
+        {
+            uint8_t *stack = (s->vga.cr_index == 0x4a) ?
+                             s->cursor_fg : s->cursor_bg;
+
+            stack[s->cursor_color_pos] = val;
+            s->cursor_color_pos = (s->cursor_color_pos + 1) % 3;
+            vga_ioport_write(&s->vga, addr, val);
+            break;
+        }
         case 0x49:
             s->origin_y = val;
             break;
@@ -882,6 +1127,10 @@ static void s3_trio_vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
     case VGA_SEQ_D:
         switch (s->vga.sr_index) {
         case 0x00 ... 0x07:
+            /* hack: drop CR1/CR5D bit */
+            if (s->crtc_seq_shared && s->vga.sr_index == 0x01) {
+                val &= ~0x08;
+            }
             vga_ioport_write(&s->vga, addr, val);
             break;
         case 0x08:
@@ -893,10 +1142,18 @@ static void s3_trio_vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
             }
             break;
         default:
+            /* SR >= 0x1d are plain R/W on the real chip; store so the
+             * read-back answers like real. */
+            s->vga.sr[s->vga.sr_index] = val;
             break;
         }
         break;
     default:
+        if (addr == VGA_PEL_IW) {
+            s->vga.dac_8bit = 0;
+        } else if (addr == VGA_PEL_D && val > 0x3f) {
+            s->vga.dac_8bit = 1;
+        }
         vga_ioport_write(&s->vga, addr, val);
         break;
     }
@@ -1033,7 +1290,7 @@ static VMStateDescription vmstate_s3_trio = {
 };
 
 static const Property s3_trio_properties[] = {
-    DEFINE_PROP_UINT32("vram_size_mb", S3TrioState, vga.vram_size_mb, 8),
+    DEFINE_PROP_UINT32("vram_size_mb", S3TrioState, vga.vram_size_mb, 0),
 };
 
 static void s3_trio_reset(DeviceState *d)
@@ -1042,7 +1299,192 @@ static void s3_trio_reset(DeviceState *d)
 
     vga_common_reset(&s->vga);
 
+    s->cursor_color_pos = 0;
+    s->last_cursor_on = false;
+    s->last_cursor_x = -1;
+    s->last_cursor_y = -1;
+    s->last_cursor_addr = 0;
+    s->last_cursor_hash = 0;
+
+    if (object_dynamic_cast(OBJECT(d), TYPE_S3_V864) != NULL) {
+        s->crtc_seq_shared = true;
+    }
+
     s->disp_stat |= DISP_STAT_SENSE;
+    s->gp_stat = GP_STAT_FIFO_EMPTY;
+}
+
+/*
+ * S3 hardware graphics cursor.
+ *
+ * The cursor is a 64x64 image made of two monochrome masks stored in display
+ * memory at CR4C/CR4D (1024-byte units); each 16-byte pattern row holds four
+ * 32-bit words made of two AND bytes followed by two XOR bytes.  The shape
+ * registers and the MS/X11 mode bit (CR55 bit 4) define the displayed colors
+ * (CR4A/CR4B true-color stacks, or CR14/CR15 palette indices in 4/8bpp mode).
+ */
+static bool s3_cursor_enabled(S3TrioState *s)
+{
+    return s->vga.cr[0x45] & 1;
+}
+
+static int s3_cursor_x(S3TrioState *s)
+{
+    return ((s->vga.cr[0x46] & 7) << 8) | s->origin_x;
+}
+
+static int s3_cursor_y(S3TrioState *s)
+{
+    return ((s->vga.cr[0x48] & 7) << 8) | s->origin_y;
+}
+
+static int s3_cursor_start_x(S3TrioState *s)
+{
+    return s->vga.cr[0x4e] & 0x3f;
+}
+
+static int s3_cursor_start_y(S3TrioState *s)
+{
+    return s->vga.cr[0x4f] & 0x3f;
+}
+
+static uint32_t s3_cursor_addr(S3TrioState *s)
+{
+    uint32_t addr = (((s->vga.cr[0x4c] & 0x0f) << 8) |
+                     s->vga.cr[0x4d]) * 1024u;
+
+    return addr % s->vga.vram_size;
+}
+
+static void s3_cursor_bits(S3TrioState *s, int px, int py,
+                           int *and_bit, int *xor_bit)
+{
+    uint32_t base = s3_cursor_addr(s) + 16u * py;
+    uint32_t idx = base + ((px >> 4) * 4) + ((px >> 3) & 1);
+    uint8_t mask = 1 << (7 - (px & 7));
+
+    if (idx + 2 >= s->vga.vram_size) {
+        *and_bit = 0;
+        *xor_bit = 0;
+        return;
+    }
+    *and_bit = !!(s->vga.vram_ptr[idx] & mask);
+    *xor_bit = !!(s->vga.vram_ptr[idx + 2] & mask);
+}
+
+static uint32_t s3_cursor_color(S3TrioState *s, bool fg)
+{
+    uint8_t idx, r, g, b;
+
+    if (((s->vga.cr[0x45] >> 2) & 3) == 0) {
+        /* 4/8 bits per pixel: colors are palette indices in CR14/CR15 */
+        idx = fg ? s->vga.cr[0x14] : s->vga.cr[0x15];
+        r = s->vga.palette[idx * 3];
+        g = s->vga.palette[idx * 3 + 1];
+        b = s->vga.palette[idx * 3 + 2];
+    } else {
+        const uint8_t *c = fg ? s->cursor_fg : s->cursor_bg;
+
+        r = c[0];
+        g = c[1];
+        b = c[2];
+    }
+    return rgb_to_pixel32(r, g, b);
+}
+
+static uint32_t s3_cursor_hash(S3TrioState *s)
+{
+    uint32_t addr = s3_cursor_addr(s);
+    uint32_t h = 2166136261u;
+    int i;
+
+    for (i = 0; i < 1024; i++) {
+        h ^= s->vga.vram_ptr[(addr + i) % s->vga.vram_size];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static void s3_cursor_invalidate(VGACommonState *vga)
+{
+    S3TrioState *s = container_of(vga, S3TrioState, vga);
+    bool on = s3_cursor_enabled(s);
+    int x = s3_cursor_x(s);
+    int y = s3_cursor_y(s);
+    uint32_t addr = s3_cursor_addr(s);
+    uint32_t hash = on ? s3_cursor_hash(s) : 0;
+
+    if (s->last_cursor_on == on && s->last_cursor_x == x &&
+        s->last_cursor_y == y && s->last_cursor_addr == addr &&
+        s->last_cursor_hash == hash) {
+        return;
+    }
+
+    if (s->last_cursor_on) {
+        vga_invalidate_scanlines(vga, s->last_cursor_y,
+                                 s->last_cursor_y + 64);
+    }
+    if (on) {
+        vga_invalidate_scanlines(vga, y, y + 64);
+    }
+    s->last_cursor_on = on;
+    s->last_cursor_x = x;
+    s->last_cursor_y = y;
+    s->last_cursor_addr = addr;
+    s->last_cursor_hash = hash;
+}
+
+static void s3_cursor_draw_line(VGACommonState *vga, uint8_t *d, int scr_y)
+{
+    S3TrioState *s = container_of(vga, S3TrioState, vga);
+    int start_x, start_y, origin_x, origin_y, pattern_y, px;
+    int width = vga->last_scr_width;
+    bool x11_mode;
+    uint32_t fg, bg;
+    uint32_t *dst = (uint32_t *)d;
+
+    if (!s3_cursor_enabled(s) || width <= 0) {
+        return;
+    }
+
+    start_x = s3_cursor_start_x(s);
+    start_y = s3_cursor_start_y(s);
+    origin_x = s3_cursor_x(s);
+    origin_y = s3_cursor_y(s);
+    pattern_y = scr_y - origin_y + start_y;
+    if (pattern_y < 0 || pattern_y >= 64) {
+        return;
+    }
+
+    x11_mode = s->vga.cr[0x55] & 0x10;
+    fg = s3_cursor_color(s, true);
+    bg = s3_cursor_color(s, false);
+
+    for (px = start_x; px < 64; px++) {
+        int sx = origin_x + px - start_x;
+        int and_bit, xor_bit;
+
+        if (sx < 0 || sx >= width) {
+            continue;
+        }
+        s3_cursor_bits(s, px, pattern_y, &and_bit, &xor_bit);
+
+        if (x11_mode) {
+            if (and_bit && xor_bit) {
+                dst[sx] = fg;
+            } else if (and_bit && !xor_bit) {
+                dst[sx] = bg;
+            }
+        } else {
+            if (!and_bit && !xor_bit) {
+                dst[sx] = bg;
+            } else if (!and_bit && xor_bit) {
+                dst[sx] = fg;
+            } else if (and_bit && xor_bit) {
+                dst[sx] ^= 0x00ffffff;
+            }
+        }
+    }
 }
 
 static void s3_trio_realize(PCIDevice *dev, Error **errp)
@@ -1052,6 +1494,12 @@ static void s3_trio_realize(PCIDevice *dev, Error **errp)
     Object *o = OBJECT(dev);
     const MemoryRegionPortio *vga_ports, *vbe_ports;
     MemoryRegion* vga_io_memory;
+
+    /* 0 = default size: set 8 MB for Trio64, 2 MB for V864 */
+    if (s->vga.vram_size_mb == 0) {
+        s->vga.vram_size_mb =
+            object_dynamic_cast(OBJECT(dev), TYPE_S3_V864) ? 2 : 8;
+    }
 
     /* setup VGA */
     if (!vga_common_init(&s->vga, OBJECT(dev), errp)) {
@@ -1064,14 +1512,48 @@ static void s3_trio_realize(PCIDevice *dev, Error **errp)
     memory_region_set_coalescing(vga_io_memory);
     memory_region_set_coalescing(&s->vga.vram);
 
+    /*
+     * On 40p, ARC probes the option ROM but firmware didn't shadowed it.
+     * It is mapped in such non-standard way, so clean the property then.
+     */
+    g_autofree char *rom_name =
+        g_strdup(dev->romfile && dev->romfile[0] ?
+                 dev->romfile : "vgabios-s3.bin");
+    g_free(dev->romfile);
+    dev->romfile = NULL;
+
+    char *rom_path = qemu_find_file(QEMU_FILE_TYPE_BIOS, rom_name);
+    if (rom_path) {
+        memory_region_init_rom(&s->rom, OBJECT(dev), "s3-trio.rom",
+                               0x10000, &error_fatal);
+        if (load_image_mr(rom_path, &s->rom) > 0) {
+            memory_region_add_subregion_overlap(s->vga.legacy_address_space,
+                                                0x000c0000, &s->rom, 1);
+            memory_region_init_alias(&s->rom_bar, OBJECT(dev),
+                                     "s3-trio.rom-bar", &s->rom, 0, 0x10000);
+            pci_register_bar(dev, PCI_ROM_SLOT, 0, &s->rom_bar);
+        }
+        g_free(rom_path);
+    } else {
+        error_report("s3-trio: option ROM '%s' not found", rom_name);
+    }
+
     s->vga.con = qemu_graphic_console_create(DEVICE(s), 0, s->vga.hw_ops, &s->vga);
 
     s->vga.get_bpp = s3_trio_get_bpp;
+    s->vga.cursor_invalidate = s3_cursor_invalidate;
+    s->vga.cursor_draw_line = s3_cursor_draw_line;
 
     isa_register_portio_list(NULL, &s->portio, 0, s3_trio_portio_list, s, "s3_trio");
 
     /* setup PCI */
     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_MEM_PREFETCH, &s->vga.vram);
+
+    /* fixed video window in PReP I/O mem */
+    memory_region_init_alias(&s->vram_iomem, o, "s3-trio-vram-iomem",
+                             &s->vga.vram, 0, s->vga.vram_size);
+    memory_region_add_subregion_overlap(pci_address_space(dev), 0x02800000,
+                                        &s->vram_iomem, 0);
 }
 
 static void s3_trio_class_init(ObjectClass *klass, const void *data)
@@ -1102,9 +1584,23 @@ static const TypeInfo s3_trio_info = {
     },
 };
 
+static void s3_v864_class_init(ObjectClass *klass, const void *data)
+{
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+
+    k->device_id = 0x88b0;
+}
+
+static const TypeInfo s3_v864_info = {
+    .name          = TYPE_S3_V864,
+    .parent        = TYPE_S3_TRIO,
+    .class_init    = s3_v864_class_init,
+};
+
 static void s3_register_types(void)
 {
     type_register_static(&s3_trio_info);
+    type_register_static(&s3_v864_info);
 }
 
 type_init(s3_register_types)
