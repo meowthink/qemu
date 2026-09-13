@@ -7244,7 +7244,7 @@ static void ppc_cpu_reset_hold(Object *obj, ResetType type)
     }
 
     env->bytelaneswap = false;
-    env->bytelaneswap_latch = 0;
+    env->le_latch = 0;
 
     msr = (target_ulong)0;
     if (!(env->flags & POWERPC_FLAG_PPE42)) {

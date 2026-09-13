@@ -371,6 +371,8 @@ static void powerpc_set_excp_state(PowerPCCPU *cpu, target_ulong vector,
 
     assert((msr & env->msr_mask) == msr);
 
+    /* Exception entry is context sync. */
+    hreg_le_sync(env);
     /*
      * We don't use hreg_store_msr here as already have treated any
      * special case that could occur. Just store MSR and update hflags

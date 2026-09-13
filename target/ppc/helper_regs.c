@@ -21,6 +21,7 @@
 #include "cpu.h"
 #include "qemu/main-loop.h"
 #include "exec/cputlb.h"
+#include "exec/tb-flush.h"
 #include "system/kvm.h"
 #include "system/tcg.h"
 #include "helper_regs.h"
@@ -247,6 +248,19 @@ static uint32_t hreg_compute_hflags_value(CPUPPCState *env)
 void hreg_compute_hflags(CPUPPCState *env)
 {
     env->hflags = hreg_compute_hflags_value(env);
+}
+
+/*
+ * Context sync event for endian mode switch: flush cached translated
+ * insns immediately.
+ */
+void hreg_le_sync(CPUPPCState *env)
+{
+    if (env->le_latch) {
+        env->le_latch = 0;
+        queue_tb_flush(env_cpu(env));
+        cpu_exit(env_cpu(env));
+    }
 }
 
 /*

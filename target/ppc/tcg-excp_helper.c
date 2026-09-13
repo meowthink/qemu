@@ -494,6 +494,11 @@ void helper_ppc_maybe_interrupt(CPUPPCState *env)
     ppc_maybe_interrupt(env);
 }
 
+void helper_le_sync(CPUPPCState *env)
+{
+    hreg_le_sync(env);
+}
+
 static void do_rfi(CPUPPCState *env, target_ulong nip, target_ulong msr)
 {
     /* MSR:POW cannot be set by any form of rfi */
@@ -518,6 +523,8 @@ static void do_rfi(CPUPPCState *env, target_ulong nip, target_ulong msr)
 #endif
     /* XXX: beware: this is false if VLE is supported */
     env->nip = nip & ~((target_ulong)0x00000003);
+    /* rfi is context sync. */
+    hreg_le_sync(env);
     hreg_store_msr(env, msr, 1);
     trace_ppc_excp_rfi(env->nip, env->msr);
     /*
