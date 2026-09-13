@@ -264,8 +264,8 @@ static void ibm_40p_init(MachineState *machine)
         exit(1);
     }
 
-    /* Set time-base frequency to 100 Mhz */
-    cpu_ppc_tb_init(env, 100UL * 1000UL * 1000UL);
+    /* Set time-base frequency to 16.67 Mhz */
+    cpu_ppc_tb_init(env, 100UL * 1000UL * 1000UL / 6);
     qemu_register_reset(ppc_prep_reset, cpu);
 
     /* allocate and load firmware */
