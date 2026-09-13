@@ -2112,6 +2112,8 @@ static int32_t scsi_disk_emulate_command(SCSIRequest *req, uint8_t *buf)
         s->tray_locked = req->cmd.buf[4] & 1;
         blk_lock_medium(s->qdev.conf.blk, req->cmd.buf[4] & 1);
         break;
+    case REZERO:
+        break;
     case READ_CAPACITY_10:
         /* The normal LEN field for this command is zero.  */
         memset(outbuf, 0, 8);

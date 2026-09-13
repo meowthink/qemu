@@ -683,22 +683,6 @@ static void lsi_do_dma(LSIState *s, int out)
     }
 }
 
-
-/* Add a command to the queue.  */
-static void lsi_queue_command(LSIState *s)
-{
-    lsi_request *p = s->current;
-
-    trace_lsi_queue_command(p->tag);
-    assert(s->current != NULL);
-    assert(s->current->dma_len == 0);
-    QTAILQ_INSERT_TAIL(&s->queue, s->current, next);
-    s->current = NULL;
-
-    p->pending = 0;
-    p->out = (s->sstat1 & PHASE_MASK) == PHASE_DO;
-}
-
 /* Queue a byte for a MSG IN phase.  */
 static void lsi_add_msg_byte(LSIState *s, uint8_t data)
 {
@@ -902,13 +886,15 @@ static void lsi_do_command(LSIState *s)
     }
     if (!s->command_complete) {
         if (n) {
-            /* Command did not complete immediately so disconnect.  */
-            lsi_add_msg_byte(s, 2); /* SAVE DATA POINTER */
-            lsi_add_msg_byte(s, 4); /* DISCONNECT */
-            /* wait data */
-            lsi_set_phase(s, PHASE_MI);
-            s->msg_action = LSI_MSG_ACTION_DISCONNECT;
-            lsi_queue_command(s);
+            /*
+             * Command did not complete immediately. Keep the connection
+             * and let the SCRIPTS data move suspend until avaliable
+             */
+            if (n > 0) {
+                lsi_set_phase(s, PHASE_DI);
+            } else {
+                lsi_set_phase(s, PHASE_DO);
+            }
         } else {
             /* wait command complete */
             lsi_set_phase(s, PHASE_DI);
