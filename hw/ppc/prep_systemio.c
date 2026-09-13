@@ -53,6 +53,7 @@ struct PrepSystemIoState {
     uint8_t system_control; /* 0x081c */
     uint8_t iomap_type; /* 0x0850 */
     uint8_t ibm_planar_id; /* 0x0852 */
+    uint8_t machine_id; /* 0x0800 */
     qemu_irq softreset_irq;
     PortioList portio;
 };
@@ -89,6 +90,15 @@ static uint32_t prep_port0092_read(void *opaque, uint32_t addr)
     PrepSystemIoState *s = opaque;
     trace_prep_systemio_read(addr, s->sreset);
     return s->sreset;
+}
+
+/* PORT 0800 -- machine/board ID, read by OpenFirmware */
+
+static uint32_t prep_port0800_read(void *opaque, uint32_t addr)
+{
+    PrepSystemIoState *s = opaque;
+    trace_prep_systemio_read(addr, s->machine_id);
+    return s->machine_id;
 }
 
 /* PORT 0808 -- Hardfile Light Register (Write Only) */
@@ -217,6 +227,7 @@ static void prep_port0850_write(void *opaque, uint32_t addr, uint32_t val)
 static const MemoryRegionPortio ppc_io800_port_list[] = {
     { 0x092, 1, 1, .read = prep_port0092_read,
                    .write = prep_port0092_write, },
+    { 0x800, 1, 1, .read = prep_port0800_read, },
     { 0x808, 1, 1, .write = prep_port0808_write, },
     { 0x80c, 1, 1, .read = prep_port080c_read, },
     { 0x810, 1, 1, .write = prep_port0810_write, },
@@ -291,6 +302,7 @@ static const VMStateDescription vmstate_prep_systemio = {
 static const Property prep_systemio_properties[] = {
     DEFINE_PROP_UINT8("ibm-planar-id", PrepSystemIoState, ibm_planar_id, 0),
     DEFINE_PROP_UINT8("equipment", PrepSystemIoState, equipment, 0),
+    DEFINE_PROP_UINT8("machine-id", PrepSystemIoState, machine_id, 0),
 };
 
 static void prep_systemio_class_initfn(ObjectClass *klass, const void *data)
