@@ -57,6 +57,8 @@ static const char *names[] = {
 #define LSI_SCNTL1_ADB    0x40
 #define LSI_SCNTL1_EXC    0x80
 
+#define LSI_SCSI_RESET_DELAY_NS 100000 /* 100 us */
+
 #define LSI_SCNTL2_WSR    0x01
 #define LSI_SCNTL2_VUE0   0x02
 #define LSI_SCNTL2_VUE1   0x04
@@ -227,6 +229,9 @@ struct LSIState {
     MemoryRegion io_io;
     AddressSpace pci_io_as;
     QEMUTimer *scripts_timer;
+    QEMUTimer *scsi_reset_timer;
+    bool scsi_reset_asserted;
+    bool scsi_reset_pending;
 
     int carry; /* ??? Should this be in a visible register somewhere?  */
     int status;
@@ -350,6 +355,9 @@ static lsi_request *get_pending_req(LSIState *s)
 static void lsi_soft_reset(LSIState *s)
 {
     trace_lsi_reset();
+    timer_del(s->scsi_reset_timer);
+    s->scsi_reset_asserted = false;
+    s->scsi_reset_pending = false;
     s->carry = 0;
 
     s->msg_action = LSI_MSG_ACTION_COMMAND;
@@ -683,22 +691,6 @@ static void lsi_do_dma(LSIState *s, int out)
     }
 }
 
-
-/* Add a command to the queue.  */
-static void lsi_queue_command(LSIState *s)
-{
-    lsi_request *p = s->current;
-
-    trace_lsi_queue_command(p->tag);
-    assert(s->current != NULL);
-    assert(s->current->dma_len == 0);
-    QTAILQ_INSERT_TAIL(&s->queue, s->current, next);
-    s->current = NULL;
-
-    p->pending = 0;
-    p->out = (s->sstat1 & PHASE_MASK) == PHASE_DO;
-}
-
 /* Queue a byte for a MSG IN phase.  */
 static void lsi_add_msg_byte(LSIState *s, uint8_t data)
 {
@@ -902,13 +894,15 @@ static void lsi_do_command(LSIState *s)
     }
     if (!s->command_complete) {
         if (n) {
-            /* Command did not complete immediately so disconnect.  */
-            lsi_add_msg_byte(s, 2); /* SAVE DATA POINTER */
-            lsi_add_msg_byte(s, 4); /* DISCONNECT */
-            /* wait data */
-            lsi_set_phase(s, PHASE_MI);
-            s->msg_action = LSI_MSG_ACTION_DISCONNECT;
-            lsi_queue_command(s);
+            /*
+             * Command did not complete immediately. Keep the connection
+             * and let the SCRIPTS data move suspend until avaliable
+             */
+            if (n > 0) {
+                lsi_set_phase(s, PHASE_DI);
+            } else {
+                lsi_set_phase(s, PHASE_DO);
+            }
         } else {
             /* wait command complete */
             lsi_set_phase(s, PHASE_DI);
@@ -1794,6 +1788,13 @@ static uint8_t lsi_reg_readb(LSIState *s, int offset)
         ret = s->sist0;
         s->sist0 = 0;
         lsi_update_irq(s);
+        if (s->scsi_reset_pending) {
+            s->scsi_reset_pending = false;
+            timer_del(s->scsi_reset_timer);
+            trace_lsi_script_scsi_interrupt(0, LSI_SIST0_RST, s->sist1, s->sist0);
+            s->sist0 |= LSI_SIST0_RST;
+            lsi_update_irq(s);
+        }
         break;
     case 0x43: /* SIST1 */
         ret = s->sist1;
@@ -1922,12 +1923,20 @@ static void lsi_reg_writeb(LSIState *s, int offset, uint8_t val)
                       "lsi_scsi: Immediate Arbritration not implemented\n");
         }
         if (val & LSI_SCNTL1_RST) {
-            if (!(s->sstat0 & LSI_SSTAT0_RST)) {
+            if (!s->scsi_reset_asserted) {
+                s->scsi_reset_asserted = true;
                 bus_cold_reset(BUS(&s->bus));
                 s->sstat0 |= LSI_SSTAT0_RST;
                 lsi_script_scsi_interrupt(s, LSI_SIST0_RST, 0);
             }
         } else {
+            if (s->scsi_reset_asserted) {
+                s->scsi_reset_asserted = false;
+                s->scsi_reset_pending = true;
+                timer_mod(s->scsi_reset_timer,
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                          LSI_SCSI_RESET_DELAY_NS);
+            }
             s->sstat0 &= ~LSI_SSTAT0_RST;
         }
         break;
@@ -2033,12 +2042,13 @@ static void lsi_reg_writeb(LSIState *s, int offset, uint8_t val)
         s->dsp &= 0x00ffffff;
         s->dsp |= val << 24;
         /*
-         * FIXME: if s->waiting != LSI_NOWAIT, this will only execute one
-         * instruction.  Is this correct?
+         * In manual start mode (DMODE.MAN = 1) a write to the DSP register
+         * is what starts the SCRIPTS; DCNTL.STD is the automatic-mode start
+         * trigger.
          */
-        if ((s->dmode & LSI_DMODE_MAN) == 0
-            && (s->istat1 & LSI_ISTAT1_SRUN) == 0)
+        if ((s->istat1 & LSI_ISTAT1_SRUN) == 0) {
             lsi_execute_script(s);
+        }
         break;
     CASE_SET_REG32(dsps, 0x30)
     CASE_SET_REG32(scratch[0], 0x34)
@@ -2295,6 +2305,8 @@ static const VMStateDescription vmstate_lsi_scsi = {
         VMSTATE_UINT8(scntl3, LSIState),
         VMSTATE_UINT8(sstat0, LSIState),
         VMSTATE_UINT8(sstat1, LSIState),
+        VMSTATE_BOOL(scsi_reset_asserted, LSIState),
+        VMSTATE_BOOL(scsi_reset_pending, LSIState),
         VMSTATE_UINT8(scid, LSIState),
         VMSTATE_UINT8(sxfer, LSIState),
         VMSTATE_UINT8(socl, LSIState),
@@ -2351,6 +2363,17 @@ static void scripts_timer_cb(void *opaque)
     lsi_execute_script(s);
 }
 
+static void scsi_reset_timer_cb(void *opaque)
+{
+    LSIState *s = opaque;
+
+    if (s->scsi_reset_pending) {
+        s->scsi_reset_pending = false;
+        s->sist0 |= LSI_SIST0_RST;
+        lsi_update_irq(s);
+    }
+}
+
 static void lsi_scsi_realize_8xx(PCIDevice *dev, Error **errp, uint16_t type)
 {
     LSIState *s = LSI53C895A(dev);
@@ -2371,6 +2394,8 @@ static void lsi_scsi_realize_8xx(PCIDevice *dev, Error **errp, uint16_t type)
     memory_region_init_io(&s->io_io, OBJECT(s), &lsi_io_ops, s,
                           "lsi-io", 256);
     s->scripts_timer = timer_new_us(QEMU_CLOCK_VIRTUAL, scripts_timer_cb, s);
+    s->scsi_reset_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                       scsi_reset_timer_cb, s);
 
     /*
      * Since we use the address-space API to interact with ram_io, disable the
@@ -2418,6 +2443,7 @@ static void lsi_scsi_exit(PCIDevice *dev)
 
     address_space_destroy(&s->pci_io_as);
     timer_free(s->scripts_timer);
+    timer_free(s->scsi_reset_timer);
 }
 
 static void lsi_class_init(ObjectClass *klass, const void *data)
