@@ -868,10 +868,9 @@ SCSIRequest *scsi_req_new(SCSIDevice *d, uint32_t tag, uint32_t lun,
          buf[0] != GET_EVENT_STATUS_NOTIFICATION &&
 
          /*
-          * If we already have a pending unit attention condition,
-          * report this one before triggering another one.
+          * REQUEST SENSE must bypass reqops_unit_attention
           */
-         !(buf[0] == REQUEST_SENSE && d->sense_is_ua))) {
+         buf[0] != REQUEST_SENSE)) {
         ops = &reqops_unit_attention;
     } else if (lun != d->lun ||
                buf[0] == REPORT_LUNS ||
