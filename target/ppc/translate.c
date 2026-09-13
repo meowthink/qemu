@@ -2584,10 +2584,27 @@ static inline void gen_addr_add(DisasContext *ctx, TCGv ret, TCGv arg1,
     }
 }
 
+static inline uint32_t gen_align_dsisr(uint32_t insn)
+{
+    switch (insn >> 26) {
+    case 31: /* integer X-form */
+    case 59: /* floating-point single X-form */
+    case 63: /* floating-point double X-form */
+        return (((insn >> 1) & 0x3) << 5) | (((insn >> 6) & 0x1) << 4) |
+               (((insn >> 10) & 0x1) << 3) | (((insn >> 9) & 0x1) << 2) |
+               (((insn >> 8) & 0x1) << 1) | ((insn >> 7) & 0x1);
+    default: /* immediate-index form */
+        return (((insn >> 26) & 0x1) << 4) | ((insn >> 27) & 0xF);
+    }
+}
+
 static inline void gen_align_no_le(DisasContext *ctx)
 {
+    uint32_t insn = ctx->opcode;
+
     gen_exception_err(ctx, POWERPC_EXCP_ALIGN,
-                      (ctx->opcode & 0x03FF0000) | POWERPC_EXCP_ALIGN_LE);
+                      (gen_align_dsisr(insn) << 8) |
+                      (insn & 0x03FF0000) | POWERPC_EXCP_ALIGN_LE);
 }
 
 /* EA <- {(ra == 0) ? 0 : GPR[ra]} + displ */
