@@ -18,6 +18,7 @@ s3_vga_cmd(uint16_t cmd) "execute command %04x"
 s3_vga_cmd_line_bresenham(uint16_t cur_x, uint16_t cur_y, int inc_x, int inc_y, uint16_t dmajor, char major_axis) "cur_x=%u cur_y=%u inc_x=%d inc_y=%d dmajor=%u major_axis=%c"
 s3_vga_cmd_line_vector(uint16_t cur_x, uint16_t cur_y, uint8_t line_type, uint16_t length) "cur_x=%u cur_y=%u line_type=%u length=%u"
 s3_vga_cmd_rect(uint16_t cur_x, uint16_t cur_y, int inc_x, int inc_y, uint16_t width, uint16_t height) "cur_x=%u cur_y=%u inc_x=%d inc_y=%d width=%u height=%u"
+s3_vga_pixel(uint32_t offset, uint8_t value, uint16_t x, uint16_t y, uint16_t maj, uint16_t maj_pcnt, uint16_t min, uint16_t min_pcnt, uint16_t gp, uint16_t cmd) "off=%u val=%02x x=%u y=%u maj=%u/%u min=%u/%u gp=%04x cmd=%04x"
 s3_vga_cmd_bitblt(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint16_t width, uint16_t height) "from=(%u,%u) to=(%u,%u) width=%u height=%u"
 s3_vga_enable_readb(uint32_t addr, uint32_t val) "read addr=%04x: 0x%02x"
 s3_vga_enable_writeb(uint32_t addr, uint32_t val) "write addr=%04x: 0x%02x"
@@ -240,4 +241,3 @@ apple_gfx_iosfc_map_memory_new_region(size_t i, void *region, uint64_t start, ui
 apple_gfx_iosfc_unmap_memory(void *a, void *b, void *c, void *d, void *e, void *f) "a=%p b=%p c=%p d=%p e=%p f=%p"
 apple_gfx_iosfc_unmap_memory_region(void* mem, void *region) "unmapping @ %p from memory region %p"
 apple_gfx_iosfc_raise_irq(uint32_t vector) "vector=0x%x"
-

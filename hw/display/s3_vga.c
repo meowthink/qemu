@@ -22,6 +22,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/datadir.h"
 #include "hw/pci/pci_device.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
@@ -33,8 +34,11 @@
 #include "trace.h"
 #include "qemu/log.h"
 #include "system/reset.h"
+#include "system/memory.h"
+#include "hw/core/loader.h"
 
 #define TYPE_S3_TRIO "s3-trio"
+#define TYPE_S3_V864 "s3-v864"
 
 enum {
     REG_DISP_STAT      = 0x00,
@@ -77,6 +81,8 @@ enum {
 
 enum {
     GP_STAT_BUSY = 0x0200,
+    GP_STAT_DATA_AVAIL = 0x0100,
+    GP_STAT_FIFO_EMPTY = 0x0400,
 };
 
 enum {
@@ -131,8 +137,11 @@ enum {
 typedef struct S3TrioState {
     PCIDevice dev;
     VGACommonState vga;
+    MemoryRegion rom;
+    MemoryRegion rom_bar;
     uint16_t maj_axis, min_axis;
     PortioList portio;
+    bool crtc_seq_shared;
 
     uint32_t dclk;
     uint32_t mclk;
@@ -205,9 +214,29 @@ static inline uint32_t reg_to_address(int reg)
     return (reg << 10) + 0x2e8;
 }
 
+/*
+ * V864 specific feature:
+ * writes to the extended CRTC registers 0x7/0x12/0x42/0x5D/0x5E
+ * are reflected into the sequencer registers
+ */
+static bool s3_crtc_seq_shared(S3TrioState *s, unsigned int idx)
+{
+    if (s->crtc_seq_shared) {
+        switch (idx) {
+            case 0x07: /* CR7: vertical overflow */
+            case 0x12: /* CR12: vertical display end (low) */
+            case 0x42: /* CR42: mode control */
+            case 0x5d: /* CR5D: horizontal overflow */
+            case 0x5e: /* CR5E: vertical overflow high */
+                return true;
+        }
+    }
+    return false;
+}
+
 static inline void do_cmd_done(S3TrioState *s)
 {
-    s->gp_stat &= ~GP_STAT_BUSY;
+    s->gp_stat = GP_STAT_FIFO_EMPTY;
 }
 
 static void move_to_next_pixel(S3TrioState *s)
@@ -276,6 +305,9 @@ static void do_cmd_write_one_pixel(S3TrioState *s, uint8_t value)
     if ((s->maj_axis < s->maj_axis_pcnt) ||
         (s->maj_axis == s->maj_axis_pcnt && !(s->cmd & CMD_LASTPIX))) {
         offset = s->cur_y * width + s->cur_x;
+        trace_s3_vga_pixel(offset, value, s->cur_x, s->cur_y, s->maj_axis,
+                           s->maj_axis_pcnt, s->min_axis, s->mfc[0],
+                           s->gp_stat, s->cmd);
         p8 = s->vga.vram_ptr + offset;
         p8[0] = value;
         memory_region_set_dirty(&s->vga.vram, offset, 1);
@@ -350,17 +382,26 @@ static uint16_t get_color_from_mix(S3TrioState *s, uint16_t mix)
 static uint16_t raster_op(S3TrioState *s, uint16_t mix)
 {
     uint16_t src = get_color_from_mix(s, mix);
-    uint16_t op = mix & 0x1f;
+    uint16_t dst = get_current_destination_bitmap(s);
+    uint16_t op = mix & 0x0f;
 
     switch (op) {
-    case 0x00: return ~get_current_destination_bitmap(s);
+    case 0x00: return ~dst;
     case 0x01: return 0;
-    case 0x02: return 1;
-    case 0x03: return ~get_current_destination_bitmap(s);
-    case 0x04: return ~get_color_from_mix(s, mix);
-    case 0x05: return get_color_from_mix(s, mix) ^ get_current_destination_bitmap(s);
-    case 0x06: return ~(get_color_from_mix(s, mix) ^ get_current_destination_bitmap(s));
-    case 0x07: return get_color_from_mix(s, mix);
+    case 0x02: return ~0;
+    case 0x03: return dst;
+    case 0x04: return ~src;
+    case 0x05: return src ^ dst;
+    case 0x06: return ~(src ^ dst);
+    case 0x07: return src;
+    case 0x08: return ~(src & dst);
+    case 0x09: return ~src | dst;
+    case 0x0a: return src | ~dst;
+    case 0x0b: return src | dst;
+    case 0x0c: return src & dst;
+    case 0x0d: return src & ~dst;
+    case 0x0e: return ~src & dst;
+    case 0x0f: return ~(src | dst);
     default:
         qemu_log_mask(LOG_GUEST_ERROR, "s3_trio: invalid MIX operation 0x%x\n",
                       op);
@@ -453,7 +494,7 @@ static void s3_do_cmd_bitblt(S3TrioState *s)
 
 static void do_cmd_init(S3TrioState *s)
 {
-    s->gp_stat |= GP_STAT_BUSY;
+    s->gp_stat = GP_STAT_BUSY;
     s->maj_axis = 0;
     s->min_axis = 0;
 }
@@ -464,6 +505,10 @@ static void do_cmd(S3TrioState *s)
 
     do_cmd_init(s);
 
+    if (s->cmd & CMD_PCDATA) {
+        s->gp_stat |= GP_STAT_DATA_AVAIL;
+    }
+
     if ((s->cmd & CMD_WRTDATA) == 0) {
         qemu_log_mask(LOG_UNIMP,
                       "s3_trio: CMD_WRTDATA=0 not implemented (%04x)\n", s->cmd);
@@ -473,6 +518,7 @@ static void do_cmd(S3TrioState *s)
     case CMD_CMD_NOP:
         qemu_log_mask(LOG_UNIMP, "s3_trio: CMD_NOP not implemented (%04x)\n",
                       s->cmd);
+        do_cmd_done(s);
         break;
     case CMD_CMD_LINE:
         if ((s->cmd & CMD_LINETYPE) == 0) {
@@ -484,6 +530,7 @@ static void do_cmd(S3TrioState *s)
             qemu_log_mask(LOG_UNIMP,
                           "s3_trio: CMD_LINE (Bresenham) not implemented (%04x)\n",
                           s->cmd);
+            do_cmd_done(s);
         } else {
             trace_s3_vga_cmd_line_vector(s->cur_x, s->cur_y, (s->cmd >> 5) & 3,
                                          s->maj_axis_pcnt);
@@ -507,23 +554,28 @@ static void do_cmd(S3TrioState *s)
     case CMD_CMD_RECTV1:
         qemu_log_mask(LOG_UNIMP, "s3_trio: CMD_RECTV1 not implemented (%04x)\n",
                       s->cmd);
+        do_cmd_done(s);
         break;
     case CMD_CMD_RECTV2:
         qemu_log_mask(LOG_UNIMP, "s3_trio: CMD_RECTV2 not implemented (%04x)\n",
                       s->cmd);
+        do_cmd_done(s);
         break;
     case CMD_CMD_LINEAF:
         qemu_log_mask(LOG_UNIMP, "s3_trio: CMD_LINEAF not implemented (%04x)\n",
                       s->cmd);
+        do_cmd_done(s);
         break;
     case CMD_CMD_BITBLT:
         trace_s3_vga_cmd_bitblt(s->cur_x, s->cur_y, s->destx_diastp, s->desty_axstep,
                                 s->maj_axis_pcnt, s->min_axis_pcnt);
         s3_do_cmd_bitblt(s);
+        do_cmd_done(s);
         break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR, "s3_trio: illegal command %04x\n",
                       s->cmd);
+        do_cmd_done(s);
         break;
     }
 }
@@ -713,7 +765,7 @@ static void s3_trio_post_write(S3TrioState* s, uint32_t addr)
         qemu_log_mask(LOG_UNIMP, "s3_trio: unimplemented write to V_DISP\n");
         break;
     case REG_SUBSYS_CNTL:
-        s->subsys_cntl &= ~(1 << 12); /* clear CHPTST */
+        s->subsys_stat &= ~(s->subsys_cntl & 0x000f); /* clear interrupts */
         break;
     case REG_PIX_TRANS:
         do_cmd_write_pixel(s, s->pix_trans);
@@ -854,6 +906,9 @@ static void s3_trio_vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
                               "s3_trio: unimplemented PLL change\n");
             } else {
                 vga_ioport_write(&s->vga, addr, val);
+                if (s3_crtc_seq_shared(s, s->vga.cr_index)) {
+                    s->vga.sr[s->vga.cr_index] = s->vga.cr[s->vga.cr_index];
+                }
             }
             break;
         case 0x33:
@@ -873,6 +928,9 @@ static void s3_trio_vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
             break;
         default:
             vga_ioport_write(&s->vga, addr, val);
+            if (s3_crtc_seq_shared(s, s->vga.cr_index)) {
+                s->vga.sr[s->vga.cr_index] = s->vga.cr[s->vga.cr_index];
+            }
             break;
         }
         break;
@@ -893,6 +951,9 @@ static void s3_trio_vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
             }
             break;
         default:
+            /* SR >= 0x1d are plain R/W on the real chip; store so the
+             * read-back answers like real. */
+            s->vga.sr[s->vga.sr_index] = val;
             break;
         }
         break;
@@ -1042,7 +1103,14 @@ static void s3_trio_reset(DeviceState *d)
 
     vga_common_reset(&s->vga);
 
+    /* V864 has 8-bit DAC vs Trio64 6-bit DAC so bypass c6_to_8() path */
+    if (object_dynamic_cast(OBJECT(d), TYPE_S3_V864) != NULL) {
+        s->vga.dac_8bit = 1;
+        s->crtc_seq_shared = true;
+    }
+
     s->disp_stat |= DISP_STAT_SENSE;
+    s->gp_stat = GP_STAT_FIFO_EMPTY;
 }
 
 static void s3_trio_realize(PCIDevice *dev, Error **errp)
@@ -1063,6 +1131,25 @@ static void s3_trio_realize(PCIDevice *dev, Error **errp)
                                         0x000a0000, vga_io_memory, 1);
     memory_region_set_coalescing(vga_io_memory);
     memory_region_set_coalescing(&s->vga.vram);
+
+    /*
+     * On 40p, ARC probes the option ROM but firmware didn't shadowed it.
+     */
+    const char *rom_name = dev->romfile && dev->romfile[0] ?
+                           dev->romfile : "vgabios-s3.bin";
+    char *rom_path = qemu_find_file(QEMU_FILE_TYPE_BIOS, rom_name);
+    if (rom_path) {
+        memory_region_init_rom(&s->rom, OBJECT(dev), "s3-trio.rom",
+                               0x10000, &error_fatal);
+        if (load_image_mr(rom_path, &s->rom) > 0) {
+            memory_region_add_subregion_overlap(s->vga.legacy_address_space,
+                                                0x000c0000, &s->rom, 1);
+            memory_region_init_alias(&s->rom_bar, OBJECT(dev),
+                                     "s3-trio.rom-bar", &s->rom, 0, 0x10000);
+            pci_register_bar(dev, PCI_ROM_SLOT, 0, &s->rom_bar);
+        }
+        g_free(rom_path);
+    }
 
     s->vga.con = graphic_console_init(DEVICE(s), 0, s->vga.hw_ops, &s->vga);
 
@@ -1102,9 +1189,23 @@ static const TypeInfo s3_trio_info = {
     },
 };
 
+static void s3_v864_class_init(ObjectClass *klass, const void *data)
+{
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+
+    k->device_id = 0x88b0;
+}
+
+static const TypeInfo s3_v864_info = {
+    .name          = TYPE_S3_V864,
+    .parent        = TYPE_S3_TRIO,
+    .class_init    = s3_v864_class_init,
+};
+
 static void s3_register_types(void)
 {
     type_register_static(&s3_trio_info);
+    type_register_static(&s3_v864_info);
 }
 
 type_init(s3_register_types)
