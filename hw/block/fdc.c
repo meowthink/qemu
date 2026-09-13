@@ -675,6 +675,22 @@ enum {
     FD_SR0_RDYCHG   = 0xc0,
 };
 
+/*
+ * Seek and recalibrate async raise irq by a timer
+ */
+#define FD_SEEK_DELAY_NS (2 * NANOSECONDS_PER_SECOND / 1000)
+
+static void fdctrl_seek_timer(void *opaque)
+{
+    fdctrl_raise_irq(opaque);
+}
+
+static void fdctrl_schedule_seek_irq(FDCtrl *fdctrl)
+{
+    timer_mod(fdctrl->seek_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + FD_SEEK_DELAY_NS);
+}
+
 enum {
     FD_SR1_MA       = 0x01, /* Missing address mark */
     FD_SR1_NW       = 0x02, /* Not writable */
@@ -1112,6 +1128,7 @@ void fdctrl_reset(FDCtrl *fdctrl, int do_irq)
     fdctrl->msr = FD_MSR_RQM;
     fdctrl->reset_sensei = 0;
     timer_del(fdctrl->result_timer);
+    timer_del(fdctrl->seek_timer);
     /* FIFO state */
     fdctrl->data_pos = 0;
     fdctrl->data_len = 0;
@@ -2036,7 +2053,7 @@ static void fdctrl_handle_recalibrate(FDCtrl *fdctrl, int direction)
     fdctrl_to_command_phase(fdctrl);
     /* Raise Interrupt */
     fdctrl->status0 |= FD_SR0_SEEK;
-    fdctrl_raise_irq(fdctrl);
+    fdctrl_schedule_seek_irq(fdctrl);
 }
 
 static void fdctrl_handle_sense_interrupt_status(FDCtrl *fdctrl, int direction)
@@ -2076,7 +2093,7 @@ static void fdctrl_handle_seek(FDCtrl *fdctrl, int direction)
     fd_seek(cur_drv, cur_drv->head, fdctrl->fifo[2], cur_drv->sect, 1);
     /* Raise Interrupt */
     fdctrl->status0 |= FD_SR0_SEEK;
-    fdctrl_raise_irq(fdctrl);
+    fdctrl_schedule_seek_irq(fdctrl);
 }
 
 static void fdctrl_handle_perpendicular_mode(FDCtrl *fdctrl, int direction)
@@ -2407,6 +2424,8 @@ void fdctrl_realize_common(DeviceState *dev, FDCtrl *fdctrl, Error **errp)
     fdctrl->fifo_size = 512;
     fdctrl->result_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                              fdctrl_result_timer, fdctrl);
+    fdctrl->seek_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                      fdctrl_seek_timer, fdctrl);
 
     fdctrl->version = 0x90; /* Intel 82078 controller */
     fdctrl->config = FD_CONFIG_EIS | FD_CONFIG_EFIFO; /* Implicit seek, polling & FIFO enabled */
