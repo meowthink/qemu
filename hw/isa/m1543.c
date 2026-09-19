@@ -456,7 +456,11 @@ static void m1543_superio_reset(DeviceState *dev)
     stb_p(s->regs + M1543_DEVICE_ID, s->chip_id);
     stb_p(s->regs + M1543_DEVICE_REV, s->chip_rev);
 
-    STB(FDC, M1543_DEVICE_ACTIVE, 0);
+    /*
+     * The floppy controller is chipset-integrated and always present;
+     * CMOS byte 0x10 describes the attached drives, not the controller.
+     */
+    STB(FDC, M1543_DEVICE_ACTIVE, 1);
     STW(FDC, M1543_DEVICE_ADDR, (*ic->floppy.get_iobase)(sio, 0));
     STB(FDC, M1543_DEVICE_IRQ1, (*ic->floppy.get_irq)(sio, 0));
     STB(FDC, M1543_DEVICE_DMA, (*ic->floppy.get_dma)(sio, 0));
@@ -675,6 +679,15 @@ static void m1543_pmu_reset(DeviceState *dev)
     /* Set wmask values. */
     memset(pci_wmask + PCI_CONFIG_HEADER_SIZE, 0,
            PCI_CONFIG_SPACE_SIZE - PCI_CONFIG_HEADER_SIZE);
+    /*
+     * M1543C datasheet: the M7101 command register only allows the I/O
+     * space enable bit to be written (memory/BME are always zero), and
+     * configuration registers 0x30-0x3f are reserved.
+     */
+    pci_set_word(pci_wmask + PCI_COMMAND, PCI_COMMAND_IO);
+    pci_set_long(pci_wmask + 0x3c, 0);
+    pci_set_byte(pci_conf + PCI_INTERRUPT_LINE, 0);
+    pci_set_byte(pci_conf + PCI_INTERRUPT_PIN, 0);
     pci_set_long(pci_wmask + 0x40, 0x0000101f);
     pci_set_long(pci_wmask + 0x44, 0xff189fff);
     pci_set_long(pci_wmask + 0x48, 0xff000000);
