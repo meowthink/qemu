@@ -53,6 +53,9 @@ typedef struct M48t59State {
     QEMUTimer *wd_timer;
     /* NVRAM storage */
     uint8_t *buffer;
+    /* Optional backing file (NVRAM image) */
+    char *filename;
+    int fd;
     /* Model parameters */
     uint32_t model; /* 2 = m48t02, 8 = m48t08, 59 = m48t59 */
     /* NVRAM storage */
