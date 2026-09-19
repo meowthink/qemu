@@ -345,7 +345,13 @@ void m48t59_write(M48t59State *NVRAM, uint32_t addr, uint32_t val)
             break;
     do_write:
         if (addr < NVRAM->size) {
+            ssize_t wr;
+
             NVRAM->buffer[addr] = val & 0xFF;
+            if (NVRAM->fd >= 0) {
+                wr = pwrite(NVRAM->fd, &NVRAM->buffer[addr], 1, addr);
+                (void)wr;
+            }
         }
         break;
     }
@@ -566,6 +572,36 @@ const MemoryRegionOps m48t59_io_ops = {
 void m48t59_realize_common(M48t59State *s, Error **errp)
 {
     s->buffer = g_malloc0(s->size);
+    s->fd = -1;
+    if (s->filename) {
+        size_t done = 0;
+
+        s->fd = open(s->filename, O_RDWR | O_CREAT, 0644);
+        if (s->fd < 0) {
+            error_setg_errno(errp, errno,
+                             "cannot open NVRAM backing file '%s'",
+                             s->filename);
+            return;
+        }
+        while (done < s->size) {
+            ssize_t n = read(s->fd, s->buffer + done, s->size - done);
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                error_setg_errno(errp, errno,
+                                 "cannot read NVRAM backing file '%s'",
+                                 s->filename);
+                close(s->fd);
+                s->fd = -1;
+                return;
+            }
+            if (n == 0) {
+                break; /* fresh / short file: rest stays zero */
+            }
+            done += n;
+        }
+    }
     if (s->model == 59) {
         s->alrm_timer = timer_new_ns(rtc_clock, &alarm_cb, s);
         s->wd_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, &watchdog_cb, s);
