@@ -27,6 +27,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/rtc/m48t59.h"
+#include "qemu/error-report.h"
 #include "qemu/timer.h"
 #include "system/runstate.h"
 #include "system/rtc.h"
@@ -187,6 +188,21 @@ static void set_up_watchdog(M48t59State *NVRAM, uint8_t value)
 }
 
 /* Direct access to NVRAM */
+static void m48t59_store(M48t59State *NVRAM, uint32_t addr, uint8_t val)
+{
+    ssize_t written;
+
+    NVRAM->buffer[addr] = val;
+    if (NVRAM->fd >= 0) {
+        written = pwrite(NVRAM->fd, &NVRAM->buffer[addr], 1, addr);
+        if (written != 1 && !NVRAM->write_error_reported) {
+            NVRAM->write_error_reported = true;
+            warn_report("cannot write NVRAM backing file '%s': %s",
+                        NVRAM->filename, strerror(errno));
+        }
+    }
+}
+
 void m48t59_write(M48t59State *NVRAM, uint32_t addr, uint32_t val)
 {
     struct tm tm;
@@ -214,7 +230,7 @@ void m48t59_write(M48t59State *NVRAM, uint32_t addr, uint32_t val)
         tmp = from_bcd(val & 0x7F);
         if (tmp >= 0 && tmp <= 59) {
             NVRAM->alarm.tm_sec = tmp;
-            NVRAM->buffer[0x1FF2] = val;
+            m48t59_store(NVRAM, 0x1FF2, val);
             set_alarm(NVRAM);
         }
         break;
@@ -223,7 +239,7 @@ void m48t59_write(M48t59State *NVRAM, uint32_t addr, uint32_t val)
         tmp = from_bcd(val & 0x7F);
         if (tmp >= 0 && tmp <= 59) {
             NVRAM->alarm.tm_min = tmp;
-            NVRAM->buffer[0x1FF3] = val;
+            m48t59_store(NVRAM, 0x1FF3, val);
             set_alarm(NVRAM);
         }
         break;
@@ -232,7 +248,7 @@ void m48t59_write(M48t59State *NVRAM, uint32_t addr, uint32_t val)
         tmp = from_bcd(val & 0x3F);
         if (tmp >= 0 && tmp <= 23) {
             NVRAM->alarm.tm_hour = tmp;
-            NVRAM->buffer[0x1FF4] = val;
+            m48t59_store(NVRAM, 0x1FF4, val);
             set_alarm(NVRAM);
         }
         break;
@@ -241,23 +257,23 @@ void m48t59_write(M48t59State *NVRAM, uint32_t addr, uint32_t val)
         tmp = from_bcd(val & 0x3F);
         if (tmp != 0) {
             NVRAM->alarm.tm_mday = tmp;
-            NVRAM->buffer[0x1FF5] = val;
+            m48t59_store(NVRAM, 0x1FF5, val);
             set_alarm(NVRAM);
         }
         break;
     case 0x1FF6:
         /* interrupts */
-        NVRAM->buffer[0x1FF6] = val;
+        m48t59_store(NVRAM, 0x1FF6, val);
         break;
     case 0x1FF7:
         /* watchdog */
-        NVRAM->buffer[0x1FF7] = val;
+        m48t59_store(NVRAM, 0x1FF7, val);
         set_up_watchdog(NVRAM, val);
         break;
     case 0x1FF8:
     case 0x07F8:
         /* control */
-       NVRAM->buffer[addr] = (val & ~0xA0) | 0x90;
+        m48t59_store(NVRAM, addr, (val & ~0xA0) | 0x90);
         break;
     case 0x1FF9:
     case 0x07F9:
@@ -276,7 +292,7 @@ void m48t59_write(M48t59State *NVRAM, uint32_t addr, uint32_t val)
                 NVRAM->stop_time = 0;
             }
         }
-        NVRAM->buffer[addr] = val & 0x80;
+        m48t59_store(NVRAM, addr, val & 0x80);
         break;
     case 0x1FFA:
     case 0x07FA:
@@ -305,7 +321,7 @@ void m48t59_write(M48t59State *NVRAM, uint32_t addr, uint32_t val)
         get_time(NVRAM, &tm);
         tm.tm_wday = tmp;
         set_time(NVRAM, &tm);
-        NVRAM->buffer[addr] = val & 0x40;
+        m48t59_store(NVRAM, addr, val & 0x40);
         break;
     case 0x1FFD:
     case 0x07FD:
@@ -345,7 +361,7 @@ void m48t59_write(M48t59State *NVRAM, uint32_t addr, uint32_t val)
             break;
     do_write:
         if (addr < NVRAM->size) {
-            NVRAM->buffer[addr] = val & 0xFF;
+            m48t59_store(NVRAM, addr, val & 0xFF);
         }
         break;
     }
@@ -566,6 +582,36 @@ const MemoryRegionOps m48t59_io_ops = {
 void m48t59_realize_common(M48t59State *s, Error **errp)
 {
     s->buffer = g_malloc0(s->size);
+    s->fd = -1;
+    if (s->filename) {
+        size_t done = 0;
+
+        s->fd = open(s->filename, O_RDWR | O_CREAT, 0644);
+        if (s->fd < 0) {
+            error_setg_errno(errp, errno,
+                             "cannot open NVRAM backing file '%s'",
+                             s->filename);
+            return;
+        }
+        while (done < s->size) {
+            ssize_t n = read(s->fd, s->buffer + done, s->size - done);
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                error_setg_errno(errp, errno,
+                                 "cannot read NVRAM backing file '%s'",
+                                 s->filename);
+                close(s->fd);
+                s->fd = -1;
+                return;
+            }
+            if (n == 0) {
+                break; /* fresh / short file: rest stays zero */
+            }
+            done += n;
+        }
+    }
     if (s->model == 59) {
         s->alrm_timer = timer_new_ns(rtc_clock, &alarm_cb, s);
         s->wd_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, &watchdog_cb, s);
