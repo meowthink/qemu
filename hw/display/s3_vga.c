@@ -1065,6 +1065,13 @@ static uint32_t s3_trio_vga_ioport_read(void *opaque, uint32_t addr)
     return val;
 }
 
+static void s3_trio_update_bank_offset(S3TrioState *s)
+{
+    s->vga.bank_offset = (s->vga.cr[0x31] & 0x01) ?
+                         ((uint32_t)(s->vga.cr[0x6a] & 0x3f) << 16) : 0;
+    vga_update_memory_access(&s->vga);
+}
+
 static void s3_trio_vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
 {
     S3TrioState *s = opaque;
@@ -1092,6 +1099,11 @@ static void s3_trio_vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
             break;
         case 0x33:
             s->unlock_compatibility_registers = ((val & ~0xad) == 0);
+            break;
+        case 0x31:
+        case 0x6a:
+            vga_ioport_write(&s->vga, addr, val);
+            s3_trio_update_bank_offset(s);
             break;
         case 0x38:
             s->unlock_control_registers_1 = (val == 0x48);
