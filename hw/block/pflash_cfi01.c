@@ -498,7 +498,12 @@ static void pflash_write(PFlashCFI01 *pfl, hwaddr offset,
             break;
         case 0x50: /* Clear status bits */
             trace_pflash_write(pfl->name, "clear status bits");
-            pfl->status = 0x0;
+            /*
+             * Clear Status Register only clears the error bits (1/4/5);
+             * bit 7 mirrors the write-state machine and stays set while
+             * the device is idle.
+             */
+            pfl->status &= 0x80;
             goto mode_read_array;
         case 0x60: /* Block (un)lock */
             trace_pflash_write(pfl->name, "block unlock");

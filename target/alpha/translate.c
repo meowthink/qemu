@@ -889,12 +889,12 @@ static const AlphaHWLDSTParams ev5_hw_ld_mmu_idx[32] = {
     [0b00111] = { AlphaMMUIdx_PrivilegedWChk,   true },
     [0b01000] = { AlphaMMUIdx_AltMode,          false },
     [0b01001] = { AlphaMMUIdx_AltMode,          true },
-    [0b01010] = { AlphaMMUIdx_AltMode,          false },
-    [0b01011] = { AlphaMMUIdx_AltMode,          true },
+    [0b01010] = { AlphaMMUIdx_AltModeVPTE,      false },
+    [0b01011] = { AlphaMMUIdx_AltModeVPTE,      true },
     [0b01100] = { AlphaMMUIdx_AltModeWChk,      false },
     [0b01101] = { AlphaMMUIdx_AltModeWChk,      true },
-    [0b01110] = { AlphaMMUIdx_AltModeWChk,      false },
-    [0b01111] = { AlphaMMUIdx_AltModeWChk,      true },
+    [0b01110] = { AlphaMMUIdx_AltModeVPTE,      false },
+    [0b01111] = { AlphaMMUIdx_AltModeVPTE,      true },
     [0b10000] = { AlphaMMUIdx_Physical,         false },
     [0b10001] = { AlphaMMUIdx_Physical,         true },
     [0b10010] = { AlphaMMUIdx_Physical,         false },
@@ -1718,6 +1718,14 @@ static bool trans_call_pal(DisasContext *s, arg_call_pal *a)
     switch (s->isa_implver) {
     case IMPLVER_2106x:
     case IMPLVER_21164:
+        /*
+         * The 21164 sets EXC_ADDR<0> from the current mode, so a
+         * CALL_PAL taken in PALmode returns to PALmode on hw_rei
+         * (HRM 6.6.3).
+         */
+        if (s->pal_mode) {
+            tcg_gen_ori_i64(tmp, tmp, R_PC_PAL_MODE_MASK);
+        }
         tcg_gen_st_i64(tmp, tcg_env, offsetof(CPUAlphaState, ipr.exc_addr));
         break;
     case IMPLVER_21264:
@@ -3067,6 +3075,7 @@ static bool trans_hw_mfpr(DisasContext *s, arg_hw_mfpr *a)
     }
     switch (s->isa_implver) {
     case IMPLVER_2106x:
+    case IMPLVER_21164:
         if (unlikely(a->ra != a->rb)) {
             return false;
         }
@@ -3462,6 +3471,7 @@ static bool trans_hw_mtpr(DisasContext *s, arg_hw_mtpr *a)
     }
     switch (s->isa_implver) {
     case IMPLVER_2106x:
+    case IMPLVER_21164:
         if (unlikely(a->ra != a->rb)) {
             return false;
         }
