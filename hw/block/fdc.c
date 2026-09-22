@@ -1966,8 +1966,15 @@ static void fdctrl_handle_readid(FDCtrl *fdctrl, int direction)
     cur_drv = get_cur_drv(fdctrl);
 
     cur_drv->head = (fdctrl->fifo[1] >> 2) & 1;
+    /*
+     * AlphaBIOS polls the MSR for the READ ID result with a timeout of
+     * about 250us (25 iterations of a 10us delay).  The classical 20ms
+     * "spinning" delay makes every READ ID fail there, so no floppy can
+     * ever be read.  Keep the spin short enough for such firmware; the
+     * sector counter still advances once per command.
+     */
     timer_mod(fdctrl->result_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-             (NANOSECONDS_PER_SECOND / 50));
+             (NANOSECONDS_PER_SECOND / 20000));
 }
 
 static void fdctrl_handle_format_track(FDCtrl *fdctrl, int direction)
