@@ -211,11 +211,24 @@ static void cmd646_set_irq(void *opaque, int channel, int level)
 static void cmd646_reset(DeviceState *dev)
 {
     PCIIDEState *d = PCI_IDE(dev);
+    PCIDevice *pd = PCI_DEVICE(d);
     unsigned int i;
 
     for (i = 0; i < 2; i++) {
         ide_bus_reset(&d->bus[i]);
     }
+
+    /*
+     * Power-up values of the base address registers: the PCI0646 comes
+     * out of reset in legacy mode with the task file registers at the
+     * standard PC-AT I/O ports (datasheet, "Base Address Registers").
+     * Firmware that does not reprogram them (or that expects to find
+     * them there) relies on this.
+     */
+    pci_set_long(pd->config + 0x10, 0x1f0 | PCI_BASE_ADDRESS_SPACE_IO);
+    pci_set_long(pd->config + 0x14, 0x3f4 | PCI_BASE_ADDRESS_SPACE_IO);
+    pci_set_long(pd->config + 0x18, 0x170 | PCI_BASE_ADDRESS_SPACE_IO);
+    pci_set_long(pd->config + 0x1c, 0x374 | PCI_BASE_ADDRESS_SPACE_IO);
 }
 
 static uint32_t cmd646_pci_config_read(PCIDevice *d,
@@ -254,7 +267,11 @@ static void pci_cmd646_ide_realize(PCIDevice *dev, Error **errp)
     uint8_t *pci_conf = dev->config;
     int i;
 
-    pci_conf[PCI_CLASS_PROG] = 0x8f;
+    /*
+     * The PCI0646 resets to legacy mode (PROGIF = 8Ah, both channels in
+     * compatibility mode and switchable), not to native mode.
+     */
+    pci_conf[PCI_CLASS_PROG] = 0x8a;
 
     pci_conf[CNTRL] = CNTRL_EN_CH0; // enable IDE0
     if (d->secondary) {
@@ -300,6 +317,16 @@ static void pci_cmd646_ide_realize(PCIDevice *dev, Error **errp)
         bmdma_init(&d->bus[i], &d->bmdma[i], d);
         ide_bus_register_restart_cb(&d->bus[i]);
     }
+
+    /*
+     * Register the legacy task file ports (1F0h/3F6h and 170h/376h) in
+     * the PCI I/O space, like the real part in legacy mode.  pci_ide_
+     * update_mode() also clears the interrupt pin, but this controller
+     * reports its interrupt through INTA# (the AlphaPC 164LX routes the
+     * IDE interrupt through its interrupt PLD), so restore the pin.
+     */
+    pci_ide_update_mode(d);
+    pci_config_set_interrupt_pin(pci_conf, 0x01);
 }
 
 static void pci_cmd646_ide_exitfn(PCIDevice *dev)
