@@ -3,5 +3,7 @@ alpha_ss.add(when: 'CONFIG_CLIPPER', if_true: files('clipper.c', 'rmc.c', 'tigco
 alpha_ss.add(when: 'CONFIG_TSUNAMI', if_true: files('tsunami.c'))
 alpha_ss.add(when: 'CONFIG_TIGBUS', if_true: files('tigbus.c'))
 alpha_ss.add(when: 'CONFIG_AM29F016', if_true: files('am29f016.c'))
+alpha_ss.add(when: 'CONFIG_EB164', if_true: files('eb164.c'))
+alpha_ss.add(when: 'CONFIG_ALCOR', if_true: files('alcor.c'))
 
 hw_arch += {'alpha': alpha_ss}
