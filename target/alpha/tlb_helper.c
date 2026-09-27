@@ -744,10 +744,10 @@ static uint32_t get_exception_syndrome(CPUAlphaState *env,
     bool accvio;
 
     /*
-     * Compute fault-on-read/write and access bits.
+     * Compute fault-on-read/write and access bits.  HRM 5.3.8: ACV is an
+     * access violation; UNALIGN is a separate fault.
      */
     accvio = fi->type == AlphaFault_Address ||
-             fi->type == AlphaFault_Alignment ||
              fi->type == AlphaFault_Permission;
 
     /*

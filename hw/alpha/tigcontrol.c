@@ -7,9 +7,11 @@
 #include "hw/alpha/tigbus.h"
 #include "hw/alpha/tigcontrol.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/irq.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "system/runstate.h"
 #include "trace.h"
 
 struct TigControlState {
@@ -20,12 +22,17 @@ struct TigControlState {
     MemoryRegion iomem;
     uint32_t base_address;
     uint8_t regs[64];
+    qemu_irq halt_irq[4];
 };
+
+static void tig_control_update_halt_lines(TigControlState *s);
+static int tig_control_post_load(void *opaque, int version_id);
 
 static const VMStateDescription vmstate_tig_control = {
     .name = "tig-control",
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = tig_control_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8_ARRAY(regs, TigControlState, 64),
         VMSTATE_END_OF_LIST()
@@ -44,32 +51,55 @@ REG8(PSIR,              0x03)
 REG8(MOD_INFO,          0x04)
 REG8(CLK_INFO,          0x05)
 REG8(CHIP_INFO,         0x06)
-REG8(TPCR,              0x07)
-REG8(PLL_DATA,          0x08)
-REG8(PLL_CLK,           0x09)
-REG8(EV6_INIT,          0x0a)
-REG8(CSLEEP,            0x0b)
-REG8(SMCR,              0x0c)
-REG8(TTCR,              0x0d)
-REG8(CLR_IRQ5,          0x0e)
-REG8(CLR_IRQ4,          0x0f)
-REG8(CLR_PWR_FLT_DET,   0x10)
-REG8(CLR_TEMP_WARN,     0x11)
-REG8(CLR_TEMP_FAIL,     0x12)
-REG8(EV6_HALT,          0x13)
-REG8(SRCR0,             0x14)
-REG8(SRCR1,             0x15)
-REG8(FRAR0,             0x16)
-REG8(FRAR1,             0x17)
-REG8(FWMR0,             0x18)
-REG8(FWMR1,             0x19)
-REG8(FWMR2,             0x1a)
-REG8(FWMR3,             0x1b)
-REG8(IPCR0,             0x1c)
-REG8(IPCR1,             0x1d)
-REG8(IPCR2,             0x1e)
-REG8(IPCR3,             0x1f)
-REG8(IPCR4,             0x20)
+/*
+ * The TIG registers are sparse: each register occupies one 64-byte
+ * slot in the TIG bus address space, so the device offset is the
+ * documented TIG address divided by 0x40 (see the ES40 TIG table:
+ * tpcr 0x200, ttcr 0x3c0, ev6_halt 0x5c0, ipcr0 0xa00, ...).
+ */
+REG8(TPCR,              0x08)
+REG8(PLL_DATA,          0x0a)
+REG8(PLL_CLK,           0x0b)
+REG8(EV6_INIT,          0x0c)
+REG8(CSLEEP,            0x0d)
+REG8(SMCR,              0x0e)
+REG8(TTCR,              0x0f)
+REG8(CLR_IRQ5,          0x10)
+REG8(CLR_IRQ4,          0x11)
+REG8(CLR_PWR_FLT_DET,   0x12)
+REG8(CLR_TEMP_WARN,     0x13)
+REG8(CLR_TEMP_FAIL,     0x14)
+REG8(EV6_HALT,          0x17)
+REG8(SRCR0,             0x18)
+REG8(SRCR1,             0x19)
+REG8(FRAR0,             0x1c)
+REG8(FRAR1,             0x1d)
+REG8(FWMR0,             0x20)
+REG8(FWMR1,             0x21)
+REG8(FWMR2,             0x22)
+REG8(FWMR3,             0x23)
+REG8(IPCR0,             0x28)
+REG8(IPCR1,             0x29)
+REG8(IPCR2,             0x2a)
+REG8(IPCR3,             0x2b)
+REG8(IPCR4,             0x2c)
+
+static void tig_control_update_halt_lines(TigControlState *s)
+{
+    uint8_t lines = s->regs[A_TTCR] | s->regs[A_EV6_HALT];
+    int i;
+
+    /* Bit n of (TTCR | EV6_HALT) is CPU n's halt/IRQ4 line.  */
+    for (i = 0; i < ARRAY_SIZE(s->halt_irq); i++) {
+        qemu_set_irq(s->halt_irq[i], (lines >> i) & 1);
+    }
+}
+
+static int tig_control_post_load(void *opaque, int version_id)
+{
+    tig_control_update_halt_lines(opaque);
+    return 0;
+}
 
 static uint64_t tig_control_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -120,10 +150,9 @@ static uint64_t tig_control_read(void *opaque, hwaddr addr, unsigned size)
         ret = s->regs[A_TTCR];
         break;
     case R_CLR_IRQ5:
-        ret = s->regs[A_CLR_IRQ5];
-        break;
     case R_CLR_IRQ4:
-        ret = s->regs[A_CLR_IRQ4];
+        /* Write-only latch clears; IRQ4/IRQ5 are level-driven.  */
+        ret = 0;
         break;
     case R_CLR_PWR_FLT_DET:
         ret = s->regs[A_CLR_PWR_FLT_DET];
@@ -235,12 +264,11 @@ static void tig_control_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case R_TTCR:
         s->regs[A_TTCR] = val;
+        tig_control_update_halt_lines(s);
         break;
     case R_CLR_IRQ5:
-        s->regs[A_CLR_IRQ5] = val;
-        break;
     case R_CLR_IRQ4:
-        s->regs[A_CLR_IRQ4] = val;
+        /* Write-only latch clears.  */
         break;
     case R_CLR_PWR_FLT_DET:
         s->regs[A_CLR_PWR_FLT_DET] = val;
@@ -253,12 +281,18 @@ static void tig_control_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case R_EV6_HALT:
         s->regs[A_EV6_HALT] = val;
+        tig_control_update_halt_lines(s);
         break;
     case R_SRCR0:
-        s->regs[A_SRCR0] = val;
-        break;
     case R_SRCR1:
-        s->regs[A_SRCR1] = val;
+        s->regs[addr] = val;
+        if (val & 0x30) {
+            /*
+             * The firmware updater writes 0x30 here when it wants the
+             * system to restart after updating the flash.
+             */
+            qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        }
         break;
     case R_FRAR0:
         s->regs[A_FRAR0] = val;
@@ -328,6 +362,8 @@ static void tig_control_realize(DeviceState *dev, Error **errp)
 static void tig_control_init(Object *obj)
 {
     TigControlState *s = TIG_CONTROL(obj);
+
+    qdev_init_gpio_out(DEVICE(obj), s->halt_irq, ARRAY_SIZE(s->halt_irq));
 
     memory_region_init_io(&s->iomem, obj, &tig_control_ops, s,
                           "tig-control", sizeof(s->regs));

@@ -313,6 +313,8 @@ static void m1543_superio_cfg_write(M1543SuperIOState *s, uint8_t dev,
     }
 }
 
+static void m1543_superio_reset_regs(M1543SuperIOState *s);
+
 static uint64_t m1543_superio_read(void *opaque, hwaddr addr, unsigned width)
 {
     M1543SuperIOState *s = opaque;
@@ -384,7 +386,8 @@ static void m1543_superio_write(void *opaque, hwaddr addr, uint64_t val,
         if (s->step == CFG_UNLOCK) {
             switch (index) {
             case M1543_SIO_RESET:
-                device_cold_reset(DEVICE(s));
+                /* Reset the config registers only; the unlock stays valid. */
+                m1543_superio_reset_regs(s);
                 break;
             case M1543_DEVICE_SELECT:
             case M1543_DEVICE_PWR_CTRL:
@@ -436,10 +439,9 @@ static const VMStateDescription vmstate_m1543_superio = {
 #define STB(d, o, v)    stb_p(s->dev_regs[(M1543_LDEV_##d)] + (o), (v))
 #define STW(d, o, v)    stw_be_p(s->dev_regs[(M1543_LDEV_##d)] + (o), (v))
 
-static void m1543_superio_reset(DeviceState *dev)
+static void m1543_superio_reset_regs(M1543SuperIOState *s)
 {
-    M1543SuperIOState *s = M1543_SUPERIO(dev);
-    ISASuperIODevice *sio = ISA_SUPERIO(dev);
+    ISASuperIODevice *sio = ISA_SUPERIO(s);
     ISASuperIOClass *ic = ISA_SUPERIO_GET_CLASS(s);
     uint8_t kbd_irq, mouse_irq;
 
@@ -448,7 +450,6 @@ static void m1543_superio_reset(DeviceState *dev)
     mouse_irq = object_property_get_uint(OBJECT(sio->kbc), "mouse-irq",
                                          &error_fatal);
 
-    s->step = CFG_KEY1;
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->dev_regs, 0, sizeof(s->dev_regs));
 
@@ -456,7 +457,11 @@ static void m1543_superio_reset(DeviceState *dev)
     stb_p(s->regs + M1543_DEVICE_ID, s->chip_id);
     stb_p(s->regs + M1543_DEVICE_REV, s->chip_rev);
 
-    STB(FDC, M1543_DEVICE_ACTIVE, 0);
+    /*
+     * The floppy controller is chipset-integrated and always present;
+     * CMOS byte 0x10 describes the attached drives, not the controller.
+     */
+    STB(FDC, M1543_DEVICE_ACTIVE, 1);
     STW(FDC, M1543_DEVICE_ADDR, (*ic->floppy.get_iobase)(sio, 0));
     STB(FDC, M1543_DEVICE_IRQ1, (*ic->floppy.get_irq)(sio, 0));
     STB(FDC, M1543_DEVICE_DMA, (*ic->floppy.get_dma)(sio, 0));
@@ -504,6 +509,14 @@ static void m1543_superio_reset(DeviceState *dev)
     STB(HOTKEY, M1543_DEVICE_CFG4, 0x42);
 
     m1543_superio_cfg_commit(s);
+}
+
+static void m1543_superio_reset(DeviceState *dev)
+{
+    M1543SuperIOState *s = M1543_SUPERIO(dev);
+
+    s->step = CFG_KEY1;
+    m1543_superio_reset_regs(s);
 }
 
 static void m1543_superio_realize(DeviceState *dev, Error **errp)
@@ -675,6 +688,15 @@ static void m1543_pmu_reset(DeviceState *dev)
     /* Set wmask values. */
     memset(pci_wmask + PCI_CONFIG_HEADER_SIZE, 0,
            PCI_CONFIG_SPACE_SIZE - PCI_CONFIG_HEADER_SIZE);
+    /*
+     * M1543C datasheet: the M7101 command register only allows the I/O
+     * space enable bit to be written (memory/BME are always zero), and
+     * configuration registers 0x30-0x3f are reserved.
+     */
+    pci_set_word(pci_wmask + PCI_COMMAND, PCI_COMMAND_IO);
+    pci_set_long(pci_wmask + 0x3c, 0);
+    pci_set_byte(pci_conf + PCI_INTERRUPT_LINE, 0);
+    pci_set_byte(pci_conf + PCI_INTERRUPT_PIN, 0);
     pci_set_long(pci_wmask + 0x40, 0x0000101f);
     pci_set_long(pci_wmask + 0x44, 0xff189fff);
     pci_set_long(pci_wmask + 0x48, 0xff000000);

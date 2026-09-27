@@ -32,6 +32,7 @@ struct ES40RMCState {
     uint32_t num_cpus;
     uint32_t base_address;
     uint64_t freq_hz;
+    uint64_t ram_size;
 
     CharFrontend display;
     bool display_inited;
@@ -325,6 +326,9 @@ static void es40_rmc_reset(DeviceState *dev)
 {
     ES40RMCState *s = ES40_RMC(dev);
     struct tm tm;
+    uint32_t total_mb, dimm_mb, n_dimms, n_arrays, dimms_per_array;
+    uint8_t dimm_present;
+    int a, j;
     int i;
 
 #define S(r, v)     (s)->mem[(r)] = (v)
@@ -341,7 +345,7 @@ static void es40_rmc_reset(DeviceState *dev)
     S(0x09, 0x01);  /* DPRAM ok */
     S(0x0a, 0xff);  /* CPU speed ok */
     S(0x0b, (s->freq_hz / 1000000) & 0x00ff);
-    S(0x0c, (s->freq_hz / 1000000) & 0xff00);
+    S(0x0c, ((s->freq_hz / 1000000) >> 8) & 0x00ff);
 
     /* Power On Time Stamp */
     qemu_get_timedate(&tm, 0);
@@ -358,7 +362,7 @@ static void es40_rmc_reset(DeviceState *dev)
 
     /* Mirror CPU 0's state to all other present processors. */
     for (i = 1; i < s->num_cpus; i++) {
-        memcpy(s->mem + (0x20 * i), s->mem, 0x1f);
+        memcpy(s->mem + (0x20 * i), s->mem, 0x20);
     }
 
     S(0x90, 0xff);  /* Power Supply/VTERM */
@@ -387,10 +391,35 @@ static void es40_rmc_reset(DeviceState *dev)
     }
 
     S(0xaa, 0);     /* Fan status */
-    S(0xab, 0);     /* MMB0 DIMM I2C status */
-    S(0xac, 0);     /* MMB1 DIMM I2C status */
-    S(0xad, 0);     /* MMB2 DIMM I2C status */
-    S(0xae, 0);     /* MMB3 DIMM I2C status */
+
+    /*
+     * DIMM topology, following the model in the ES40 emulator: sets of
+     * four identical DIMMs fill an MMB's slot set; each populated MMB
+     * is one array of at most 8 DIMMs (Typhoon ASIZ max = 8 GiB).
+     */
+    total_mb = s->ram_size / MiB;
+    if (total_mb == 0) {
+        total_mb = 64;
+    }
+    dimm_mb = MIN(total_mb / 4, 1024);
+    if (dimm_mb == 0) {
+        dimm_mb = 1;
+    }
+    n_dimms = total_mb / dimm_mb;
+    n_arrays = (n_dimms + 7) / 8;
+    dimms_per_array = n_dimms / n_arrays;
+
+    for (a = 0; a < n_arrays; a++) {
+        /* Service guide Table C-1: <7:4> F = 8 DIMMs, 4 = lower four only. */
+        S(0x80 + 2 * a, (dimms_per_array == 8 ? 0xf0 : 0x40) | (a & 7));
+        S(0x81 + 2 * a, MAX(1u, dimm_mb / 64));    /* DIMM size / 64MB */
+    }
+
+    /* SPD read failure bits (bit d-1 = Jd, set = no SPD to read). */
+    dimm_present = (dimms_per_array == 8) ? 0xff : 0x0f;
+    for (a = 0; a < 4; a++) {
+        S(0xab + a, (a < n_arrays) ? (uint8_t)~dimm_present : 0xff);
+    }
     S(0xaf, 0);     /* MMB and CPU I2C bus status */
 
     /* MMB and CPU I2C bus status */
@@ -480,9 +509,13 @@ static void es40_rmc_reset(DeviceState *dev)
         S(0x3418 + 0x10 * i, 0xff);
     }
 
-    /* SROM Array 0 to DIMM ID translation */
-    for (i = 0; i < 0x20; i++) {
-        S(0x34a0 + i, i);
+    /* SROM array-to-DIMM translation: entry j of array a is DIMM J(j+1). */
+    for (a = 0; a < 4; a++) {
+        for (j = 0; j < 8; j++) {
+            uint8_t status = (a < n_arrays && j < dimms_per_array) ? 0 : 1;
+
+            S(0x34a0 + a * 8 + j, (status << 5) | ((a & 3) << 3) | j);
+        }
     }
 #undef S
 }
@@ -492,6 +525,7 @@ static const Property es40_rmc_properties[] = {
     DEFINE_PROP_UINT32("base-address", ES40RMCState, base_address, 0x400000),
     DEFINE_PROP_UINT64("clock-frequency", ES40RMCState, freq_hz,
                        500000000ULL),
+    DEFINE_PROP_UINT64("ram-size", ES40RMCState, ram_size, 1 * GiB),
 };
 
 static int es40_rmc_post_load(void *opaque, int version_id)
