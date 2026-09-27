@@ -1620,6 +1620,64 @@ static void pchip_reset(TsunamiPchipState *pcs)
     INIT_FIELD(pcs->regs.pmonctl, PMONCNT, CNT0, 0);
 }
 
+/* PERROR error flags and fault info (Table 10-42), PERRMASK<11:0> (10-43). */
+#define PCHIP_ERROR_FLAGS   UINT64_C(0x0000000000000dff)
+#define PCHIP_ERROR_INFO    UINT64_C(0xffffffffffff0000)
+#define PCHIP_PERMASK_MASK  UINT64_C(0x0000000000000fff)
+
+/* Pchip error IRQ: 62 for hose 0, 61 for hose 1. */
+static void pchip_update_error_irq(TsunamiPchipState *pcs)
+{
+    TsunamiState *s = pcs->upstream;
+    bool level = (pcs->regs.perror & PCHIP_ERROR_FLAGS) != 0;
+
+    cchip_device_irq_update(s, TSUNAMI_IRQ_PCI0_DEVERROR - pcs->bus_nr, level);
+}
+
+/* Latch an error the way PERRSET does (HRM Table 10-44). */
+static void pchip_set_error(TsunamiPchipState *pcs, uint64_t val)
+{
+    uint64_t flags = val & pcs->regs.perrmask & PCHIP_ERROR_FLAGS;
+
+    if (!flags) {
+        return;
+    }
+    if (pcs->regs.perror & PCHIP_ERROR_FLAGS) {
+        pcs->regs.perror |= pcs->regs.perrmask & 1;     /* LOST */
+    } else {
+        pcs->regs.perror = (val & PCHIP_ERROR_INFO) | flags;
+    }
+    pchip_update_error_irq(pcs);
+}
+
+/* Unclaimed config write: CMD=B, NDS, AD<31:2> in INFO (HRM 8.8.2.1). */
+static void pchip_config_write_abort(TsunamiPchipState *pcs, hwaddr addr)
+{
+    uint32_t address = addr;
+
+    /* Type 0 uses a one-hot IDSEL, not the device number. */
+    if (!(address & 0xff0000)) {
+        unsigned device = (address >> 11) & 31;
+
+        address &= 0x7fc;
+        if (device == 21) {
+            /* Not in Table 10-3; leave it unmodeled. */
+            return;
+        }
+        if (device <= 20) {
+            address |= 1U << (device + 11);
+        }
+        /* Devices 22-31 assert no IDSEL. */
+    }
+    pchip_set_error(pcs, (UINT64_C(0xb) << 52) | ((uint64_t)address << 16) |
+                         UINT64_C(0x100));
+}
+
+static int tsunami_pcihost_post_load(void *opaque, int version_id)
+{
+    pchip_update_error_irq(opaque);
+    return 0;
+}
 
 static uint64_t pchip_read(void *opaque, hwaddr addr, unsigned size)
 {
@@ -1680,13 +1738,18 @@ static uint64_t pchip_read(void *opaque, hwaddr addr, unsigned size)
         break;
 
     case A_PCHIP_PERROR:
-        /* PERROR: Pchip Error Register. */
-        ret = pcs->regs.perror;
+        /* PERROR: Pchip Error Register.  Flags are W1C, INFO is read-only. */
+        ret = pcs->regs.perror & (PCHIP_ERROR_INFO | PCHIP_ERROR_FLAGS);
         break;
 
     case A_PCHIP_PERRMASK:
-        /* PERRMASK: Pchip Error Mask Register. */
-        ret = pcs->regs.perrmask;
+        /* PERRMASK: Pchip Error Mask Register; bits 63:12 are RAZ. */
+        ret = pcs->regs.perrmask & PCHIP_PERMASK_MASK;
+        break;
+
+    case A_PCHIP_PERRSET:
+        /* PERRSET: Pchip Error Set Register. */
+        ret = pcs->regs.perrset;
         break;
 
     case A_PCHIP_PMONCTL:
@@ -1776,18 +1839,21 @@ static void pchip_write(void *opaque, hwaddr addr, uint64_t val,
         break;
 
     case A_PCHIP_PERROR:
-        /* PERROR: Pchip Error Register. */
-        MERGE_FIELD(pcs->regs.plat, val, 0x0000000000000dff);
+        /* PERROR: the error flags are write-1-to-clear, INFO is read-only. */
+        pcs->regs.perror &= ~(val & PCHIP_ERROR_FLAGS);
+        pchip_update_error_irq(pcs);
         break;
 
     case A_PCHIP_PERRMASK:
-        /* PERRMASK: Pchip Error Mask Register. */
-        MERGE_FIELD(pcs->regs.perrmask, val, 0x0000000000000fff);
+        /* PERRMASK: only MASK<11:0> is writable. */
+        pcs->regs.perrmask = val & PCHIP_PERMASK_MASK;
+        pchip_update_error_irq(pcs);
         break;
 
     case A_PCHIP_PERRSET:
         /* PERRSET: Pchip Error Set Register. */
-        MERGE_FIELD(pcs->regs.perrset, val, 0xffffffffffff0fff);
+        pcs->regs.perrset = val & (PCHIP_ERROR_INFO | PCHIP_PERMASK_MASK);
+        pchip_set_error(pcs, val);
         break;
 
     case A_PCHIP_TLBIV:
@@ -1804,7 +1870,8 @@ static void pchip_write(void *opaque, hwaddr addr, uint64_t val,
         break;
 
     case A_PCHIP_SPRST:
-        /* SPRST: Soft PCI Reset Register. */
+        /* SPRST: Soft PCI Reset Register; resets only this Pchip's bus. */
+        bus_cold_reset(BUS(PCI_HOST_BRIDGE(pcs)->bus));
         break;
 
     default:
@@ -1881,7 +1948,13 @@ static void pci_conf_write(void *opaque, hwaddr addr,
     PCIHostState *phb = PCI_HOST_BRIDGE(pcs);
 
     trace_tsunami_pchip_write(pcs->bus_nr, "pci-config", addr, val, size);
+
     pci_data_write(phb->bus, addr, val, size);
+
+    /* A config write that no target claims aborts and latches PERROR. */
+    if (!pci_find_device(phb->bus, (addr >> 16) & 0xff, (addr >> 8) & 0xff)) {
+        pchip_config_write_abort(pcs, addr);
+    }
 }
 
 const MemoryRegionOps pci_conf_ops = {
@@ -2026,6 +2099,7 @@ static const VMStateDescription vmstate_tsunami_pcihost = {
     .name = TYPE_TSUNAMI_PCI_HOST_BRIDGE,
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = tsunami_pcihost_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(regs.win, TsunamiPchipState, 4, 1,
                              vmstate_tsunami_pcihost_window, TsunamiDMAWindow),

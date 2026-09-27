@@ -68,18 +68,24 @@ static void create_pflash_am29f016(TigBus *tb, const char *name)
     if ((dinfo = drive_get(IF_PFLASH, 0, 0)) != NULL) {
         qdev_prop_set_drive_err(dev, "drive", blk_by_legacy_dinfo(dinfo),
                                 &error_fatal);
+    } else {
+        warn_report("no pflash drive: the TIG flash is uninitialised; pass "
+                    "-drive if=pflash,file=<firmware image> to boot the ARC "
+                    "firmware");
     }
 
     tigbus_realize_and_unref(TIG_BUS_DEVICE(dev), tb, &error_fatal);
 }
 
-static void create_rmc(TigBus *tb, uint32_t num_cpus, uint64_t freq_hz)
+static void create_rmc(TigBus *tb, uint32_t num_cpus, uint64_t freq_hz,
+                       uint64_t ram_size)
 {
     DeviceState *dev;
 
     dev = qdev_new(TYPE_ES40_RMC);
     qdev_prop_set_uint32(dev, "num-cpus", num_cpus);
     qdev_prop_set_uint32(dev, "clock-frequency", freq_hz);
+    qdev_prop_set_uint64(dev, "ram-size", ram_size);
     qdev_prop_set_uint8(dev, "cs", 1);
     tigbus_realize_and_unref(TIG_BUS_DEVICE(dev), tb, &error_fatal);
 }
@@ -267,8 +273,14 @@ static void es40_machine_init(MachineState *machine)
     /* TIG bus setup. */
     tig_bus = tsunami_get_tig_bus(tsunami);
     create_pflash_am29f016(tig_bus, "pflash0");
-    create_rmc(tig_bus, machine->smp.cpus, clock_get_hz(cpu_refclk));
-    tigbus_create_device(tig_bus, TYPE_TIG_CONTROL);
+    create_rmc(tig_bus, machine->smp.cpus, clock_get_hz(cpu_refclk),
+               machine->ram_size);
+    dev = DEVICE(tigbus_create_device(tig_bus, TYPE_TIG_CONTROL));
+    for (n = 0; n < machine->smp.cpus; n++) {
+        /* TIG TTCR/EV6_HALT bit n drives CPU n's halt interrupt (IRQ4).  */
+        qdev_connect_gpio_out(dev, n,
+            qdev_get_gpio_in(DEVICE(cpus[n]), ALPHA_CPU_INPUT_IRQ4));
+    }
 
     /* SCSI disk setup. */
     if (drive_get_max_bus(IF_SCSI) >= 0) {
