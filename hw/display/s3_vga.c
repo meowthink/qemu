@@ -143,6 +143,7 @@ typedef struct S3TrioState {
     MemoryRegion rom;
     MemoryRegion rom_bar;
     MemoryRegion vram_iomem;
+    MemoryRegion mmio_window;
     uint16_t maj_axis, min_axis;
     PortioList portio;
     bool crtc_seq_shared;
@@ -151,6 +152,7 @@ typedef struct S3TrioState {
     uint32_t mclk;
 
     uint32_t device_id;
+    bool mmio_window_mapped;
 
     uint16_t disp_stat; /* 02e8 */
     uint16_t h_disp; /* 06e8 */
@@ -954,6 +956,8 @@ static uint32_t s3_trio_ioport_readw(void *opaque, uint32_t addr)
     return val;
 }
 
+static void s3_trio_update_mmio_window(S3TrioState *s);
+
 static void s3_trio_post_write(S3TrioState* s, uint32_t addr)
 {
     switch (address_to_reg(addr)) {
@@ -972,6 +976,7 @@ static void s3_trio_post_write(S3TrioState* s, uint32_t addr)
     default:
         break;
     }
+    s3_trio_update_mmio_window(s);
 }
 
 static void s3_trio_ioport_writeb(void *opaque, uint32_t addr, uint32_t val)
@@ -1030,6 +1035,116 @@ static void s3_trio_ioport_writew(void *opaque, uint32_t addr, uint32_t val)
     }
     s3_trio_post_write(s, addr & ~0x1);
 }
+
+/*
+ * MMIO mode enabled by CR53 bit 4 or 4AE8H bit 5
+ */
+static bool s3_enhanced_window_enabled(S3TrioState *s)
+{
+    if (!((s->advfunc_cntl & 0x0020) || (s->vga.cr[0x53] & 0x10))) {
+        return false;
+    }
+    if ((s->vga.cr[0x58] | s->advfunc_cntl) & 0x10) {
+        if (!(s->vga.cr[0x31] & 0x01) || (s->vga.cr[0x58] & 0x03) ||
+            s->vga.cr[0x59] != 0x00 || s->vga.cr[0x5a] != 0x0a) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool s3_mmio_window_is_reg(hwaddr addr, bool is_write)
+{
+    if (addr < 0x82e8 || addr > 0xbee9 || (addr & 0x3fe) != 0x2e8) {
+        return false;
+    }
+    return is_write || address_to_reg(addr & ~0x1) != REG_MULTIFUNC_CNTL;
+}
+
+static void s3_mmio_window_write(void *opaque, hwaddr addr, uint64_t val,
+                                 unsigned size)
+{
+    S3TrioState *s = opaque;
+    unsigned i;
+
+    if (s3_enhanced_window_enabled(s)) {
+        if (addr < 0x8000) {
+            unsigned off = 0;
+
+            while (off < size) {
+                unsigned piece = MIN(size - off, 2u);
+
+                s3_pixel_data_write(s, addr + off,
+                                    (val >> (8 * off)) &
+                                    (piece == 2 ? 0xffff : 0xff), piece);
+                off += piece;
+            }
+            return;
+        }
+        if (s3_mmio_window_is_reg(addr, true)) {
+            if (size == 1) {
+                uint32_t byte = val & 0xff;
+                uint16_t *p;
+
+                p = s3_trio_get_register(s, address_to_reg(addr & ~0x1), 1,
+                                         &byte);
+                if (p) {
+                    ((uint8_t *)p)[addr & 1] = byte;
+                }
+                s3_trio_post_write(s, addr & ~0x1);
+            } else {
+                s3_trio_ioport_writew(s, addr, val & 0xffff);
+            }
+            return;
+        }
+        /* No other location decodes in the MMIO window. */
+        return;
+    }
+
+    /* MMIO off: the aperture is the normal planar/chain-4 VGA memory. */
+    for (i = 0; i < size; i++) {
+        vga_mem_writeb(&s->vga, addr + i, (val >> (8 * i)) & 0xff);
+    }
+}
+
+static uint64_t s3_mmio_window_read(void *opaque, hwaddr addr, unsigned size)
+{
+    S3TrioState *s = opaque;
+    uint64_t val = 0;
+    unsigned i;
+
+    if (s3_enhanced_window_enabled(s) && s3_mmio_window_is_reg(addr, false)) {
+        uint16_t *p = s3_trio_get_register(s, address_to_reg(addr & ~0x1), 0,
+                                           NULL);
+        uint16_t w = p ? *p : 0;
+
+        if (size == 1) {
+            val = (w >> (8 * (addr & 1))) & 0xff;
+        } else {
+            val = w;
+        }
+        return val;
+    }
+
+    for (i = 0; i < size; i++) {
+        val |= (uint64_t)vga_mem_readb(&s->vga, addr + i) << (8 * i);
+    }
+    return val;
+}
+
+static const MemoryRegionOps s3_mmio_window_ops = {
+    .read = s3_mmio_window_read,
+    .write = s3_mmio_window_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
 
 static uint32_t s3_trio_vga_ioport_read(void *opaque, uint32_t addr)
 {
@@ -1113,6 +1228,30 @@ static uint32_t s3_trio_vga_ioport_read(void *opaque, uint32_t addr)
     return val;
 }
 
+static void s3_trio_update_bank_offset(S3TrioState *s)
+{
+    s->vga.bank_offset = (s->vga.cr[0x31] & 0x01) ?
+                         ((uint32_t)(s->vga.cr[0x6a] & 0x3f) << 16) : 0;
+    vga_update_memory_access(&s->vga);
+}
+
+static void s3_trio_update_mmio_window(S3TrioState *s)
+{
+    bool want = s3_enhanced_window_enabled(s);
+
+    if (want == s->mmio_window_mapped) {
+        return;
+    }
+    if (want) {
+        memory_region_add_subregion_overlap(s->vga.legacy_address_space,
+                                            0x000a0000, &s->mmio_window, 3);
+    } else {
+        memory_region_del_subregion(s->vga.legacy_address_space,
+                                    &s->mmio_window);
+    }
+    s->mmio_window_mapped = want;
+}
+
 static void s3_trio_update_cursor_shadow(S3TrioState *s)
 {
     s->vga.force_shadow = s3_cursor_enabled(s);
@@ -1146,6 +1285,11 @@ static void s3_trio_vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
         case 0x33:
             s->unlock_compatibility_registers = ((val & ~0xad) == 0);
             break;
+        case 0x31:
+        case 0x6a:
+            vga_ioport_write(&s->vga, addr, val);
+            s3_trio_update_bank_offset(s);
+            break;
         case 0x38:
             s->unlock_control_registers_1 = (val == 0x48);
             break;
@@ -1177,6 +1321,7 @@ static void s3_trio_vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
             vga_ioport_write(&s->vga, addr, val);
             break;
         }
+        s3_trio_update_mmio_window(s);
         break;
     case VGA_SEQ_I:
         s->vga.sr_index = val;
@@ -1356,6 +1501,12 @@ static const Property s3_trio_properties[] = {
 static void s3_trio_reset(DeviceState *d)
 {
     S3TrioState *s = S3_TRIO(d);
+
+    if (s->mmio_window_mapped) {
+        memory_region_del_subregion(s->vga.legacy_address_space,
+                                    &s->mmio_window);
+        s->mmio_window_mapped = false;
+    }
 
     vga_common_reset(&s->vga);
 
@@ -1568,6 +1719,9 @@ static void s3_trio_realize(PCIDevice *dev, Error **errp)
                                         0x000a0000, vga_io_memory, 1);
     memory_region_set_coalescing(vga_io_memory);
     memory_region_set_coalescing(&s->vga.vram);
+
+    memory_region_init_io(&s->mmio_window, o, &s3_mmio_window_ops, s,
+                          "s3-mmio-window", 0x20000);
 
     /*
      * On 40p, ARC probes the option ROM but firmware didn't shadowed it.

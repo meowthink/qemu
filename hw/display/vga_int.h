@@ -177,6 +177,7 @@ void vga_dirty_log_stop(VGACommonState *s);
 extern const VMStateDescription vmstate_vga_common;
 uint32_t vga_ioport_read(void *opaque, uint32_t addr);
 void vga_ioport_write(void *opaque, uint32_t addr, uint32_t val);
+void vga_update_memory_access(VGACommonState *s);
 uint32_t vga_mem_readb(VGACommonState *s, hwaddr addr);
 void vga_mem_writeb(VGACommonState *s, hwaddr addr, uint32_t val);
 void vga_invalidate_scanlines(VGACommonState *s, int y1, int y2);
