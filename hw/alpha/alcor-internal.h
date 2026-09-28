@@ -125,6 +125,12 @@ struct AlcorState {
 
     /* MMIO container, mapped by the machine at ALCOR_IO_BASE. */
     MemoryRegion iomem;
+    /*
+     * The sparse windows also appear once per 2^35: the decode uses
+     * addr<39> and addr<34:30> only, so addr<38:35> ("SBZ" in TRM
+     * 6.3.2/6.3.3) is ignored and the ARC/OS "hose" addresses set it.
+     */
+    MemoryRegion hose_alias[5];
     /* Chipset CSR groups: csr, mctl, pa, misc, pwr, irq. */
     MemoryRegion csr_regs[6];
     MemoryRegion dummy;
