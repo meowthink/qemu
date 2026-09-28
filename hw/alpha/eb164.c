@@ -437,35 +437,31 @@ static void eb164_cpu_reset(void *opaque)
  * exactly 0x60000 below the chipset's 0A.0000).  Without it the NT setup
  * console output is dropped and the screen stays black even though the
  * keyboard, disk and interrupts all work.
+ *
+ * The encoding is the chipset's sparse-space one (21172 TRM 6.3.2/6.3.3,
+ * tables 6-3/6-5): addr<4:3> is the transfer size (byte, word, tribyte,
+ * longword), addr<6:5> the byte offset inside the PCI longword and
+ * addr<7> = ad<2>.  The transfer width therefore comes from the address, not
+ * from the width of the CPU access - the S3 miniport sends its 8-bit mask
+ * rows with an STL to a byte-encoded address and the 16-bit glyph-cache rows
+ * with an STL to a longword-encoded address.  Hand the access to
+ * alcor_sparse_read()/alcor_sparse_write() with the PCI address based at
+ * 0xa0000 rather than decoding it again here.
  */
 static uint64_t eb164_vga_hose_read(void *opaque, hwaddr addr, unsigned size)
 {
     EB164MachineState *ms = opaque;
-    hwaddr pci = 0xa0000 + ((addr >> 8) << 3) + (((addr >> 7) & 1) << 2);
-    unsigned lane = (addr >> 5) & 3;
-    unsigned xsize = MIN(size, 4u);
-    uint8_t buf[4] = { 0 };
-    uint64_t val = 0;
 
-    address_space_read(&ms->vga_pci_as, pci + lane, MEMTXATTRS_UNSPECIFIED,
-                       buf, xsize);
-    memcpy(&val, buf, xsize);
-    return val << (8 * lane);
+    /* Region 3 is the fixed sparse I/O region, so no HAE mapping applies. */
+    return alcor_sparse_read(&ms->vga_pci_as, 3, 0, 0xa0000, addr, size);
 }
 
 static void eb164_vga_hose_write(void *opaque, hwaddr addr, uint64_t val,
                                  unsigned size)
 {
     EB164MachineState *ms = opaque;
-    hwaddr pci = 0xa0000 + ((addr >> 8) << 3) + (((addr >> 7) & 1) << 2);
-    unsigned lane = (addr >> 5) & 3;
-    unsigned xsize = MIN(size, 4u);
-    uint8_t buf[4];
 
-    val >>= 8 * lane;
-    memcpy(buf, &val, xsize);
-    address_space_write(&ms->vga_pci_as, pci + lane, MEMTXATTRS_UNSPECIFIED,
-                        buf, xsize);
+    alcor_sparse_write(&ms->vga_pci_as, 3, 0, 0xa0000, addr, val, size);
 }
 
 static const MemoryRegionOps eb164_vga_hose_ops = {
