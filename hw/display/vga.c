@@ -1531,6 +1531,10 @@ static void vga_draw_graphic(VGACommonState *s, int full_update)
         multi_scan = double_scan;
     }
     multi_run = multi_scan;
+    if (s->native_mode && s->native_mode(s)) {
+        /* packed-pixel cards override GR05's shift control */
+        shift_control = 2;
+    }
     if (shift_control != s->shift_control ||
         double_scan != s->double_scan) {
         full_update = 1;
