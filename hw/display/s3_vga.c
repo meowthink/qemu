@@ -188,6 +188,7 @@ typedef struct S3TrioState {
     uint16_t bkgd_mix; /* b6e8 */
     uint16_t frgd_mix; /* bae8 */
     uint16_t mfc[16]; /* bee8 */
+    uint16_t multifunc_data; /* byte-write assembly of bee8 */
     uint16_t pix_trans; /* e2e8 */
     uint16_t pix_trans_ext; /* e2ea (image data extension, 32-bit transfers) */
     uint32_t xfer_pixel;    /* CPU pixel data received so far */
@@ -371,6 +372,27 @@ static inline void do_cmd_done(S3TrioState *s)
     s->gp_stat = GP_STAT_FIFO_EMPTY;
 }
 
+static inline int s3_sext14(uint16_t value)
+{
+    return (int16_t)(value << 2) >> 2;
+}
+
+/*
+ * Scissors: BEE8H indices 1-4, and index E bit 5 selects external clipping
+ * (draw outside the box) instead of the box itself (DB008-B 10-6).
+ */
+static bool s3_clipped(S3TrioState *s, int x, int y)
+{
+    bool inside;
+
+    x &= 0xfff;
+    y &= 0xfff;
+    inside = x >= (s->scissors_l & 0xfff) && x <= (s->scissors_r & 0xfff) &&
+             y >= (s->scissors_t & 0xfff) && y <= (s->scissors_b & 0xfff);
+
+    return (s->color_compare & 0x20) ? inside : !inside;
+}
+
 static void move_to_next_pixel(S3TrioState *s)
 {
     uint16_t line_len;
@@ -397,9 +419,7 @@ static void move_to_next_pixel(S3TrioState *s)
         }
         break;
     case CMD_CMD_LINE:
-        if ((s->cmd & CMD_LINETYPE) == 0) {
-            assert(0);
-        } else {
+        if (s->cmd & CMD_LINETYPE) {
             static const int xstep[] = { 1,  1,  0, -1, -1, -1, 0, 1 };
             static const int ystep[] = { 0, -1, -1, -1,  0,  1, 1, 1 };
             s->cur_x += xstep[(s->cmd >> 5) & 7];
@@ -407,6 +427,35 @@ static void move_to_next_pixel(S3TrioState *s)
             if (s->maj_axis_pcnt-- == 0) {
                 do_cmd_done(s);
             }
+        } else {
+            /* Bresenham: MAJ_AXIS_PCNT counts the steps, ERR_TERM carries the
+             * error and DESTY_AXSTP/DESTX_DIASTP the axial/diagonal increments
+             * (DB008-B 11-7). */
+            int err = s3_sext14(s->err_term);
+            int xs = (s->cmd & CMD_INC_X) ? 1 : -1;
+            int ys = (s->cmd & CMD_INC_Y) ? 1 : -1;
+
+            if (s->maj_axis >= (s->maj_axis_pcnt & 0xfff)) {
+                do_cmd_done(s);
+                break;
+            }
+            s->maj_axis++;
+            if (s->cmd & CMD_YMAJAXIS) {
+                s->cur_y += ys;
+            } else {
+                s->cur_x += xs;
+            }
+            if (err >= 0) {
+                if (s->cmd & CMD_YMAJAXIS) {
+                    s->cur_x += xs;
+                } else {
+                    s->cur_y += ys;
+                }
+                err += s3_sext14(s->destx_diastp);
+            } else {
+                err += s3_sext14(s->desty_axstep);
+            }
+            s->err_term = err & 0x3fff;
         }
         break;
     default:
@@ -419,6 +468,9 @@ static void do_cmd_write_one_pixel(S3TrioState *s, uint32_t value)
 {
     uint32_t offset;
 
+    if (s3_clipped(s, s->cur_x, s->cur_y)) {
+        return;
+    }
     if (s->color_compare & 0x100) {
         uint32_t cmp = s->color_cmp & s3_pixel_mask(s);
 
@@ -697,6 +749,9 @@ static void s3_do_cmd_patblt(S3TrioState *s)
             if (px < 0 || py < 0 || px >= res_width || py >= res_height) {
                 continue;
             }
+            if (s3_clipped(s, px, py)) {
+                continue;
+            }
             /*
              * The pattern is usually kept in off-screen display memory, so
              * only screen bounds apply to the destination; the source may be
@@ -852,6 +907,9 @@ static void s3_do_cmd_bitblt(S3TrioState *s)
                 dst_off + bpp > s->vga.vram_size) {
                 continue;
             }
+            if (s3_clipped(s, dx, dy)) {
+                continue;
+            }
             src = s3_read_pixel(s, src_off);
             dst = s3_read_pixel(s, dst_off);
             s3_write_pixel(s, dst_off, s3_mix_pixel(s, mix, src, dst));
@@ -907,10 +965,11 @@ static void do_cmd(S3TrioState *s)
                                             s->cmd & CMD_INC_Y ? 1 : -1,
                                             s->maj_axis_pcnt,
                                             s->cmd & CMD_YMAJAXIS ? 'Y' : 'X');
-            qemu_log_mask(LOG_UNIMP,
-                          "s3_trio: CMD_LINE (Bresenham) not implemented (%04x)\n",
-                          s->cmd);
-            do_cmd_done(s);
+            if (!(s->cmd & CMD_PCDATA)) {
+                while (s->gp_stat & GP_STAT_BUSY) {
+                    do_cmd_write_engine_pixel(s);
+                }
+            }
         } else {
             trace_s3_vga_cmd_line_vector(s->cur_x, s->cur_y, (s->cmd >> 5) & 7,
                                          s->maj_axis_pcnt);
@@ -1119,6 +1178,11 @@ static uint32_t s3_trio_ioport_readb(void *opaque, uint32_t addr)
     uint32_t val;
     uint16_t *p;
 
+    if (address_to_reg(addr & ~0x1) == REG_MULTIFUNC_CNTL) {
+        val = (s->multifunc_data >> ((~addr & 1) * 8)) & 0xff;
+        trace_s3_vga_io_readb(addr, val);
+        return val;
+    }
     p = s3_trio_get_register(s, address_to_reg(addr & ~0x1), 0, NULL);
 
     if (p) {
@@ -1199,6 +1263,20 @@ static void s3_trio_ioport_writeb(void *opaque, uint32_t addr, uint32_t val)
     }
     p = s3_trio_get_register(s, address_to_reg(addr & ~0x1), 1, &val);
 
+    /*
+     * BEE8H carries the index in bits 15-12, so the byte write that lands in
+     * the high half selects the bank; committing on the low byte would use the
+     * index of the previous word (DB008-B 18-11, "Bits 15-12 INDEX").
+     */
+    if (address_to_reg(addr & ~0x1) == REG_MULTIFUNC_CNTL) {
+        ((uint8_t *)&s->multifunc_data)[~addr & 1] = val;
+        if (!(addr & 1)) {
+            s->mfc[(s->multifunc_data >> 12) & 0xf] =
+                s->multifunc_data & 0x0fff;
+        }
+        s3_trio_post_write(s, addr & ~0x1);
+        return;
+    }
     if (p) {
         c = (uint8_t*)p;
         c[~addr & 1] = val;
@@ -1797,6 +1875,7 @@ static VMStateDescription vmstate_s3_trio = {
         VMSTATE_UINT16(bkgd_color, S3TrioState),
         VMSTATE_UINT16(frgd_color, S3TrioState),
         VMSTATE_UINT16(wrt_mask, S3TrioState),
+        VMSTATE_UINT16(multifunc_data, S3TrioState),
         VMSTATE_UINT16(rd_mask, S3TrioState),
         VMSTATE_UINT16(color_cmp, S3TrioState),
         VMSTATE_UINT16(bkgd_mix, S3TrioState),
