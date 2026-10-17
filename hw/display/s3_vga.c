@@ -180,11 +180,11 @@ typedef struct S3TrioState {
     uint16_t gp_stat; /* 9ae8 (R) */
     uint16_t cmd; /* 9ae8 (W) */
     uint16_t short_stroke; /* 9ee8 */
-    uint16_t bkgd_color; /* a2e8 */
-    uint16_t frgd_color; /* a6e8 */
-    uint16_t wrt_mask; /* aae8 */
-    uint16_t rd_mask; /* aee8 */
-    uint16_t color_cmp; /* b2e8 */
+    uint32_t bkgd_color; /* a2e8 */
+    uint32_t frgd_color; /* a6e8 */
+    uint32_t wrt_mask; /* aae8 */
+    uint32_t rd_mask; /* aee8 */
+    uint32_t color_cmp; /* b2e8 */
     uint16_t bkgd_mix; /* b6e8 */
     uint16_t frgd_mix; /* bae8 */
     uint16_t mfc[16]; /* bee8 */
@@ -229,6 +229,7 @@ static uint32_t raster_op(S3TrioState *s, uint16_t mix);
 static uint32_t get_color(S3TrioState *s);
 static bool s3_cursor_enabled(S3TrioState *s);
 static uint32_t s3_cursor_addr(S3TrioState *s);
+static int s3_pixel_bytes(S3TrioState *s);
 
 #define min_axis_pcnt mfc[0]
 #define scissors_t    mfc[1]
@@ -240,6 +241,60 @@ static uint32_t s3_cursor_addr(S3TrioState *s);
 #define pattern_h     mfc[9]
 #define pix_cntl      mfc[10]
 #define color_compare mfc[14]
+
+#define MUL_TMISC_RSF 0x0010
+
+/*
+ * BKGD_COLOR, FRGD_COLOR, WRT_MASK, RD_MASK and COLOR_CMP are 32 bits wide.
+ * A 32-bit access writes the whole register; RSF selects the half that a
+ * 16-bit access sees (DB008-B 18-18, 86C928 10-12).
+ */
+static uint32_t *s3_trio_wide_register(S3TrioState *s, int reg)
+{
+    switch (reg) {
+    case REG_BKGD_COLOR:
+        return &s->bkgd_color;
+    case REG_FRGD_COLOR:
+        return &s->frgd_color;
+    case REG_WRT_MASK:
+        return &s->wrt_mask;
+    case REG_RD_MASK:
+        return &s->rd_mask;
+    case REG_COLOR_CMP:
+        return &s->color_cmp;
+    default:
+        return NULL;
+    }
+}
+
+static uint16_t s3_trio_wide_read16(S3TrioState *s, uint32_t value)
+{
+    return (s->color_compare & MUL_TMISC_RSF) ? value >> 16 : value;
+}
+
+static void s3_trio_wide_write16(S3TrioState *s, uint32_t *reg, uint16_t value,
+                                 bool word_access)
+{
+    bool toggle = word_access && s3_pixel_bytes(s) == 4 &&
+                  !(s->color_compare & 0x200);
+
+    if (s->color_compare & MUL_TMISC_RSF) {
+        *reg = (*reg & 0xffff) | ((uint32_t)value << 16);
+    } else {
+        *reg = (*reg & 0xffff0000) | value;
+    }
+    if (toggle) {
+        s->color_compare ^= MUL_TMISC_RSF;
+    }
+}
+
+static void s3_trio_wide_write32(S3TrioState *s, uint32_t *reg, uint32_t value)
+{
+    *reg = value;
+    if (s3_pixel_bytes(s) == 4) {
+        s->color_compare ^= MUL_TMISC_RSF;
+    }
+}
 
 /* CR50 bits 5-4 select 1, 2 or 4 bytes per pixel (DB008-B table 9-3). */
 static int s3_pixel_bytes(S3TrioState *s)
@@ -1132,19 +1187,12 @@ static uint16_t* s3_trio_get_register(S3TrioState *s, uint32_t addr, int is_writ
         p = is_write ? &s->short_stroke : NULL;
         break;
     case REG_BKGD_COLOR:
-        p = is_write ? &s->bkgd_color : NULL;
-        break;
     case REG_FRGD_COLOR:
-        p = is_write ? &s->frgd_color : NULL;
-        break;
     case REG_WRT_MASK:
-        p = is_write ? &s->wrt_mask : NULL;
-        break;
     case REG_RD_MASK:
-        p = is_write ? &s->rd_mask : NULL;
-        break;
     case REG_COLOR_CMP:
-        p = is_write ? &s->color_cmp : NULL;
+        /* 32-bit command registers, see s3_trio_wide_register() */
+        p = NULL;
         break;
     case REG_BKGD_MIX:
         p = is_write ? &s->bkgd_mix : NULL;
@@ -1177,6 +1225,7 @@ static uint32_t s3_trio_ioport_readb(void *opaque, uint32_t addr)
     S3TrioState *s = opaque;
     uint32_t val;
     uint16_t *p;
+    uint32_t *w;
 
     if (address_to_reg(addr & ~0x1) == REG_MULTIFUNC_CNTL) {
         val = (s->multifunc_data >> ((~addr & 1) * 8)) & 0xff;
@@ -1184,9 +1233,12 @@ static uint32_t s3_trio_ioport_readb(void *opaque, uint32_t addr)
         return val;
     }
     p = s3_trio_get_register(s, address_to_reg(addr & ~0x1), 0, NULL);
+    w = s3_trio_wide_register(s, address_to_reg(addr & ~0x1));
 
     if (p) {
         val = (*p >> ((~addr & 1) * 8)) & 0xff;
+    } else if (w) {
+        val = (s3_trio_wide_read16(s, *w) >> ((~addr & 1) * 8)) & 0xff;
     } else {
         val = 0;
     }
@@ -1200,11 +1252,15 @@ static uint32_t s3_trio_ioport_readw(void *opaque, uint32_t addr)
     S3TrioState *s = opaque;
     uint32_t val;
     uint16_t *p;
+    uint32_t *w;
 
     p = s3_trio_get_register(s, address_to_reg(addr), 0, NULL);
+    w = s3_trio_wide_register(s, address_to_reg(addr));
 
     if (p) {
         val = *p;
+    } else if (w) {
+        val = s3_trio_wide_read16(s, *w);
     } else {
         val = 0;
     }
@@ -1241,6 +1297,7 @@ static void s3_trio_ioport_writeb(void *opaque, uint32_t addr, uint32_t val)
     S3TrioState *s = opaque;
     uint16_t *p;
     uint8_t *c;
+    uint32_t *w;
 
     trace_s3_vga_io_writeb(addr, val);
     /*
@@ -1262,6 +1319,7 @@ static void s3_trio_ioport_writeb(void *opaque, uint32_t addr, uint32_t val)
         return;
     }
     p = s3_trio_get_register(s, address_to_reg(addr & ~0x1), 1, &val);
+    w = s3_trio_wide_register(s, address_to_reg(addr & ~0x1));
 
     /*
      * BEE8H carries the index in bits 15-12, so the byte write that lands in
@@ -1280,6 +1338,15 @@ static void s3_trio_ioport_writeb(void *opaque, uint32_t addr, uint32_t val)
     if (p) {
         c = (uint8_t*)p;
         c[~addr & 1] = val;
+    } else if (w) {
+        uint16_t half = s3_trio_wide_read16(s, *w);
+
+        if (~addr & 1) {
+            half = (half & 0x00ff) | ((val & 0xff) << 8);
+        } else {
+            half = (half & 0xff00) | (val & 0xff);
+        }
+        s3_trio_wide_write16(s, w, half, false);
     }
 
     if (address_to_reg(addr & ~0x1) == REG_PIX_TRANS) {
@@ -1296,6 +1363,7 @@ static void s3_trio_ioport_writew(void *opaque, uint32_t addr, uint32_t val)
 {
     S3TrioState *s = opaque;
     uint16_t *p;
+    uint32_t *w;
 
     trace_s3_vga_io_writew(addr, val);
     if ((addr & 0x3ff) == 0x2ea) {
@@ -1311,9 +1379,12 @@ static void s3_trio_ioport_writew(void *opaque, uint32_t addr, uint32_t val)
         return;
     }
     p = s3_trio_get_register(s, address_to_reg(addr), 1, &val);
+    w = s3_trio_wide_register(s, address_to_reg(addr));
 
     if (p) {
         *p = val & 0xffff;
+    } else if (w) {
+        s3_trio_wide_write16(s, w, val, true);
     }
 
     if (address_to_reg(addr) == REG_PIX_TRANS) {
@@ -1325,6 +1396,33 @@ static void s3_trio_ioport_writew(void *opaque, uint32_t addr, uint32_t val)
         }
     }
     s3_trio_post_write(s, addr & ~0x1);
+}
+
+static uint32_t s3_trio_ioport_readl(void *opaque, uint32_t addr)
+{
+    S3TrioState *s = opaque;
+    uint32_t *w = s3_trio_wide_register(s, address_to_reg(addr));
+    uint32_t val = 0;
+
+    if (w) {
+        val = *w;
+        if (s3_pixel_bytes(s) == 4) {
+            s->color_compare ^= MUL_TMISC_RSF;
+        }
+    }
+    trace_s3_vga_io_readl(addr, val);
+    return val;
+}
+
+static void s3_trio_ioport_writel(void *opaque, uint32_t addr, uint32_t val)
+{
+    S3TrioState *s = opaque;
+    uint32_t *w = s3_trio_wide_register(s, address_to_reg(addr));
+
+    trace_s3_vga_io_writel(addr, val);
+    if (w) {
+        s3_trio_wide_write32(s, w, val);
+    }
 }
 
 /*
@@ -1381,7 +1479,11 @@ static void s3_mmio_window_write(void *opaque, hwaddr addr, uint64_t val,
             return;
         }
         if (s3_mmio_window_is_reg(addr, true)) {
-            if (size == 1) {
+            uint32_t *w = s3_trio_wide_register(s, address_to_reg(addr & ~0x1));
+
+            if (size == 4 && w) {
+                s3_trio_wide_write32(s, w, val);
+            } else if (size == 1) {
                 uint32_t byte = val & 0xff;
                 uint16_t *p;
 
@@ -1389,6 +1491,15 @@ static void s3_mmio_window_write(void *opaque, hwaddr addr, uint64_t val,
                                          &byte);
                 if (p) {
                     ((uint8_t *)p)[addr & 1] = byte;
+                } else if (w) {
+                    uint16_t half = s3_trio_wide_read16(s, *w);
+
+                    if (addr & 1) {
+                        half = (half & 0x00ff) | ((byte & 0xff) << 8);
+                    } else {
+                        half = (half & 0xff00) | (byte & 0xff);
+                    }
+                    s3_trio_wide_write16(s, w, half, false);
                 }
                 s3_trio_post_write(s, addr & ~0x1);
             } else {
@@ -1415,12 +1526,18 @@ static uint64_t s3_mmio_window_read(void *opaque, hwaddr addr, unsigned size)
     if (s3_enhanced_window_enabled(s) && s3_mmio_window_is_reg(addr, false)) {
         uint16_t *p = s3_trio_get_register(s, address_to_reg(addr & ~0x1), 0,
                                            NULL);
-        uint16_t w = p ? *p : 0;
+        uint32_t *wp = s3_trio_wide_register(s, address_to_reg(addr & ~0x1));
+        uint32_t w = wp ? *wp : (p ? *p : 0);
 
-        if (size == 1) {
+        if (size == 4) {
+            if (wp) {
+                s->color_compare ^= MUL_TMISC_RSF;
+            }
+            val = w;
+        } else if (size == 1) {
             val = (w >> (8 * (addr & 1))) & 0xff;
         } else {
-            val = w;
+            val = wp ? s3_trio_wide_read16(s, w) : w;
         }
         return val;
     }
@@ -1720,14 +1837,19 @@ static const MemoryRegionPortio s3_trio_portio_list[] = {
     { 0x9ae8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
     { 0x9ee8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
     { 0x9ee8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
+    { 0xa2e8, 1, 4, .read = s3_trio_ioport_readl, .write = s3_trio_ioport_writel, },
     { 0xa2e8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
     { 0xa2e8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
+    { 0xa6e8, 1, 4, .read = s3_trio_ioport_readl, .write = s3_trio_ioport_writel, },
     { 0xa6e8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
     { 0xa6e8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
+    { 0xaae8, 1, 4, .read = s3_trio_ioport_readl, .write = s3_trio_ioport_writel, },
     { 0xaae8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
     { 0xaae8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
+    { 0xaee8, 1, 4, .read = s3_trio_ioport_readl, .write = s3_trio_ioport_writel, },
     { 0xaee8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
     { 0xaee8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
+    { 0xb2e8, 1, 4, .read = s3_trio_ioport_readl, .write = s3_trio_ioport_writel, },
     { 0xb2e8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
     { 0xb2e8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
     { 0xb6e8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
@@ -1872,12 +1994,12 @@ static VMStateDescription vmstate_s3_trio = {
         VMSTATE_UINT16(gp_stat, S3TrioState),
         VMSTATE_UINT16(cmd, S3TrioState),
         VMSTATE_UINT16(short_stroke, S3TrioState),
-        VMSTATE_UINT16(bkgd_color, S3TrioState),
-        VMSTATE_UINT16(frgd_color, S3TrioState),
-        VMSTATE_UINT16(wrt_mask, S3TrioState),
+        VMSTATE_UINT32(bkgd_color, S3TrioState),
+        VMSTATE_UINT32(frgd_color, S3TrioState),
+        VMSTATE_UINT32(wrt_mask, S3TrioState),
         VMSTATE_UINT16(multifunc_data, S3TrioState),
-        VMSTATE_UINT16(rd_mask, S3TrioState),
-        VMSTATE_UINT16(color_cmp, S3TrioState),
+        VMSTATE_UINT32(rd_mask, S3TrioState),
+        VMSTATE_UINT32(color_cmp, S3TrioState),
         VMSTATE_UINT16(bkgd_mix, S3TrioState),
         VMSTATE_UINT16(frgd_mix, S3TrioState),
         VMSTATE_UINT16_ARRAY(mfc, S3TrioState, 16),
