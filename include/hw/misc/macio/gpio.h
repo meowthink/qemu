@@ -44,6 +44,8 @@
 #define KL_GPIO_RESET_CPU2            (KEYLARGO_GPIO_EXTINT_0 + 0x0f)
 #define KL_GPIO_RESET_CPU3            (KEYLARGO_GPIO_EXTINT_0 + 0x10)
 
+#define MACIO_GPIO_MAX_CPUS 4
+
 /* G5 SMU doorbell ("os-req-gpio"): GPIO line 31 */
 #define KL_GPIO_SMU_DOORBELL          (KEYLARGO_GPIO_EXTINT_0 + 0x1f)
 /* The PM7,3/Quad generation rings the same doorbell at cell offset 0x12 */
@@ -63,6 +65,7 @@ struct MacIOGPIOState {
     uint8_t gpio_regs[36];
     uint32_t nb_cpus;
     bool k2;
+    qemu_irq cpu_reset[MACIO_GPIO_MAX_CPUS];
 };
 
 void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state);

@@ -150,18 +150,24 @@ static void macio_gpio_write(void *opaque, hwaddr addr, uint64_t value,
                 ibit = 1; /* Ensure pulled high unless driven low */
             }
             macio_set_gpio(s, 4, ibit);
+            qemu_set_irq(s->cpu_reset[1],
+                         (value & OUT_ENABLE) && !(value & OUT_DATA));
         } else if (addr == (KL_GPIO_RESET_CPU2 - KEYLARGO_GPIO_EXTINT_0)) {
             /* For CPU2 reset: (0x58+0x0f) - 0x58 = 0x0F */
             if (!(value & OUT_ENABLE)) {
                 ibit = 1; /* Ensure pulled high unless driven low */
             }
             macio_set_gpio(s, 15, ibit);
+            qemu_set_irq(s->cpu_reset[2],
+                         (value & OUT_ENABLE) && !(value & OUT_DATA));
         } else if (addr == (KL_GPIO_RESET_CPU3 - KEYLARGO_GPIO_EXTINT_0)) {
             /* For CPU3 reset: (0x58+0x10) - 0x58 = 0x10 */
             if (!(value & OUT_ENABLE)) {
                 ibit = 1; /* Ensure pulled high unless driven low */
             }
             macio_set_gpio(s, 16, ibit);
+            qemu_set_irq(s->cpu_reset[3],
+                         (value & OUT_ENABLE) && !(value & OUT_DATA));
         } else if (addr == (KL_GPIO_SMU_DOORBELL -
                             KEYLARGO_GPIO_EXTINT_0) ||
                    addr == (KL_GPIO_SMU_DOORBELL2 -
@@ -215,6 +221,8 @@ static void macio_gpio_init(Object *obj)
     for (i = 0; i < KEYLARGO_GPIO_EXTINT_CNT; i++) {
         sysbus_init_irq(sbd, &s->gpio_extirqs[i]);
     }
+    qdev_init_gpio_out_named(DEVICE(obj), s->cpu_reset, "cpu-reset",
+                             MACIO_GPIO_MAX_CPUS);
 
     memory_region_init_io(&s->gpiomem, OBJECT(s), &macio_gpio_ops, obj,
                           "gpio", 0x30);
