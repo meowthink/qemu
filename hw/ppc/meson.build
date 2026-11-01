@@ -75,6 +75,8 @@ ppc_ss.add(when: 'CONFIG_PREP', if_true: files('prep_systemio.c'))
 ppc_ss.add(when: 'CONFIG_RS6000_MC', if_true: files('rs6000_mc.c'))
 # OldWorld PowerMac
 ppc_ss.add(when: 'CONFIG_MAC_OLDWORLD', if_true: files('mac_oldworld.c'))
+# Apple Network Server 500/700
+ppc_ss.add(when: 'CONFIG_ANS', if_true: files('ans.c'))
 # NewWorld PowerMac
 ppc_ss.add(when: 'CONFIG_MAC_NEWWORLD', if_true: files('mac_newworld.c'))
 # e500

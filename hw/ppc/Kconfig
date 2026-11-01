@@ -142,6 +142,23 @@ config MAC_OLDWORLD
     select MACIO
     select FW_CFG_PPC
 
+config ANS
+    bool
+    default y
+    depends on PPC
+    imply PCI_DEVICES
+    imply TEST_DEVICES
+    select ANS_GRAND_CENTRAL
+    select BANDIT_PCI
+    select HAMMERHEAD
+    select MAC_DBDMA
+    select ESCC
+    select LSI_SCSI_PCI
+    select ESP
+    select ADB
+    select VGA_CIRRUS
+    select FW_CFG_PPC
+
 config MAC_NEWWORLD
     bool
     default y
