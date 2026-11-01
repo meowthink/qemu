@@ -34,7 +34,6 @@
 #include "hw/usb/usb.h"
 #include "migration/vmstate.h"
 #include "hw/core/sysbus.h"
-#include "hw/core/qdev-dma.h"
 #include "hw/core/qdev-properties.h"
 #include "trace.h"
 #include "hcd-ohci.h"
@@ -300,9 +299,11 @@ void ohci_stop_endpoints(OHCIState *ohci)
     USBDevice *dev;
     int i, j;
 
-    if (ohci->async_td) {
-        usb_cancel_packet(&ohci->usb_packet);
-        ohci->async_td = 0;
+    for (i = 0; i < OHCI_MAX_ASYNC; i++) {
+        if (ohci->async_td[i]) {
+            usb_cancel_packet(&ohci->usb_packet[i]);
+            ohci->async_td[i] = 0;
+        }
     }
     for (i = 0; i < ohci->num_ports; i++) {
         dev = ohci->rhport[i].port.dev;
@@ -315,6 +316,8 @@ void ohci_stop_endpoints(OHCIState *ohci)
         }
     }
 }
+
+static void ohci_port_reset_rearm(OHCIState *ohci);
 
 static void ohci_roothub_reset(OHCIState *ohci)
 {
@@ -329,10 +332,32 @@ static void ohci_roothub_reset(OHCIState *ohci)
     for (i = 0; i < ohci->num_ports; i++) {
         port = &ohci->rhport[i];
         port->ctrl = 0;
+        ohci->port_reset_end[i] = 0;
         if (port->port.dev && port->port.dev->attached) {
+            /*
+             * A whole-hub reset (HCFS=Reset, e.g. guest-initiated bus
+             * recovery -- this isn't just an initial-boot path) resets
+             * every attached port back-to-back in this loop, with no
+             * real time between them. That is the same classic-Mac-OS
+             * shim collision ohci_port_set_status() staggers for
+             * guest-driven individual port resets (see the comment
+             * there): whichever device isn't on port 0 loses the race
+             * and never gets its HID reports delivered, even though it
+             * finishes USB-level enumeration just fine. This loop is a
+             * separate code path (ohci_roothub_reset() calls
+             * usb_port_reset() directly, bypassing ohci_port_set_status()
+             * entirely) so it needs its own copy of the same stagger.
+             */
+            if (i > 0) {
+                g_usleep(50000);
+            }
             usb_port_reset(&port->port);
+            if (i == 0) {
+                ohci->port0_reset_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+            }
         }
     }
+    ohci_port_reset_rearm(ohci);
     ohci_stop_endpoints(ohci);
 }
 
@@ -710,16 +735,15 @@ static int ohci_service_iso_td(OHCIState *ohci, struct ohci_ed *ed)
         end_addr = next_offset;
     }
 
-    if (start_addr > end_addr) {
-        trace_usb_ohci_iso_td_bad_cc_overrun(start_addr, end_addr);
-        return 1;
-    }
-
-    if ((start_addr & OHCI_PAGE_MASK) != (end_addr & OHCI_PAGE_MASK)) {
+    if ((start_addr & OHCI_PAGE_MASK) == (end_addr & OHCI_PAGE_MASK)) {
+        if (start_addr > end_addr) {
+            trace_usb_ohci_iso_td_bad_cc_overrun(start_addr, end_addr);
+            return 1;
+        }
+        len = end_addr - start_addr + 1;
+    } else {
         len = (end_addr & OHCI_OFFSET_MASK) + 0x1001
             - (start_addr & OHCI_OFFSET_MASK);
-    } else {
-        len = end_addr - start_addr + 1;
     }
     if (len > sizeof(buf)) {
         len = sizeof(buf);
@@ -878,6 +902,42 @@ static void ohci_td_pkt(const char *msg, const uint8_t *buf, size_t len)
  * Service a transport descriptor.
  * Returns nonzero to terminate processing of this endpoint.
  */
+/* Find the async slot currently tracking TD address addr, or -1. */
+static int ohci_find_async_slot(OHCIState *ohci, uint32_t addr)
+{
+    int i;
+
+    /*
+     * addr == 0 means "no TD queued" for the caller, never a real async
+     * submission (ohci_service_td() rejects addr == 0 outright). A free
+     * slot also has async_td[i] == 0, so without this check addr == 0
+     * would spuriously "match" any unused slot and we'd end up canceling
+     * a USBPacket that was never actually submitted.
+     */
+    if (addr == 0) {
+        return -1;
+    }
+    for (i = 0; i < OHCI_MAX_ASYNC; i++) {
+        if (ohci->async_td[i] == addr) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Find a free async slot to submit a new packet into, or -1 if all busy. */
+static int ohci_alloc_async_slot(OHCIState *ohci)
+{
+    int i;
+
+    for (i = 0; i < OHCI_MAX_ASYNC; i++) {
+        if (ohci->async_td[i] == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
 {
     int dir;
@@ -886,6 +946,7 @@ static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
     int pid;
     int ret;
     int i;
+    int slot;
     USBDevice *dev;
     USBEndpoint *ep;
     struct ohci_td td;
@@ -900,10 +961,26 @@ static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
     }
 
     /* See if this TD has already been submitted to the device. */
-    completion = (addr == ohci->async_td);
-    if (completion && !ohci->async_complete) {
+    slot = ohci_find_async_slot(ohci, addr);
+    completion = (slot >= 0);
+    if (completion && !ohci->async_complete[slot]) {
         trace_usb_ohci_td_skip_async();
         return 1;
+    }
+    if (!completion) {
+        /*
+         * New submission: grab a free async slot now. Real hardware allows
+         * one active transfer per endpoint; a small pool of slots lets
+         * different endpoints (e.g. a keyboard and a mouse, or a HID
+         * device and a mass-storage device) have independent in-flight
+         * packets instead of serializing all async I/O on the controller
+         * through a single shared slot.
+         */
+        slot = ohci_alloc_async_slot(ohci);
+        if (slot < 0) {
+            trace_usb_ohci_td_too_many_pending();
+            return 1;
+        }
     }
     if (ohci_read_td(ohci, addr, &td)) {
         trace_usb_ohci_td_read_error(addr);
@@ -955,8 +1032,8 @@ static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
             }
             len = (td.be - td.cbp) + 1;
         }
-        if (len > sizeof(ohci->usb_buf)) {
-            len = sizeof(ohci->usb_buf);
+        if (len > sizeof(ohci->usb_buf[slot])) {
+            len = sizeof(ohci->usb_buf[slot]);
         }
 
         pktlen = len;
@@ -978,7 +1055,7 @@ static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
                 pktlen = len;
             }
             if (!completion) {
-                if (ohci_copy_td(ohci, &td, ohci->usb_buf, pktlen,
+                if (ohci_copy_td(ohci, &td, ohci->usb_buf[slot], pktlen,
                                  DMA_DIRECTION_TO_DEVICE)) {
                     ohci_die(ohci);
                 }
@@ -989,11 +1066,11 @@ static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
     flag_r = (td.flags & OHCI_TD_R) != 0;
     trace_usb_ohci_td_pkt_hdr(addr, (int64_t)pktlen, (int64_t)len, str,
                               flag_r, td.cbp, td.be);
-    ohci_td_pkt("OUT", ohci->usb_buf, pktlen);
+    ohci_td_pkt("OUT", ohci->usb_buf[slot], pktlen);
 
     if (completion) {
-        ohci->async_td = 0;
-        ohci->async_complete = false;
+        ohci->async_td[slot] = 0;
+        ohci->async_complete[slot] = false;
     } else {
         dev = ohci_find_device(ohci, OHCI_BM(ed->flags, ED_FA));
         if (dev == NULL) {
@@ -1001,48 +1078,40 @@ static int ohci_service_td(OHCIState *ohci, struct ohci_ed *ed)
             return 1;
         }
         ep = usb_ep_get(dev, pid, OHCI_BM(ed->flags, ED_EN));
-        if (ohci->async_td) {
-            /*
-             * ??? The hardware should allow one active packet per
-             * endpoint.  We only allow one active packet per controller.
-             * This should be sufficient as long as devices respond in a
-             * timely manner.
-             */
-            trace_usb_ohci_td_too_many_pending(ep->nr);
-            return 1;
-        }
         if (ep->type != USB_ENDPOINT_XFER_ISOC) {
-            usb_packet_setup(&ohci->usb_packet, pid, ep, 0, addr, !flag_r,
+            usb_packet_setup(&ohci->usb_packet[slot], pid, ep, 0, addr,
+                             !flag_r,
                              OHCI_BM(td.flags, TD_DI) == 0);
-            usb_packet_addbuf(&ohci->usb_packet, ohci->usb_buf, pktlen);
-            usb_handle_packet(dev, &ohci->usb_packet);
-            trace_usb_ohci_td_packet_status(ohci->usb_packet.status);
+            usb_packet_addbuf(&ohci->usb_packet[slot],
+                              ohci->usb_buf[slot], pktlen);
+            usb_handle_packet(dev, &ohci->usb_packet[slot]);
+            trace_usb_ohci_td_packet_status(ohci->usb_packet[slot].status);
 
-            if (ohci->usb_packet.status == USB_RET_ASYNC) {
+            if (ohci->usb_packet[slot].status == USB_RET_ASYNC) {
                 usb_device_flush_ep_queue(dev, ep);
-                ohci->async_td = addr;
+                ohci->async_td[slot] = addr;
                 return 1;
             }
         } else {
             /* Attempted non-iso transfer to iso endpoint */
-            ohci->usb_packet.status = USB_RET_NAK;
-            ohci->usb_packet.actual_length = 0;
+            ohci->usb_packet[slot].status = USB_RET_NAK;
+            ohci->usb_packet[slot].actual_length = 0;
             trace_usb_ohci_td_to_iso_endpoint(ep->nr);
         }
     }
-    if (ohci->usb_packet.status == USB_RET_SUCCESS) {
-        ret = ohci->usb_packet.actual_length;
+    if (ohci->usb_packet[slot].status == USB_RET_SUCCESS) {
+        ret = ohci->usb_packet[slot].actual_length;
     } else {
-        ret = ohci->usb_packet.status;
+        ret = ohci->usb_packet[slot].status;
     }
 
     if (ret >= 0) {
         if (dir == OHCI_TD_DIR_IN) {
-            if (ohci_copy_td(ohci, &td, ohci->usb_buf, ret,
+            if (ohci_copy_td(ohci, &td, ohci->usb_buf[slot], ret,
                              DMA_DIRECTION_FROM_DEVICE)) {
                 ohci_die(ohci);
             }
-            ohci_td_pkt("IN", ohci->usb_buf, pktlen);
+            ohci_td_pkt("IN", ohci->usb_buf[slot], pktlen);
         } else {
             ret = pktlen;
         }
@@ -1155,13 +1224,15 @@ static int ohci_service_ed_list(OHCIState *ohci, uint32_t head)
 
         if ((ed.head & OHCI_ED_H) || (ed.flags & OHCI_ED_K)) {
             uint32_t addr;
+            int slot;
             /* Cancel pending packets for ED that have been paused. */
             addr = ed.head & OHCI_DPTR_MASK;
-            if (ohci->async_td && addr == ohci->async_td) {
-                usb_cancel_packet(&ohci->usb_packet);
-                ohci->async_td = 0;
-                usb_device_ep_stopped(ohci->usb_packet.ep->dev,
-                                      ohci->usb_packet.ep);
+            slot = ohci_find_async_slot(ohci, addr);
+            if (slot >= 0) {
+                usb_cancel_packet(&ohci->usb_packet[slot]);
+                ohci->async_td[slot] = 0;
+                usb_device_ep_stopped(ohci->usb_packet[slot].ep->dev,
+                                      ohci->usb_packet[slot].ep);
             }
             continue;
         }
@@ -1190,10 +1261,28 @@ static int ohci_service_ed_list(OHCIState *ohci, uint32_t head)
             }
 
             if (ed_cnt++ > ED_LINK_LIMIT) {
+                /*
+                 * This endpoint's work budget for the frame is used up:
+                 * stop here and pick the list up again next frame. The ED
+                 * write-back below records how far we got, so a
+                 * legitimately long TD queue still drains one budget at a
+                 * time, while a circular TD list still cannot spin forever
+                 * -- which is all this limit exists to prevent.
+                 *
+                 * Do not ohci_die() here: that raises
+                 * HcInterruptStatus.UnrecoverableError, and Mac OS X's
+                 * AppleUSBOHCI answers UE with a software reset
+                 * (HcCommandStatus.HCR) followed by HcControl back to
+                 * Operational WITHOUT rewriting HcHCCA. The reset zeroes
+                 * hcca (as OpenHCI 1.0a says it must), so the controller
+                 * then runs forever servicing address 0 and every device
+                 * on the bus -- keyboard and mouse included -- goes
+                 * permanently dead. A budget overrun is not an
+                 * unrecoverable controller error.
+                 */
                 qemu_log_mask(LOG_GUEST_ERROR,
                               "ohci: Too many endpoint descriptors in loop\n");
-                ohci_die(ohci);
-                return 0;
+                break;
             }
         }
 
@@ -1501,6 +1590,52 @@ static int ohci_port_set_if_connected(OHCIState *ohci, int i, uint32_t val)
 }
 
 /* Set root hub port status */
+static void ohci_port_reset_rearm(OHCIState *ohci)
+{
+    int64_t next = 0;
+    int i;
+
+    for (i = 0; i < ohci->num_ports; i++) {
+        if (ohci->port_reset_end[i] &&
+            (!next || ohci->port_reset_end[i] < next)) {
+            next = ohci->port_reset_end[i];
+        }
+    }
+    if (next) {
+        timer_mod(ohci->port_reset_timer, next);
+    } else {
+        timer_del(ohci->port_reset_timer);
+    }
+}
+
+/* Reset signalling on a root-hub port has run its course. */
+static void ohci_port_reset_done(void *opaque)
+{
+    OHCIState *ohci = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int i;
+
+    for (i = 0; i < ohci->num_ports; i++) {
+        OHCIPort *port = &ohci->rhport[i];
+
+        if (!ohci->port_reset_end[i] || ohci->port_reset_end[i] > now) {
+            continue;
+        }
+        ohci->port_reset_end[i] = 0;
+        if (!(port->ctrl & OHCI_PORT_PRS)) {
+            continue;       /* port went away meanwhile */
+        }
+        if (port->port.dev && port->port.dev->attached) {
+            usb_device_reset(port->port.dev);
+        }
+        port->ctrl &= ~OHCI_PORT_PRS;
+        /* ??? Should this also set OHCI_PORT_PESC. */
+        port->ctrl |= OHCI_PORT_PES | OHCI_PORT_PRSC;
+        ohci_set_interrupt(ohci, OHCI_INTR_RHSC);
+    }
+    ohci_port_reset_rearm(ohci);
+}
+
 static void ohci_port_set_status(OHCIState *ohci, int portnum, uint32_t val)
 {
     uint32_t old_state;
@@ -1523,11 +1658,49 @@ static void ohci_port_set_status(OHCIState *ohci, int portnum, uint32_t val)
     }
 
     if (ohci_port_set_if_connected(ohci, portnum, val & OHCI_PORT_PRS)) {
+        /*
+         * port-reset-us > 0 models what a real HC does: reset signalling
+         * on the port for a while (nominally 10ms, OHCI 7.4.4 / USB 2.0
+         * 7.1.7.5) with PRS reading 1, then device reset, PES, PRSC and
+         * RHSC. Opt-in only: it did not cure the Mac OS 9.0.4 ROM
+         * root-hub driver, which mis-tracks which port it just addressed
+         * whenever a third root-hub device is present (3-port hub, or 2
+         * ports with a usb-hub) -- it "resets the other port" but hits
+         * its own freshly addressed device, re-enumerates a few times and
+         * stops with no interrupt endpoints scheduled -- and with the
+         * completion coming from a timer while the guest polls PRS/PRSC,
+         * results became host-timing dependent. Kept for guests that
+         * want a spec-shaped reset.
+         */
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
         trace_usb_ohci_port_reset(portnum);
-        usb_device_reset(port->port.dev);
-        port->ctrl &= ~OHCI_PORT_PRS;
-        /* ??? Should this also set OHCI_PORT_PESC. */
-        port->ctrl |= OHCI_PORT_PES | OHCI_PORT_PRSC;
+        if (ohci->port_reset_us == 0) {
+            /*
+             * Default: complete inside the register write, as upstream
+             * does. Classic Mac OS's USB-to-ADB shim is timing-sensitive
+             * during enumeration: when two ports are reset back-to-back
+             * only the device on port 0 ends up usable (the second
+             * enumerates fine at the USB level but its HID reports are
+             * never delivered), so stagger a non-port-0 reset landing
+             * within 200ms wall-clock of port 0's by 50ms.
+             */
+            usb_device_reset(port->port.dev);
+            if (portnum == 0) {
+                ohci->port0_reset_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+            } else if (ohci->port0_reset_time != 0 &&
+                       qemu_clock_get_ns(QEMU_CLOCK_REALTIME) -
+                       ohci->port0_reset_time < 200 * SCALE_MS) {
+                g_usleep(50000);
+            }
+            port->ctrl &= ~OHCI_PORT_PRS;
+            /* ??? Should this also set OHCI_PORT_PESC. */
+            port->ctrl |= OHCI_PORT_PES | OHCI_PORT_PRSC;
+        } else {
+            ohci->port_reset_end[portnum] = now +
+                (int64_t)ohci->port_reset_us * SCALE_US;
+            ohci_port_reset_rearm(ohci);
+        }
     }
 
     /* Invert order here to ensure in ambiguous case, device is powered up. */
@@ -1842,12 +2015,15 @@ static void ohci_attach(USBPort *port1)
 static void ohci_child_detach(USBPort *port1, USBDevice *dev)
 {
     OHCIState *ohci = port1->opaque;
+    int i;
 
-    if (ohci->async_td &&
-        usb_packet_is_inflight(&ohci->usb_packet) &&
-        ohci->usb_packet.ep->dev == dev) {
-        usb_cancel_packet(&ohci->usb_packet);
-        ohci->async_td = 0;
+    for (i = 0; i < OHCI_MAX_ASYNC; i++) {
+        if (ohci->async_td[i] &&
+            usb_packet_is_inflight(&ohci->usb_packet[i]) &&
+            ohci->usb_packet[i].ep->dev == dev) {
+            usb_cancel_packet(&ohci->usb_packet[i]);
+            ohci->async_td[i] = 0;
+        }
     }
 }
 
@@ -1900,10 +2076,16 @@ static void ohci_wakeup(USBPort *port1)
 
 static void ohci_async_complete_packet(USBPort *port, USBPacket *packet)
 {
-    OHCIState *ohci = container_of(packet, OHCIState, usb_packet);
+    OHCIState *ohci = port->opaque;
+    int i;
 
     trace_usb_ohci_async_complete();
-    ohci->async_complete = true;
+    for (i = 0; i < OHCI_MAX_ASYNC; i++) {
+        if (&ohci->usb_packet[i] == packet) {
+            ohci->async_complete[i] = true;
+            break;
+        }
+    }
     ohci_process_lists(ohci);
 }
 
@@ -1978,12 +2160,15 @@ void usb_ohci_init(OHCIState *ohci, DeviceState *dev, uint32_t num_ports,
     ohci->localmem_base = localmem_base;
 
     ohci->name = object_get_typename(OBJECT(dev));
-    usb_packet_init(&ohci->usb_packet);
-
-    ohci->async_td = 0;
+    for (i = 0; i < OHCI_MAX_ASYNC; i++) {
+        usb_packet_init(&ohci->usb_packet[i]);
+        ohci->async_td[i] = 0;
+    }
 
     ohci->eof_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                    ohci_frame_boundary, ohci);
+    ohci->port_reset_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                          ohci_port_reset_done, ohci);
 }
 
 /*
@@ -2028,8 +2213,8 @@ static const VMStateDescription vmstate_ohci_eof_timer = {
 
 const VMStateDescription vmstate_ohci_state = {
     .name = "ohci-core",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_INT64(sof_time, OHCIState),
         VMSTATE_UINT32(ctl, OHCIState),
@@ -2062,9 +2247,9 @@ const VMStateDescription vmstate_ohci_state = {
         VMSTATE_UINT32(hreset, OHCIState),
         VMSTATE_UINT32(htest, OHCIState),
         VMSTATE_UINT32(old_ctl, OHCIState),
-        VMSTATE_UINT8_ARRAY(usb_buf, OHCIState, 8192),
-        VMSTATE_UINT32(async_td, OHCIState),
-        VMSTATE_BOOL(async_complete, OHCIState),
+        VMSTATE_UINT8_2DARRAY(usb_buf, OHCIState, OHCI_MAX_ASYNC, 8192),
+        VMSTATE_UINT32_ARRAY(async_td, OHCIState, OHCI_MAX_ASYNC),
+        VMSTATE_BOOL_ARRAY(async_complete, OHCIState, OHCI_MAX_ASYNC),
         VMSTATE_END_OF_LIST()
     },
     .subsections = (const VMStateDescription * const []) {

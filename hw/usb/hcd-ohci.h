@@ -29,6 +29,14 @@
 /* Number of Downstream Ports on the root hub: */
 #define OHCI_MAX_PORTS 15
 
+/*
+ * Number of simultaneous in-flight async USB packets this controller can
+ * track. Real OHCI hardware allows one active transfer per endpoint; we
+ * approximate that with a small fixed pool of slots shared across all
+ * endpoints/devices on the controller, instead of a single shared slot.
+ */
+#define OHCI_MAX_ASYNC 8
+
 typedef struct OHCIPort {
     USBPort port;
     uint32_t ctrl;
@@ -46,6 +54,29 @@ struct OHCIState {
 
     QEMUTimer *eof_timer;
     int64_t sof_time;
+
+    /*
+     * QEMU_CLOCK_REALTIME timestamp of port 0's last reset, or 0 if it
+     * has never been reset. Deliberately wall-clock, not virtual time:
+     * this only ever gates a real g_usleep() stagger, so it needs to
+     * track actual elapsed time regardless of how much (or how little)
+     * guest virtual time advances between the two resets. Used by
+     * ohci_port_set_status() and ohci_roothub_reset() to detect when a
+     * later port's reset lands right on top of port 0's -- see the
+     * comments there for why that specific collision matters.
+     */
+    int64_t port0_reset_time;
+
+    /*
+     * Root-hub port reset in progress: PRS reads 1 and the port stays
+     * disabled until port_reset_end[i] (QEMU_CLOCK_VIRTUAL), when the
+     * device is reset, PES/PRSC are set and RHSC raised -- the ~10ms
+     * reset signalling a real HC does (OHCI 7.4.4, USB 7.1.7.5). Zero
+     * means no reset pending on that port.
+     */
+    QEMUTimer *port_reset_timer;
+    int64_t port_reset_end[OHCI_MAX_PORTS];
+    uint32_t port_reset_us;     /* reset signalling duration */
 
     /* OHCI state */
     /* Control partition */
@@ -87,10 +118,10 @@ struct OHCIState {
 
     /* Active packets.  */
     uint32_t old_ctl;
-    USBPacket usb_packet;
-    uint8_t usb_buf[8192];
-    uint32_t async_td;
-    bool async_complete;
+    USBPacket usb_packet[OHCI_MAX_ASYNC];
+    uint8_t usb_buf[OHCI_MAX_ASYNC][8192];
+    uint32_t async_td[OHCI_MAX_ASYNC];
+    bool async_complete[OHCI_MAX_ASYNC];
 
     void (*ohci_die)(OHCIState *ohci);
 };
