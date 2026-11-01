@@ -61,6 +61,7 @@
 #include "hw/input/adb.h"
 #include "hw/ppc/mac_dbdma.h"
 #include "hw/pci/pci.h"
+#include "hw/pci/pci_bus.h"
 #include "net/net.h"
 #include "system/system.h"
 #include "hw/nvram/fw_cfg.h"
@@ -181,6 +182,8 @@ struct Core99MachineState {
 
     Core99ViaConfig via_config;
     unsigned model;
+    bool apple_rom;
+    PCIBus *agp_bus;
 };
 
 static const Core99ModelInfo *core99_model_info(const Core99MachineState *cms)
@@ -892,6 +895,7 @@ static void ppc_core99_init(MachineState *machine)
 
     filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
     rom_is_flash = filename && !firmware_is_elf(filename);
+    core99_machine->apple_rom = rom_is_flash;
 
     /*
      * A real PowerMac3,4/3,6 has a PMU, never a CUDA, and a real Apple ROM
@@ -1096,22 +1100,39 @@ static void ppc_core99_init(MachineState *machine)
         /* Use values found on a real PowerMac */
         /* Uninorth AGP bus */
         uninorth_agp_dev = qdev_new(TYPE_UNI_NORTH_AGP_HOST_BRIDGE);
+        qdev_prop_set_bit(uninorth_agp_dev, "real-irq-map", rom_is_flash);
         s = SYS_BUS_DEVICE(uninorth_agp_dev);
         sysbus_realize_and_unref(s, &error_fatal);
         sysbus_mmio_map(s, 0, 0xf0800000);
         sysbus_mmio_map(s, 1, 0xf0c00000);
+        /*
+         * AGP bus memory window (see pci_unin_agp_init()).  A card in the AGP
+         * slot gets its BARs assigned in here, so without this mapping the CPU
+         * cannot reach them at all and the display never lights up.  The I/O
+         * space matches the real /pci@f0000000 ranges, at low overlap priority
+         * so the fw_cfg registers mapped inside it keep their bytes.
+         */
+        sysbus_mmio_map(s, 2, 0x90000000);
+        memory_region_add_subregion_overlap(get_system_memory(), 0xf0000000,
+                                            sysbus_mmio_get_region(s, 3), -1);
+        core99_machine->agp_bus = PCI_HOST_BRIDGE(uninorth_agp_dev)->bus;
 
         /* Uninorth internal bus */
         uninorth_internal_dev = qdev_new(
                                 TYPE_UNI_NORTH_INTERNAL_PCI_HOST_BRIDGE);
+        qdev_prop_set_bit(uninorth_internal_dev, "real-irq-map", rom_is_flash);
+        qdev_prop_set_bit(uninorth_internal_dev, "no-self-func", true);
         s = SYS_BUS_DEVICE(uninorth_internal_dev);
         sysbus_realize_and_unref(s, &error_fatal);
         sysbus_mmio_map(s, 0, 0xf4800000);
         sysbus_mmio_map(s, 1, 0xf4c00000);
+        /* The real pci@f4000000's one memory window (its ranges prop) */
+        sysbus_mmio_map(s, 2, 0xf5000000);
 
         /* Uninorth main bus - this must be last to make it the default */
         uninorth_pci_dev = qdev_new(TYPE_UNI_NORTH_PCI_HOST_BRIDGE);
         qdev_prop_set_uint32(uninorth_pci_dev, "ofw-addr", 0xf2000000);
+        qdev_prop_set_bit(uninorth_pci_dev, "real-irq-map", rom_is_flash);
         s = SYS_BUS_DEVICE(uninorth_pci_dev);
         sysbus_realize_and_unref(s, &error_fatal);
         sysbus_mmio_map(s, 0, 0xf2800000);
@@ -1205,23 +1226,54 @@ static void ppc_core99_init(MachineState *machine)
         kick = qemu_allocate_irq(cpu_kick, cpus[3], 3);
         sysbus_connect_irq(s, 16, kick);
     }
-    for (i = 0; i < 4; i++) {
-        qdev_connect_gpio_out(uninorth_pci_dev, i,
-                              qdev_get_gpio_in(pic_dev, 0x1b + i));
+    /*
+     * The Apple ROM hands the guest the real machine's interrupt maps, so in
+     * that mode the slots interrupt where those tables say they do; OpenBIOS
+     * builds its own tree around the legacy four-line hash.
+     */
+    if (rom_is_flash) {
+        static const int real_pci_irqs[7] = {
+            0x34, 0x35, 0x36, 0x3a, 0x1b, 0x1c, 0x3f
+        };
+
+        for (i = 0; i < ARRAY_SIZE(real_pci_irqs); i++) {
+            qdev_connect_gpio_out(uninorth_pci_dev, i,
+                                  qdev_get_gpio_in(pic_dev,
+                                                   real_pci_irqs[i]));
+        }
+    } else {
+        for (i = 0; i < 4; i++) {
+            qdev_connect_gpio_out(uninorth_pci_dev, i,
+                                  qdev_get_gpio_in(pic_dev, 0x1b + i));
+        }
     }
 
     /* TODO: additional PCI buses only wired up for 32-bit machines */
     if (PPC_INPUT(env) != PPC_FLAGS_INPUT_970) {
         /* Uninorth AGP bus */
-        for (i = 0; i < 4; i++) {
-            qdev_connect_gpio_out(uninorth_agp_dev, i,
-                                  qdev_get_gpio_in(pic_dev, 0x1b + i));
+        if (rom_is_flash) {
+            /* The AGP slot (device 0x10) is the real map's only entry */
+            qdev_connect_gpio_out(uninorth_agp_dev, 0,
+                                  qdev_get_gpio_in(pic_dev, 0x30));
+        } else {
+            for (i = 0; i < 4; i++) {
+                qdev_connect_gpio_out(uninorth_agp_dev, i,
+                                      qdev_get_gpio_in(pic_dev, 0x1b + i));
+            }
         }
 
         /* Uninorth internal bus */
-        for (i = 0; i < 4; i++) {
-            qdev_connect_gpio_out(uninorth_internal_dev, i,
-                                  qdev_get_gpio_in(pic_dev, 0x1b + i));
+        if (rom_is_flash) {
+            /* Real pci@f4000000 map: slots 0x0e/0x0f */
+            qdev_connect_gpio_out(uninorth_internal_dev, 0,
+                                  qdev_get_gpio_in(pic_dev, 0x28));
+            qdev_connect_gpio_out(uninorth_internal_dev, 1,
+                                  qdev_get_gpio_in(pic_dev, 0x29));
+        } else {
+            for (i = 0; i < 4; i++) {
+                qdev_connect_gpio_out(uninorth_internal_dev, i,
+                                      qdev_get_gpio_in(pic_dev, 0x1b + i));
+            }
         }
     }
 
@@ -1367,6 +1419,16 @@ static void ppc_core99_init(MachineState *machine)
     core99_report_boot_device(nvr);
     /* No PCI init: the BIOS will do it */
 
+    /*
+     * Real PM34 hardware's onboard FireWire (11c1:5811), at
+     * /pci@f4000000/firewire@e.  A stub: Apple Hardware Test's Core99
+     * FireWire TCM needs the node to exist before it can test it.
+     */
+    if (rom_is_flash && uninorth_internal_dev) {
+        pci_create_simple(PCI_HOST_BRIDGE(uninorth_internal_dev)->bus,
+                          PCI_DEVFN(0x0e, 0), "mac99-firewire-stub");
+    }
+
     dev = qdev_new(TYPE_FW_CFG_MEM);
     fw_cfg = FW_CFG(dev);
     qdev_prop_set_uint32(dev, "data_width", 1);
@@ -1472,6 +1534,52 @@ static int core99_kvm_type(MachineState *machine, const char *arg)
     return 2;
 }
 
+#define CORE99_AGP_SLOT 0x10
+
+/*
+ * The AGP bus has one slot, device 0x10.  A real Apple ROM only looks for
+ * its display there: a card anywhere else is sized and then abandoned, so a
+ * display card given no addr= is moved into it while that slot is free, and
+ * a card that can report an AGP identity (1002:5046) is told to.
+ */
+static bool core99_is_display_card(Core99MachineState *cms, DeviceState *dev)
+{
+    return cms->apple_rom && cms->agp_bus &&
+           object_dynamic_cast(OBJECT(dev), TYPE_PCI_DEVICE) &&
+           (PCI_DEVICE_GET_CLASS(dev)->class_id >> 8) ==
+               PCI_BASE_CLASS_DISPLAY;
+}
+
+static void core99_machine_device_pre_plug(HotplugHandler *hotplug_dev,
+                                           DeviceState *dev, Error **errp)
+{
+    Core99MachineState *cms = CORE99_MACHINE(hotplug_dev);
+    PCIDevice *pci_dev = PCI_DEVICE(dev);
+    int agp_devfn = PCI_DEVFN(CORE99_AGP_SLOT, 0);
+
+    if (pci_dev->devfn == -1 && !cms->agp_bus->devices[agp_devfn]) {
+        if (qdev_get_parent_bus(dev) != BUS(cms->agp_bus) &&
+            !qdev_set_parent_bus(dev, BUS(cms->agp_bus), errp)) {
+            return;
+        }
+        pci_dev->devfn = agp_devfn;
+    }
+    if (qdev_get_parent_bus(dev) == BUS(cms->agp_bus) &&
+        pci_dev->devfn == agp_devfn &&
+        object_property_find(OBJECT(dev), "agp")) {
+        object_property_set_bool(OBJECT(dev), "agp", true, errp);
+    }
+}
+
+static HotplugHandler *core99_get_hotplug_handler(MachineState *machine,
+                                                  DeviceState *dev)
+{
+    if (core99_is_display_card(CORE99_MACHINE(machine), dev)) {
+        return HOTPLUG_HANDLER(machine);
+    }
+    return NULL;
+}
+
 /*
  * PowerMac3,6's CPU is a 7455, not the 7400 the other models default to.
  * Hooking get_default_cpu_type means an explicit -cpu still wins.
@@ -1489,6 +1597,7 @@ static void core99_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
     FWPathProviderClass *fwc = FW_PATH_PROVIDER_CLASS(oc);
+    HotplugHandlerClass *hc = HOTPLUG_HANDLER_CLASS(oc);
 
     mc->desc = "Mac99 based PowerMac";
     mc->init = ppc_core99_init;
@@ -1508,6 +1617,8 @@ static void core99_machine_class_init(ObjectClass *oc, const void *data)
     mc->default_ram_id = "ppc_core99.ram";
     mc->ignore_boot_device_suffixes = true;
     fwc->get_dev_path = core99_fw_dev_path;
+    mc->get_hotplug_handler = core99_get_hotplug_handler;
+    hc->pre_plug = core99_machine_device_pre_plug;
 }
 
 static char *core99_get_via_config(Object *obj, Error **errp)
@@ -1601,6 +1712,7 @@ static const TypeInfo core99_machine_info = {
     .instance_size = sizeof(Core99MachineState),
     .interfaces = (const InterfaceInfo[]) {
         { TYPE_FW_PATH_PROVIDER },
+        { TYPE_HOTPLUG_HANDLER },
         { }
     },
 };
