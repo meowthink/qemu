@@ -613,10 +613,15 @@ static void register_74xx_sprs(CPUPPCState *env)
                  SPR_NOACCESS, SPR_NOACCESS,
                  &spr_read_generic, &spr_write_generic,
                  0x00000000);
-    /* Hardware implementation registers */
+    /*
+     * Hardware implementation registers. See spr_read_hid0_74xx(): HID0's
+     * L1 cache flash-invalidate bits self-clear on real hardware and must be
+     * masked on read, or the ROM's L1-cache-enable readback poll never sees
+     * the invalidate complete.
+     */
     spr_register(env, SPR_HID0, "HID0",
                  SPR_NOACCESS, SPR_NOACCESS,
-                 &spr_read_generic, &spr_write_generic,
+                 &spr_read_hid0_74xx, &spr_write_generic,
                  0x00000000);
 
     spr_register(env, SPR_HID1, "HID1",
@@ -629,9 +634,14 @@ static void register_74xx_sprs(CPUPPCState *env)
                  &spr_read_generic, &spr_write_generic,
                  0x00000000);
 
+    /*
+     * A storing write handler, so the L2-enable sequence can read back what
+     * it just wrote; see spr_read_l2cr() for why the invalidate handshake
+     * bits are masked out of reads instead of out of writes.
+     */
     spr_register(env, SPR_L2CR, "L2CR",
                  SPR_NOACCESS, SPR_NOACCESS,
-                 &spr_read_generic, spr_access_nop,
+                 &spr_read_l2cr, &spr_write_generic,
                  0x00000000);
 }
 

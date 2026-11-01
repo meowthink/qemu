@@ -463,6 +463,60 @@ void spr_write_generic(DisasContext *ctx, int sprn, int gprn)
     spr_store_dump_spr(sprn);
 }
 
+/*
+ * L2CR drives the 74xx's external L2 cache. Writes have to stick: the
+ * standard bring-up sequence enables the cache and then reads L2CR back to
+ * confirm the write took, so discarding it (the generic upstream default,
+ * harmless for targets that never read it back) makes that check fail -- the
+ * real PowerMac3,4 ROM's power-on self test reports an external cache
+ * failure and sets a bit in /diagnostics/post-results, which classic Mac OS
+ * surfaces as "a problem with cache memory".
+ *
+ * The global-invalidate handshake still has to look finished, though. L2IP
+ * is hardware status that is set while an invalidate runs and cleared when
+ * it completes, and on the 7450 family L2I itself is cleared by hardware at
+ * completion; there is no cache to invalidate here, so both must read back
+ * clear or a firmware poll loop spins forever.
+ *
+ * Mask on the read side rather than stripping the bits as they are written:
+ * write-side masking stops the register holding what software stored, which
+ * breaks anything comparing a readback and corrupts the bits that should
+ * round-trip.
+ */
+#define L2CR_L2I    0x00200000  /* global invalidate */
+#define L2CR_L2IP   0x00000001  /* invalidate in progress */
+
+void spr_read_l2cr(DisasContext *ctx, int gprn, int sprn)
+{
+    gen_load_spr(cpu_gpr[gprn], sprn);
+    tcg_gen_andi_tl(cpu_gpr[gprn], cpu_gpr[gprn],
+                    ~(target_ulong)(L2CR_L2I | L2CR_L2IP));
+}
+
+/*
+ * HID0[ICFI]/[DCFI] (L1 instruction/data cache flash invalidate) are the
+ * same class of self-clearing status bit as L2CR's L2I/L2IP above: real 74xx
+ * hardware clears each one on the cycle after the write that set it
+ * (MPC7450 Family User's Manual Table 2-6). The generic storing handler
+ * leaves it set forever, so the ROM's L1-cache-enable sequence -- set
+ * ICE/ICFI (or DCE/DCFI) together, then read HID0 back to confirm the
+ * invalidate completed before trusting the cache -- never observes
+ * completion. That is the L1 counterpart of the L2CR failure above.
+ *
+ * Mask on the read side, not the write side, for the same reason as
+ * spr_read_l2cr(): every other HID0 bit (ICE, DCE, BTIC, and so on) must
+ * still round-trip exactly as software wrote it.
+ */
+#define HID0_ICFI   0x00000800  /* instruction cache flash invalidate */
+#define HID0_DCFI   0x00000400  /* data cache flash invalidate */
+
+void spr_read_hid0_74xx(DisasContext *ctx, int gprn, int sprn)
+{
+    gen_load_spr(cpu_gpr[gprn], sprn);
+    tcg_gen_andi_tl(cpu_gpr[gprn], cpu_gpr[gprn],
+                    ~(target_ulong)(HID0_ICFI | HID0_DCFI));
+}
+
 void spr_write_generic32(DisasContext *ctx, int sprn, int gprn)
 {
 #ifdef TARGET_PPC64

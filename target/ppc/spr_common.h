@@ -81,6 +81,8 @@ void _spr_register(CPUPPCState *env, int num, const char *name,
 void spr_noaccess(DisasContext *ctx, int gprn, int sprn);
 void spr_read_generic(DisasContext *ctx, int gprn, int sprn);
 void spr_write_generic(DisasContext *ctx, int sprn, int gprn);
+void spr_read_l2cr(DisasContext *ctx, int gprn, int sprn);
+void spr_read_hid0_74xx(DisasContext *ctx, int gprn, int sprn);
 void spr_write_generic32(DisasContext *ctx, int sprn, int gprn);
 void spr_core_write_generic(DisasContext *ctx, int sprn, int gprn);
 void spr_core_write_generic32(DisasContext *ctx, int sprn, int gprn);
