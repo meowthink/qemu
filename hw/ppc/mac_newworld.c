@@ -247,53 +247,146 @@ static void core99_cpu_defaults(const Core99MachineState *cms,
 }
 
 /*
- * The DIMM SPD EEPROMs at 0x50 + slot, which is how a real Apple ROM sizes
- * RAM -- it never asks QEMU.  One donor module's geometry bytes are patched
- * and its byte-63 checksum re-summed per slot, so every -m has images.
+ * The DIMMs, their banks, and their SPD EEPROMs, at 0x50 + slot on the
+ * UniNorth/U3 I2C bus.  A real Apple ROM never asks firmware for the RAM
+ * size: it reads the SPDs itself and programs the memory controller from
+ * them, so the machine has to present a population that adds up to -m,
+ * with one SPD image per module and its byte-63 checksum.
+ *
+ * Two populations, selected by u3:
+ *
+ *  - G4 (UniNorth): the model's donor module -- a real dump from that
+ *    machine -- with its geometry bytes patched, one module per slot.
+ *    Unchanged from what this machine has always attached.
+ *
+ *  - G5 (U3): the PowerMac7,3 ROM reads *two* SPD addresses per memory
+ *    bank (0x50/0x51, 0x52/0x53, ...) and rejects the bank unless both
+ *    answer with the same module, i.e. it wants the matched pairs a real
+ *    G5 requires.  So a U3 bank is two identical modules.  The donor is a
+ *    PC133 SDR module and that ROM requires DDR (SPD byte 2 == 7 at
+ *    0xf84af4/0xf84b08) with a tCK that fits the memory clock it decodes
+ *    from U3 0xf8000f60, so the SPD is synthesized as DDR400 instead.
  */
-static void core99_add_spd_dimms(const Core99MachineState *cms, I2CBus *bus,
-                                 uint64_t ram_size)
+#define MAC99_U3_DIMM_SLOTS 8
+
+typedef struct Mac99DimmGeom {
+    unsigned mb;        /* module capacity */
+    unsigned rows;      /* SPD byte 3 */
+    unsigned cols;      /* SPD byte 4 */
+    unsigned ranks;     /* SPD byte 5 */
+    unsigned density;   /* SPD byte 31: the donor's per-rank MB / 4 convention */
+} Mac99DimmGeom;
+
+/* The donor modules' own SDR geometries. */
+static const Mac99DimmGeom core99_spd_geom_sdr[] = {
+    { 512, 13, 10, 2, 0x40 },
+    { 256, 13, 10, 1, 0x40 },
+    { 128, 12, 10, 1, 0x20 },
+    {  64, 12,  9, 1, 0x10 },
+    {  32, 11,  9, 1, 0x08 },
+};
+
+/*
+ * The DDR geometries, keyed to the G5 ROM's own capacity table: the lookup
+ * at 0xf84788 matches SPD bytes 3 (rows), 4 (columns) and 17 (banks per
+ * device) against the 4-byte entries at 0xf84804..0xf84820 -- {12,9},
+ * {12,10}, {13,10}, {13,11}, {14,11}, all with 4 banks per device -- and
+ * returns 2^(entry byte 3 + 1) as the module capacity, so these are the
+ * geometries that make it recompute the capacity we mean.
+ */
+static const Mac99DimmGeom core99_spd_geom_ddr[] = {
+    { 2048, 14, 11, 2, 0x80 },
+    { 1024, 13, 11, 2, 0x80 },
+    {  512, 13, 10, 2, 0x40 },
+    {  256, 12, 10, 1, 0x40 },
+    {  128, 12,  9, 1, 0x20 },
+};
+
+/*
+ * Build one module's SPD image.  donor != NULL patches a real dump (the G4
+ * path); donor == NULL synthesizes a DDR400 module whose bytes are the ones
+ * the G5 ROM decodes: 2 = 7 (DDR), 9 = 0x50 (tCK 5.0ns), 12 = 0x82
+ * (refresh) and the timing bytes 27/29/30/42 it folds into the memory
+ * controller's word.
+ */
+static void core99_dimm_spd(uint8_t spd[MAC_SPD_SIZE],
+                            const Mac99DimmGeom *geom, const uint8_t *donor)
 {
-    static const struct {
-        unsigned mb, rows, cols, ranks, density;
-    } spd_geom[] = {
-        { 512, 13, 10, 2, 0x40 },
-        { 256, 13, 10, 1, 0x40 },
-        { 128, 12, 10, 1, 0x20 },
-        {  64, 12,  9, 1, 0x10 },
-        {  32, 11,  9, 1, 0x08 },
-    };
+    unsigned sum, i;
+
+    if (donor) {
+        memcpy(spd, donor, MAC_SPD_SIZE);
+    } else {
+        memset(spd, 0, MAC_SPD_SIZE);
+        spd[0]  = 0x80;     /* bytes written */
+        spd[1]  = 0x08;     /* 2^8 bytes of SPD */
+        spd[2]  = 0x07;     /* DDR SDRAM */
+        spd[6]  = 0x40;     /* 64-bit data width */
+        spd[8]  = 0x04;     /* SSTL-2 */
+        spd[9]  = 0x50;     /* tCK 5.0ns, DDR400 CL3 */
+        spd[10] = 0x50;     /* tAC 0.5ns */
+        spd[12] = 0x82;     /* 7.8us refresh, self refresh */
+        spd[13] = 0x08;     /* x8 devices */
+        spd[17] = 0x04;     /* 4 banks per device */
+        spd[18] = 0x1c;     /* CL 2 / 2.5 / 3 */
+        spd[27] = 0x3c;     /* tRP  60ns */
+        spd[29] = 0x3c;     /* tRAS 60ns */
+        spd[30] = 0x50;     /* tRC  80ns */
+        spd[42] = 0x3c;     /* tRFC */
+        spd[62] = 0x0d;     /* SPD revision 1.0 */
+    }
+    spd[3]  = geom->rows;
+    spd[4]  = geom->cols;
+    spd[5]  = geom->ranks;
+    spd[31] = geom->density;
+    for (sum = 0, i = 0; i < 63; i++) {
+        sum += spd[i];
+    }
+    spd[63] = sum & 0xff;
+}
+
+static void core99_add_spd_dimms(const Core99MachineState *cms, I2CBus *bus,
+                                 uint64_t ram_size, bool u3)
+{
     const Core99ModelInfo *model = core99_model_info(cms);
+    const Mac99DimmGeom *geom = u3 ? core99_spd_geom_ddr
+                                   : core99_spd_geom_sdr;
+    const uint8_t *donor = u3 ? NULL : model->spd_donor;
+    unsigned ngeom = u3 ? ARRAY_SIZE(core99_spd_geom_ddr)
+                        : ARRAY_SIZE(core99_spd_geom_sdr);
+    unsigned slots = u3 ? MAC99_U3_DIMM_SLOTS : model->spd_slots;
+    /*
+     * A U3 bank is the pair of modules the G5 ROM insists on; the G4 ROM
+     * reads one SPD per slot and lets the modules differ.
+     */
+    unsigned per_bank = u3 ? 2 : 1;
     uint64_t left = ram_size;
-    int slot = 0;
-    unsigned g = 0;
+    unsigned slot = 0, g = 0, bank = 0;
 
-    while (left && slot < model->spd_slots && g < ARRAY_SIZE(spd_geom)) {
-        uint8_t spd[MAC_SPD_SIZE];
-        unsigned sum, b;
+    while (left && slot + per_bank <= slots && g < ngeom) {
+        uint64_t want = (uint64_t)geom[g].mb * MiB * per_bank;
+        unsigned i;
 
-        if (left < (uint64_t)spd_geom[g].mb * MiB) {
+        if (left < want) {
             g++;
             continue;
         }
-        memcpy(spd, model->spd_donor, MAC_SPD_SIZE);
-        spd[3] = spd_geom[g].rows;
-        spd[4] = spd_geom[g].cols;
-        spd[5] = spd_geom[g].ranks;
-        spd[31] = spd_geom[g].density;
-        for (sum = 0, b = 0; b < 63; b++) {
-            sum += spd[b];
+        for (i = 0; i < per_bank; i++) {
+            uint8_t spd[MAC_SPD_SIZE];
+
+            core99_dimm_spd(spd, &geom[g], donor);
+            at24c_eeprom_init_rom(bus, 0x50 + slot + i, MAC_SPD_SIZE, spd,
+                                  MAC_SPD_SIZE);
         }
-        spd[63] = sum & 0xff;
-        at24c_eeprom_init_rom(bus, 0x50 + slot, MAC_SPD_SIZE, spd,
-                              MAC_SPD_SIZE);
-        left -= (uint64_t)spd_geom[g].mb * MiB;
-        slot++;
+        trace_mac99_dimm_bank(bank, geom[g].mb, per_bank, 0x50 + slot);
+        slot += per_bank;
+        bank++;
+        left -= want;
     }
     if (left) {
         warn_report("mac99: %" PRIu64 "MB of RAM not representable as "
                     "1-%u %s DIMMs; the firmware will see %" PRIu64 "MB",
-                    left / MiB, model->spd_slots, model->name,
+                    left / MiB, slots, model->name,
                     (ram_size - left) / MiB);
     }
 }
@@ -1133,11 +1226,17 @@ static void ppc_core99_init(MachineState *machine)
      * Tangent schematic labels it "ADDRESS = 6 (AC/AD)" next to the module
      * connector's I2C pins, i.e. 8-bit 0xac/0xad, 7-bit 0x56. A real Apple
      * ROM reads it during bring-up and refuses to continue without it.
+     * The U3's memory banks take 0x50..0x57, so on the G5 0x56 belongs to
+     * DIMM slot 3 and is left to the population in core99_add_spd_dimms().
      */
     unin_i2c = UNI_NORTH(s)->i2c.bus;
-    at24c_eeprom_init_rom(unin_i2c, 0x56, 256, NULL, 0);
+    if (PPC_INPUT(env) != PPC_FLAGS_INPUT_970) {
+        at24c_eeprom_init_rom(unin_i2c, 0x56, 256, NULL, 0);
+    }
 
-    core99_add_spd_dimms(core99_machine, unin_i2c, machine->ram_size);
+    /* The DIMM banks and their SPD images; see core99_add_spd_dimms(). */
+    core99_add_spd_dimms(core99_machine, unin_i2c, machine->ram_size,
+                         PPC_INPUT(env) == PPC_FLAGS_INPUT_970);
 
     if (PPC_INPUT(env) == PPC_FLAGS_INPUT_970) {
         machine_arch = ARCH_MAC99_U3;

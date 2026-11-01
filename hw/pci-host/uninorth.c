@@ -1413,6 +1413,21 @@ static uint64_t unin_read(void *opaque, hwaddr addr, unsigned size)
         s->regs[0x60] = 1;
     }
 
+    /*
+     * The PowerMac7,3 ROM reads its memory clock from 0xf8000f60: it takes
+     * bits 12-15 as an index 8..15 into a 133..250MHz table (0xc100c13c,
+     * which the ROM itself programs, encodes index 12) and derives how fast
+     * a DIMM's tCK field may be before it refuses the module.  Reading zero
+     * makes it index off the end of that table into its own code, pick a
+     * bogus threshold and reject every DIMM, so the ROM then sizes RAM as
+     * zero and parks before the console.  Default to index 12 = 200MHz so
+     * the U3 pairs with the DDR400 SPDs core99_add_spd_dimms synthesizes.
+     */
+    if (s->version == U3_VERSION_23 &&
+        !(s->regs[0xf60] | s->regs[0xf61] | s->regs[0xf62] | s->regs[0xf63])) {
+        s->regs[0xf62] = 0xc0;
+    }
+
     if (addr == 0) {
         value = s->version;
     } else {
