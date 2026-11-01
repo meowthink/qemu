@@ -2290,7 +2290,20 @@ static int ppc_next_unmasked_interrupt(CPUPPCState *env)
 void ppc_maybe_interrupt(CPUPPCState *env)
 {
     CPUState *cs = env_cpu(env);
+
+    /*
+     * With no pending IRQ, an MSR store has nothing to do. ppc_set_irq()
+     * rechecks the MSR under the BQL; the barriers close the race.
+     */
+    if (!bql_locked()) {
+        smp_mb();
+        if (!qatomic_read(&env->pending_interrupts) &&
+            !cpu_test_interrupt(cs, CPU_INTERRUPT_HARD)) {
+            return;
+        }
+    }
     BQL_LOCK_GUARD();
+    smp_mb(); /* pairs with the one above, after ppc_set_irq()'s store */
 
     if (ppc_next_unmasked_interrupt(env)) {
         cpu_interrupt(cs, CPU_INTERRUPT_HARD);
