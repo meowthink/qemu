@@ -351,7 +351,7 @@ static void pmu_cmd_get_version(PMUState *s,
                                 uint8_t *out_data, uint8_t *out_len)
 {
     *out_len = 1;
-    *out_data = 1; /* ??? Check what Apple does */
+    *out_data = 0x14; /* PMU99 version for KeyLargo/Core99 */
 }
 
 static void pmu_cmd_power_events(PMUState *s,
