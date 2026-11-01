@@ -198,7 +198,7 @@ static uint64_t macio_gpio_read(void *opaque, hwaddr addr, unsigned size)
             val = s->gpio_regs[addr];
         }
     }
-    
+
     return val;
 }
 
@@ -248,6 +248,16 @@ static void macio_gpio_reset(DeviceState *dev)
     macio_set_gpio(s, 1, true);
     /* GPIO 3 is up by default */
     macio_set_gpio(s, 3, true);
+
+    /*
+     * The K2 (G5) pulls GPIO 9 up.  The PowerMac7,2/7,3 BootROM reads its
+     * input bit -- mac-io + 0x61 bit 1, i.e. 0x58 + line 9 (AppleK2.h
+     * kK2GPIOBase = 0x58) -- and will not leave its POST loop until the bit
+     * is high.
+     */
+    if (s->k2) {
+        macio_set_gpio(s, 9, true);
+    }
     
     /* 
      * CPU reset GPIOs (4, 15, 16) are NOT initialized here.
