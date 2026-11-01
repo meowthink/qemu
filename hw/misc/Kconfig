@@ -250,6 +250,14 @@ config ATHENS_CLOCKS
     bool
     depends on I2C
 
+config ANS_GRAND_CENTRAL
+    bool
+    select PCI
+    select MAC_DBDMA
+
+config HAMMERHEAD
+    bool
+
 config DJMEMC
     bool
 
