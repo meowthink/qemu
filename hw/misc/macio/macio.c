@@ -461,18 +461,31 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev, NEWWORLD_ESCCB_IRQ));
     sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, NEWWORLD_ESCCA_IRQ));
 
-    /* IDE buses */
+    /*
+     * IDE buses.  The channel numbers are not the "familiar" 0x16/0x1a:
+     * before the stride was corrected to the real-hardware 0x100
+     * (DBDMA_CHANNEL_SHIFT, see advances/repo-lineage/02) those numbers
+     * landed the mac-io IDE DMA registers at byte offsets 0x8b00/0x8d00,
+     * which is what OpenBIOS's hardcoded device tree advertises.  With the
+     * corrected stride the same numbers move to 0x9600/0x9a00, where no
+     * guest is looking -- a classic Mac OS IDE driver loads via PIO and then
+     * wedges the moment it starts a DMA.  0x0b/0x0d reproduce the offsets a
+     * guest expects, and are the channel numbers a real ROM's IDE DMA
+     * command is observed to program (cat7's macio legacy_layout[3]; the
+     * same correction is already carried for the Old World boards by
+     * advances/15-mac_oldworld-Gossamer-wiring.patch).
+     */
     if (!macio_realize_ide(s, &ns->ide[0],
                            qdev_get_gpio_in(pic_dev, NEWWORLD_IDE0_IRQ),
                            qdev_get_gpio_in(pic_dev, NEWWORLD_IDE0_DMA_IRQ),
-                           0x16, errp)) {
+                           0x0b, errp)) {
         return;
     }
 
     if (!macio_realize_ide(s, &ns->ide[1],
                            qdev_get_gpio_in(pic_dev, NEWWORLD_IDE1_IRQ),
                            qdev_get_gpio_in(pic_dev, NEWWORLD_IDE1_DMA_IRQ),
-                           0x1a, errp)) {
+                           0x0d, errp)) {
         return;
     }
 
