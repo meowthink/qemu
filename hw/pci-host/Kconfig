@@ -19,6 +19,10 @@ config RAVEN_PCI
     select PCI
     select OR_IRQ
 
+config BANDIT_PCI
+    bool
+    select PCI
+
 config GRACKLE_PCI
     select PCI
     bool
