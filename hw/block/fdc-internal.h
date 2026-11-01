@@ -93,6 +93,7 @@ struct FDCtrl {
     qemu_irq irq;
     /* Controller state */
     QEMUTimer *result_timer;
+    QEMUTimer *seek_timer;
     int dma_chann;
     uint8_t phase;
     IsaDma *dma;
