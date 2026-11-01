@@ -794,9 +794,16 @@ static int cirrus_do_copy(CirrusVGAState *s, int dst, int src, int w, int h)
     return 1;
 }
 
+/* ROPs that never read the source; drivers leave its pitch unprogrammed */
+static bool cirrus_rop_uses_src(uint8_t rop)
+{
+    return rop != CIRRUS_ROP_0 && rop != CIRRUS_ROP_1 &&
+           rop != CIRRUS_ROP_NOP && rop != CIRRUS_ROP_NOTDST;
+}
+
 static int cirrus_bitblt_videotovideo_copy(CirrusVGAState * s)
 {
-    if (blit_is_unsafe(s, false))
+    if (blit_is_unsafe(s, !cirrus_rop_uses_src(s->vga.gr[0x32])))
         return 0;
 
     return cirrus_do_copy(s, s->cirrus_blt_dstaddr - s->vga.params.start_addr,
@@ -1089,8 +1096,11 @@ static void cirrus_write_bitblt(CirrusVGAState * s, unsigned reg_value)
     if (((old_value & CIRRUS_BLT_RESET) != 0) &&
         ((reg_value & CIRRUS_BLT_RESET) == 0)) {
         cirrus_bitblt_reset(s);
-    } else if (((old_value & CIRRUS_BLT_START) == 0) &&
-               ((reg_value & CIRRUS_BLT_START) != 0)) {
+    }
+    /* Releasing reset and setting start in one write (NT driver) starts */
+    if (((old_value & CIRRUS_BLT_START) == 0) &&
+        ((reg_value & (CIRRUS_BLT_START | CIRRUS_BLT_RESET)) ==
+         CIRRUS_BLT_START)) {
         cirrus_bitblt_start(s);
     }
 }
@@ -2837,6 +2847,44 @@ static const MemoryRegionOps cirrus_vga_io_ops = {
     },
 };
 
+/*
+ * The 54M30's relocatable 512-byte VGA I/O range, decoded at the low byte of
+ * the port address.  This board straps the fixed $3B0 block in charge, so the
+ * window only has to reach the same registers.
+ */
+#define CIRRUS_54M30_IO_SPAN 0x200
+
+static uint64_t cirrus_54m30_io_read(void *opaque, hwaddr addr, unsigned size)
+{
+    uint8_t port = addr & 0xff;
+
+    if (port < 0xb0 || port > 0xdf) {
+        return 0xff;
+    }
+    return cirrus_vga_ioport_read(opaque, port - 0xb0, size);
+}
+
+static void cirrus_54m30_io_write(void *opaque, hwaddr addr, uint64_t val,
+                                  unsigned size)
+{
+    uint8_t port = addr & 0xff;
+
+    if (port < 0xb0 || port > 0xdf) {
+        return;
+    }
+    cirrus_vga_ioport_write(opaque, port - 0xb0, val, size);
+}
+
+static const MemoryRegionOps cirrus_54m30_io_ops = {
+    .read = cirrus_54m30_io_read,
+    .write = cirrus_54m30_io_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 1,
+    },
+};
+
 void cirrus_init_common(CirrusVGAState *s, Object *owner,
                         int device_id, int is_pci,
                         MemoryRegion *system_memory, MemoryRegion *system_io)
@@ -2917,6 +2965,11 @@ void cirrus_init_common(CirrusVGAState *s, Object *owner,
                           "cirrus-mmio", CIRRUS_PNPMMIO_SIZE);
     memory_region_set_flush_coalesced(&s->cirrus_mmio_io);
 
+    /* I/O handler for the 54M30's relocatable VGA I/O range (BAR1) */
+    memory_region_init_io(&s->cirrus_54m30_io, owner, &cirrus_54m30_io_ops, s,
+                          "cirrus-54m30-io", CIRRUS_54M30_IO_SPAN);
+    memory_region_set_flush_coalesced(&s->cirrus_54m30_io);
+
     s->real_vram_size =
         (s->device_id == CIRRUS_ID_CLGD5446) ? 4 * MiB : 2 * MiB;
 
@@ -2967,12 +3020,21 @@ static void pci_cirrus_vga_realize(PCIDevice *dev, Error **errp)
     s->vga.con = qemu_graphic_console_create(DEVICE(dev), 0, s->vga.hw_ops, &s->vga);
 
     /* setup PCI */
-    memory_region_init(&s->pci_bar, OBJECT(dev), "cirrus-pci-bar0", 0x2000000);
+    /*
+     * The 54M30 decodes a 16 MB aperture (Apple's Network Server notes; the
+     * reference model's own geometry), where QEMU's cirrus default is 32 MB.
+     * A driver that sizes the BAR sees the difference.
+     */
+    memory_region_init(&s->pci_bar, OBJECT(dev), "cirrus-pci-bar0",
+                       device_id == PCI_DEVICE_ID_CIRRUS_54M30 ? 0x1000000
+                                                               : 0x2000000);
 
     /* XXX: add byte swapping apertures */
     memory_region_add_subregion(&s->pci_bar, 0, &s->cirrus_linear_io);
-    memory_region_add_subregion(&s->pci_bar, 0x1000000,
-                                &s->cirrus_linear_bitblt_io);
+    if (device_id != PCI_DEVICE_ID_CIRRUS_54M30) {
+        memory_region_add_subregion(&s->pci_bar, 0x1000000,
+                                    &s->cirrus_linear_bitblt_io);
+    }
 
     /* setup memory space */
     /* memory #0 LFB */
@@ -2981,6 +3043,19 @@ static void pci_cirrus_vga_realize(PCIDevice *dev, Error **errp)
     pci_register_bar(&d->dev, 0, PCI_BASE_ADDRESS_MEM_PREFETCH, &s->pci_bar);
     if (device_id == CIRRUS_ID_CLGD5446) {
         pci_register_bar(&d->dev, 1, 0, &s->cirrus_mmio_io);
+    } else if (device_id == PCI_DEVICE_ID_CIRRUS_54M30) {
+        /* The 512-byte relocatable VGA I/O range, sized and assigned like
+         * any BAR; the registers behind it are the fixed $3B0 block's. */
+        pci_register_bar(&d->dev, 1, PCI_BASE_ADDRESS_SPACE_IO,
+                         &s->cirrus_54m30_io);
+        /*
+         * Only the I/O, memory and bus-master bits are writable in the
+         * Command register; the part's other bits are reserved and read
+         * back zero, which is what a driver's read-back test expects.
+         */
+        pci_set_word(d->dev.wmask + PCI_COMMAND,
+                     PCI_COMMAND_IO | PCI_COMMAND_MEMORY |
+                     PCI_COMMAND_MASTER);
     }
 }
 
@@ -3019,9 +3094,29 @@ static const TypeInfo cirrus_vga_info = {
     },
 };
 
+/*
+ * Apple's "54M30": a GD54M30-class part (1013:00a0) with 2 MB of VRAM and
+ * the older register set.  The ANS ROM's "MainLBU Video" test compares config
+ * dword 0 against $1013:00A0, so the device id is what makes the board POST.
+ */
+static void cirrus_vga_54m30_class_init(ObjectClass *klass, const void *data)
+{
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+
+    k->device_id = PCI_DEVICE_ID_CIRRUS_54M30;
+    k->romfile = NULL;
+}
+
+static const TypeInfo cirrus_vga_54m30_info = {
+    .name          = "cirrus-54m30",
+    .parent        = TYPE_PCI_CIRRUS_VGA,
+    .class_init    = cirrus_vga_54m30_class_init,
+};
+
 static void cirrus_vga_register_types(void)
 {
     type_register_static(&cirrus_vga_info);
+    type_register_static(&cirrus_vga_54m30_info);
 }
 
 type_init(cirrus_vga_register_types)

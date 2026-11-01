@@ -53,6 +53,7 @@ typedef struct CirrusVGAState {
     MemoryRegion cirrus_linear_io;
     MemoryRegion cirrus_linear_bitblt_io;
     MemoryRegion cirrus_mmio_io;
+    MemoryRegion cirrus_54m30_io;
     MemoryRegion pci_bar;
     bool linear_vram;  /* vga.vram mapped over cirrus_linear_io */
     MemoryRegion low_mem_container; /* container for 0xa0000-0xc0000 */
