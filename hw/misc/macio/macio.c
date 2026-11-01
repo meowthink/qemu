@@ -286,6 +286,16 @@ static const MemoryRegionOps timer_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+static void macio_escc_idle_dma_rw(DBDMA_io *io)
+{
+    DBDMA_park_writeback(io);
+}
+
+static void macio_escc_idle_dma_flush(DBDMA_io *io)
+{
+    /* No transfer is ever in progress, so there is nothing to flush. */
+}
+
 static void macio_newworld_realize(PCIDevice *d, Error **errp)
 {
     MacIOState *s = MACIO(d);
@@ -327,6 +337,28 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
     sysbus_realize_and_unref(sbd, &error_fatal);
     memory_region_add_subregion(&s->bar, 0x40000,
                                 sysbus_mmio_get_region(sbd, 0));
+
+    /*
+     * ESCC serial DMA channels (SCC-A tx/rx = 4/5, SCC-B tx/rx = 6/7).
+     * Registered so they don't inherit the generic unassigned-channel
+     * fallback, whose auto-completion misleads Mac OS 9.2's SerialDMA
+     * boot-time init (a drained RX ring that "succeeds" walks the driver
+     * into a deeper init stage it polls forever, freezing the boot at
+     * "Starting Up...").  See macio_escc_idle_dma_rw() for the
+     * request-line-never-asserted semantics these channels present instead.
+     */
+    for (int escc_ch = 4; escc_ch <= 7; escc_ch++) {
+        /*
+         * DMA interrupt sources from the real PowerMac3,4 device tree:
+         * ch-a (tx/rx = channels 4/5) raises 0x05/0x06, ch-b (6/7) raises
+         * 0x07/0x08 -- i.e. channel + 1.  The serial driver's post-drain
+         * state machine only advances from these interrupts.
+         */
+        DBDMA_register_channel(&s->dbdma, escc_ch,
+                               qdev_get_gpio_in(pic_dev, escc_ch + 1),
+                               macio_escc_idle_dma_rw,
+                               macio_escc_idle_dma_flush, NULL);
+    }
 
     /*
      * i2s-a's DBDMA channels (0 and 1): the interrupt sources are the
