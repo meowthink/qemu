@@ -72,6 +72,7 @@
 #include "hw/core/loader.h"
 #include "hw/core/fw-path-provider.h"
 #include "elf.h"
+#include <zlib.h>                /* adler32() for the CHRP nvram outer checksum */
 #include "qemu/error-report.h"
 #include "system/kvm.h"
 #include "system/reset.h"
@@ -133,6 +134,13 @@ static const MemoryRegionOps core99_rom_ops = {
  */
 #define ROM_WINDOW_BASE 0xff000000
 #define ROM_WINDOW_SIZE (16 * MiB)
+/*
+ * The L2 clock the boot-command graft publishes.  L2CR 0xb9000000 has
+ * L2CLK = divide-by-2 and the donor PowerMac3,4's backside cache runs at
+ * 233MHz off a 466.67MHz core; this tree has no model= property yet, so this
+ * is the constant the source branch used before its PM34/PM36 clock work.
+ */
+#define CORE99_L2CLOCK 233333332
 
 #define KERNEL_LOAD_ADDR 0x01000000
 #define KERNEL_GAP       0x00100000
@@ -413,6 +421,179 @@ static void core99_nvram_seed_if_blank(uint8_t *data, uint32_t size)
     }
     memcpy(&data[CORE99_NVRAM_TEMPLATE_SIZE], core99_nvram_flash_template,
           CORE99_NVRAM_TEMPLATE_SIZE);
+}
+
+static uint8_t core99_chrp_cksum(const uint8_t *hdr)
+{
+    unsigned int sum = hdr[0];
+    int i;
+
+    for (i = 0; i < 14; i++) {
+        sum += hdr[2 + i];
+        sum = (sum + ((sum & 0xff00) >> 8)) & 0xff;
+    }
+    return sum & 0xff;
+}
+
+/*
+ * Make the built-in gmac usable under Mac OS by publishing its MAC on the
+ * Open Firmware ethernet node, and graft the missing L2-cache device-tree
+ * data so Mac OS stops reporting a cache fault.
+ *
+ * Mac OS (classic AppleTalk/OT and OS X's AppleGMACEthernet) reads the
+ * Ethernet MAC solely from the OF "local-mac-address" property and will not
+ * create en0 without it; a "built-in" property additionally makes it show as
+ * "Built-in Ethernet" rather than a PCI slot.  The real Apple ROM's own gmac
+ * driver never publishes these, so they are injected through the OF
+ * "boot-command" variable, honouring whatever MAC the gmac was given on the
+ * command line (or QEMU's default when none was specified).
+ *
+ * A real PowerMac3,4 publishes /cpus/PowerPC,G4@0/l2cr = 0xb9000000 and a
+ * child "l2-cache" node (1MB unified, 64-byte lines, 0x2000 sets, 233MHz --
+ * verbatim from a real PowerMac3,4 lsprop dump).  With the 74xx L2CR/HID0
+ * read-side fixes (repo-lineage/10) the CPU now reports sane values, but the
+ * ROM's own L2 bring-up/POST still never runs on QEMU's transparent memory
+ * model, so the device tree ends up with neither property and
+ * /diagnostics/post-results (the POST failure bitmask a real healthy Mac
+ * reads back as 0x00000000) is left non-zero -- which is what Mac OS
+ * surfaces as "a problem with cache memory".  Graft both: the l2cr/l2-cache
+ * data a real machine has, and a zeroed post-results, so Mac OS sees exactly
+ * what a passing POST would have produced.
+ *
+ * boot-command (not nvramrc) is used deliberately: nvramrc runs before
+ * probe-all, when /pci@f4000000/ethernet@f does not yet exist; boot-command
+ * runs at the end of start-up, after the PCI ethernet node has been probed
+ * and after /diagnostics/post-results has already been written by the ROM's
+ * own (failing) POST, so it is the right point to overwrite both.
+ *
+ * The nvram is Apple/CHRP format: an 8KB image mirrored inside the 16KB
+ * flash, OF variables stored as name=value NUL strings in the "common"
+ * partition.  Every edit must fix both the per-partition header checksum and
+ * the outer Adler32 (at copy+0x10, over [copy+0x14 : copy+0x2000]); without
+ * the latter the ROM rejects the image ("NVRAM corrupted") and wipes it.
+ */
+static void core99_nvram_set_bootcmd(uint8_t *data, uint32_t size,
+                                     const uint8_t *mac, uint32_t l2clock)
+{
+    const uint32_t COPY = 0x2000;
+    /* gmac graft, only when a MAC is supplied (i.e. a sungem is present) */
+    g_autofree char *gmac = mac ? g_strdup_printf(
+        "dev /pci@f4000000/ethernet@f "
+        "here h# %02x over c! 1+ h# %02x over c! 1+ h# %02x over c! 1+ "
+        "h# %02x over c! 1+ h# %02x over c! 1+ h# %02x swap c! "
+        "here 6 encode-bytes \" local-mac-address\" property "
+        "0 0 encode-bytes \" built-in\" property device-end ",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]) : g_strdup("");
+    /*
+     * The l2-cache node's own clock-frequency is not a constant: L2CR
+     * 0xb9000000 has L2CLK = divide-by-2, so the backside cache runs at half
+     * the core clock and the property has to follow whatever that is.  The
+     * donor PowerMac3,4's 233MHz is exactly 466.67/2; raise the core and this
+     * must move with it or the grafted node contradicts the l2cr beside it.
+     */
+    g_autofree char *l2clk = g_strdup_printf(
+        "h# %x encode-int \" clock-frequency\" property ", l2clock);
+    g_autofree char *bootcmd = g_strconcat("boot-command=", gmac,
+        "dev /cpus/PowerPC,G4@0 "
+        "h# b9000000 encode-int \" l2cr\" property "
+        "new-device \" l2-cache\" device-name \" cache\" device-type ",
+        l2clk,
+        "0 0 encode-bytes \" cache-unified\" property "
+        "h# 40 encode-int \" d-cache-line-size\" property "
+        "h# 40 encode-int \" i-cache-line-size\" property "
+        "h# 2000 encode-int \" d-cache-sets\" property "
+        "h# 2000 encode-int \" i-cache-sets\" property "
+        "h# 100000 encode-int \" d-cache-size\" property "
+        "h# 100000 encode-int \" i-cache-size\" property "
+        "finish-device device-end "
+        "dev /diagnostics 0 encode-int \" post-results\" property "
+        "device-end mac-boot", NULL);
+    uint32_t base;
+
+    for (base = 0; base + COPY <= size; base += COPY) {
+        uint32_t off;
+
+        /* Replace boot-command in this copy's "common" partition. */
+        for (off = base; off + 16 <= base + COPY; ) {
+            uint32_t plen = (((data[off + 2] << 8) | data[off + 3]) * 16);
+
+            if (plen == 0) {
+                break;
+            }
+            if (data[off] == 0x70 &&
+                memcmp(&data[off + 4], "common", 6) == 0) {
+                uint32_t dstart = off + 16, dlen = plen - 16, i;
+                GString *vars = g_string_new(NULL);
+                bool seen = false;
+
+                for (i = dstart; i < dstart + dlen && data[i]; ) {
+                    const char *v = (const char *)&data[i];
+                    size_t vl = strnlen(v, dstart + dlen - i);
+
+                    if (!strncmp(v, "boot-command=", 13)) {
+                        g_string_append(vars, bootcmd);
+                        seen = true;
+                    } else {
+                        g_string_append_len(vars, v, vl);
+                    }
+                    g_string_append_c(vars, '\0');
+                    i += vl + 1;
+                }
+                if (!seen) {
+                    g_string_append(vars, bootcmd);
+                    g_string_append_c(vars, '\0');
+                }
+                g_string_append_c(vars, '\0');   /* end-of-list marker */
+
+                if (vars->len <= dlen) {
+                    memset(&data[dstart], 0, dlen);
+                    memcpy(&data[dstart], vars->str, vars->len);
+                    data[off + 1] = core99_chrp_cksum(&data[off]);
+                } else {
+                    warn_report("nvram: vars too large, "
+                                "boot-command graft not applied");
+                }
+                g_string_free(vars, TRUE);
+                break;
+            }
+            off += plen;
+        }
+
+        /* Fix the outer Adler32 in this copy's "nvram" (0x5a) header. */
+        if (data[base] == 0x5a && !memcmp(&data[base + 4], "nvram", 5)) {
+            /* Standard Adler-32 (initial value 1), as the real Apple ROM uses */
+            uint32_t a = adler32(1, &data[base + 0x14], COPY - 0x14);
+
+            stl_be_p(&data[base + 0x10], a);
+        }
+    }
+}
+
+/*
+ * Seed a blank flash image and graft the boot-command.  The FireWire GUID and
+ * AGP-slot-enable grafts of the source branch are PM34-specific (they need
+ * the firewire stub and the AGP work); the cache and gmac grafts are the two
+ * that apply to any mac99.
+ */
+static void core99_nvram_graft(MacIONVRAMState *nvr)
+{
+    Object *o = object_resolve_path_type("", "sungem", NULL);
+    g_autofree char *macstr = o ? object_property_get_str(o, "mac", NULL)
+                                : NULL;
+    uint8_t mac[6];
+    bool have_mac = false;
+
+    if (!nvr->data) {
+        return;
+    }
+    if (macstr && sscanf(macstr, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+                         &mac[0], &mac[1], &mac[2], &mac[3], &mac[4],
+                         &mac[5]) == 6) {
+        have_mac = true;
+    }
+    core99_nvram_seed_if_blank(nvr->data, nvr->size);
+    core99_nvram_set_bootcmd(nvr->data, nvr->size,
+                             have_mac ? mac : NULL, CORE99_L2CLOCK);
 }
 
 
@@ -1075,10 +1256,11 @@ static void ppc_core99_init(MachineState *machine)
      * A brand-new flash image is all-0xff and has no partition structure at
      * all -- seed the real default one, otherwise the ROM sees "NVRAM
      * corrupted" and rebuilds its own in-guest copy that never reaches the
-     * backing file.
+     * backing file.  Then graft the boot-command (gmac MAC + the cache POST
+     * data); both patch the in-RAM image only, as the source branch does.
      */
     if (rom_is_flash) {
-        core99_nvram_seed_if_blank(nvr->data, nvr->size);
+        core99_nvram_graft(nvr);
     }
     core99_report_boot_device(nvr);
     /* No PCI init: the BIOS will do it */
