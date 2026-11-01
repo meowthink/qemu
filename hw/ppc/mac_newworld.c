@@ -66,6 +66,8 @@
 #include "hw/nvram/fw_cfg.h"
 #include "hw/char/escc.h"
 #include "hw/misc/macio/macio.h"
+#include "hw/nvram/eeprom_at24c.h"
+#include "hw/nvram/mac_spd.h"
 #include "hw/ppc/openpic.h"
 #include "hw/core/loader.h"
 #include "hw/core/fw-path-provider.h"
@@ -91,7 +93,46 @@
 
 #define PROM_FILENAME "openbios-ppc"
 #define PROM_BASE 0xfff00000
+
+static uint64_t core99_rom_read(void *opaque, hwaddr addr, unsigned size)
+{
+    /* never called: reads are served from the ROM device's RAM backing */
+    return 0;
+}
+
+static void core99_rom_write(void *opaque, hwaddr addr, uint64_t val,
+                             unsigned size)
+{
+    trace_mac99_rom_write(addr, size, val);
+}
+
+static const MemoryRegionOps core99_rom_ops = {
+    .read = core99_rom_read,
+    .write = core99_rom_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 8,
+};
+
+/* KeyLargo/MacIO base decoded by real hardware (and by real Apple ROMs) */
+#define MACIO_BASE 0xf3000000
+#define MACIO_WIN_SIZE 0x01000000
 #define PROM_SIZE (1 * MiB)
+/*
+ * A real Apple ROM stores its Open Firmware variables in the boot flash --
+ * the ROM's own info property lists fff04000 as a 0x4000 nvram section and
+ * its write-characteristic as "flash" -- and reaches it as flat bytes rather
+ * than through the Old World one-byte-per-halfword window.
+ */
+#define NVRAM_FLASH_SIZE 0x4000
+/*
+ * The ROM socket's full decode window; only the top PROM_SIZE is populated.
+ * Mac OS 9's "nvram,flash" driver reaches the two NVRAM banks at
+ * 0xff004000/0xff006000 -- the same 0x4000/0x6000 offsets of the flash part,
+ * decoded 16MB below the top -- which is what ROM_WINDOW_SIZE has to cover.
+ */
+#define ROM_WINDOW_BASE 0xff000000
+#define ROM_WINDOW_SIZE (16 * MiB)
 
 #define KERNEL_LOAD_ADDR 0x01000000
 #define KERNEL_GAP       0x00100000
@@ -139,9 +180,28 @@ static char *core99_nvram_get_var(const uint8_t *data, uint32_t size,
 {
     const uint32_t COPY = 0x2000;
     size_t nlen = strlen(name);
-    uint32_t base;
+    uint32_t base, best = 0, best_gen = 0;
+    bool have_best = false;
 
+    /*
+     * Two 8KB banks; the ROM (and Mac OS's nvram,flash driver) use the one
+     * with the higher generation count (core99 header: CHRP header, adler32
+     * at +0x10, generation at +0x14). Report from that one, not the first.
+     */
     for (base = 0; base + COPY <= size; base += COPY) {
+        uint32_t gen;
+
+        if (data[base] != 0x5a || memcmp(&data[base + 4], "nvram", 5) != 0) {
+            continue;
+        }
+        gen = ldl_be_p(&data[base + 0x14]);
+        if (!have_best || gen > best_gen) {
+            best = base;
+            best_gen = gen;
+            have_best = true;
+        }
+    }
+    for (base = have_best ? best : 0; base + COPY <= size; base += COPY) {
         uint32_t off;
 
         for (off = base; off + 16 <= base + COPY; ) {
@@ -194,6 +254,167 @@ static void core99_report_boot_device(MacIONVRAMState *nvr)
 
     trace_mac99_boot_device(dev ? dev : "(unset)");
 }
+
+/*
+ * A blank/never-written flash NVRAM (all bytes 0xff, matching real erased-
+ * flash semantics) has no valid CHRP partition structure at all for
+ * core99_nvram_graft()/core99_nvram_set_bootcmd() to patch into -- their
+ * search loop for the "common" (0x70) partition finds nothing and silently
+ * no-ops. The real Apple ROM detects this as "NVRAM corrupted" and rebuilds
+ * its own default structure, but only in its own in-guest working copy;
+ * that repair is never observed to persist back to the emulated flash's
+ * backing file (confirmed live: even a full, successful boot leaves a
+ * freshly-created backing file completely unchanged). Net effect: every
+ * boot-command graft (gmac MAC, FireWire GUID, cache-POST) silently never
+ * applies on a genuinely fresh nvram-flash-*.img, only on one a real ROM
+ * has already formatted at some point in the past.
+ *
+ * Seed a real, byte-for-byte, ROM-validated default structure instead of
+ * hand-constructing one -- extracted directly from a real PowerMac3,4
+ * nvram-flash-34.img's second 8KB copy (the first copy in that same real
+ * file is itself blank/unused, matching typical flash wear-leveling; only
+ * one live copy is needed for the ROM's own scan to find). This is the
+ * exact same "copy a real captured byte blob rather than reconstruct the
+ * format from a spec" approach already used for the Old World OF partition
+ * template above (see oldworld_of_partition_head/_strings) -- safer than
+ * hand-rolling the "system" (0x5f, Apple-specific, not the generic CHRP
+ * tag) and "APL,MacOS75" partitions this real capture also contains, which
+ * this code has no need to understand the contents of, only to reproduce
+ * faithfully enough that the real ROM's own validation accepts the whole
+ * copy as uncorrupted.
+ */
+#define CORE99_NVRAM_TEMPLATE_SIZE 0x2000
+static const uint8_t core99_nvram_flash_template[CORE99_NVRAM_TEMPLATE_SIZE] = {
+    [0]=0x5a, [1]=0x82, [3]=0x02, [4]=0x6e, [5]=0x76, [6]=0x72, [7]=0x61, [8]=0x6d,
+    [16]=0x7c, [17]=0x26, [18]=0x12, [19]=0x0a, [32]=0x5f, [33]=0x25, [35]=0x1e, [36]=0x73,
+    [37]=0x79, [38]=0x73, [39]=0x74, [40]=0x65, [41]=0x6d, [512]=0x70, [513]=0xfd, [514]=0x01,
+    [515]=0x01, [516]=0x63, [517]=0x6f, [518]=0x6d, [519]=0x6d, [520]=0x6f, [521]=0x6e, [528]=0x6c,
+    [529]=0x69, [530]=0x74, [531]=0x74, [532]=0x6c, [533]=0x65, [534]=0x2d, [535]=0x65, [536]=0x6e,
+    [537]=0x64, [538]=0x69, [539]=0x61, [540]=0x6e, [541]=0x3f, [542]=0x3d, [543]=0x66, [544]=0x61,
+    [545]=0x6c, [546]=0x73, [547]=0x65, [549]=0x72, [550]=0x65, [551]=0x61, [552]=0x6c, [553]=0x2d,
+    [554]=0x6d, [555]=0x6f, [556]=0x64, [557]=0x65, [558]=0x3f, [559]=0x3d, [560]=0x66, [561]=0x61,
+    [562]=0x6c, [563]=0x73, [564]=0x65, [566]=0x61, [567]=0x75, [568]=0x74, [569]=0x6f, [570]=0x2d,
+    [571]=0x62, [572]=0x6f, [573]=0x6f, [574]=0x74, [575]=0x3f, [576]=0x3d, [577]=0x74, [578]=0x72,
+    [579]=0x75, [580]=0x65, [582]=0x64, [583]=0x69, [584]=0x61, [585]=0x67, [586]=0x2d, [587]=0x73,
+    [588]=0x77, [589]=0x69, [590]=0x74, [591]=0x63, [592]=0x68, [593]=0x3f, [594]=0x3d, [595]=0x66,
+    [596]=0x61, [597]=0x6c, [598]=0x73, [599]=0x65, [601]=0x66, [602]=0x63, [603]=0x6f, [604]=0x64,
+    [605]=0x65, [606]=0x2d, [607]=0x64, [608]=0x65, [609]=0x62, [610]=0x75, [611]=0x67, [612]=0x3f,
+    [613]=0x3d, [614]=0x66, [615]=0x61, [616]=0x6c, [617]=0x73, [618]=0x65, [620]=0x6f, [621]=0x65,
+    [622]=0x6d, [623]=0x2d, [624]=0x62, [625]=0x61, [626]=0x6e, [627]=0x6e, [628]=0x65, [629]=0x72,
+    [630]=0x3f, [631]=0x3d, [632]=0x66, [633]=0x61, [634]=0x6c, [635]=0x73, [636]=0x65, [638]=0x6f,
+    [639]=0x65, [640]=0x6d, [641]=0x2d, [642]=0x6c, [643]=0x6f, [644]=0x67, [645]=0x6f, [646]=0x3f,
+    [647]=0x3d, [648]=0x66, [649]=0x61, [650]=0x6c, [651]=0x73, [652]=0x65, [654]=0x75, [655]=0x73,
+    [656]=0x65, [657]=0x2d, [658]=0x6e, [659]=0x76, [660]=0x72, [661]=0x61, [662]=0x6d, [663]=0x72,
+    [664]=0x63, [665]=0x3f, [666]=0x3d, [667]=0x66, [668]=0x61, [669]=0x6c, [670]=0x73, [671]=0x65,
+    [673]=0x75, [674]=0x73, [675]=0x65, [676]=0x2d, [677]=0x67, [678]=0x65, [679]=0x6e, [680]=0x65,
+    [681]=0x72, [682]=0x69, [683]=0x63, [684]=0x3f, [685]=0x3d, [686]=0x66, [687]=0x61, [688]=0x6c,
+    [689]=0x73, [690]=0x65, [692]=0x64, [693]=0x65, [694]=0x66, [695]=0x61, [696]=0x75, [697]=0x6c,
+    [698]=0x74, [699]=0x2d, [700]=0x6d, [701]=0x61, [702]=0x63, [703]=0x2d, [704]=0x61, [705]=0x64,
+    [706]=0x64, [707]=0x72, [708]=0x65, [709]=0x73, [710]=0x73, [711]=0x3f, [712]=0x3d, [713]=0x66,
+    [714]=0x61, [715]=0x6c, [716]=0x73, [717]=0x65, [719]=0x72, [720]=0x65, [721]=0x61, [722]=0x6c,
+    [723]=0x2d, [724]=0x62, [725]=0x61, [726]=0x73, [727]=0x65, [728]=0x3d, [729]=0x2d, [730]=0x31,
+    [732]=0x72, [733]=0x65, [734]=0x61, [735]=0x6c, [736]=0x2d, [737]=0x73, [738]=0x69, [739]=0x7a,
+    [740]=0x65, [741]=0x3d, [742]=0x2d, [743]=0x31, [745]=0x6c, [746]=0x6f, [747]=0x61, [748]=0x64,
+    [749]=0x2d, [750]=0x62, [751]=0x61, [752]=0x73, [753]=0x65, [754]=0x3d, [755]=0x30, [756]=0x78,
+    [757]=0x38, [758]=0x30, [759]=0x30, [760]=0x30, [761]=0x30, [762]=0x30, [764]=0x76, [765]=0x69,
+    [766]=0x72, [767]=0x74, [768]=0x2d, [769]=0x62, [770]=0x61, [771]=0x73, [772]=0x65, [773]=0x3d,
+    [774]=0x2d, [775]=0x31, [777]=0x76, [778]=0x69, [779]=0x72, [780]=0x74, [781]=0x2d, [782]=0x73,
+    [783]=0x69, [784]=0x7a, [785]=0x65, [786]=0x3d, [787]=0x2d, [788]=0x31, [790]=0x70, [791]=0x63,
+    [792]=0x69, [793]=0x2d, [794]=0x70, [795]=0x72, [796]=0x6f, [797]=0x62, [798]=0x65, [799]=0x2d,
+    [800]=0x6d, [801]=0x61, [802]=0x73, [803]=0x6b, [804]=0x3d, [805]=0x2d, [806]=0x31, [808]=0x73,
+    [809]=0x63, [810]=0x72, [811]=0x65, [812]=0x65, [813]=0x6e, [814]=0x2d, [815]=0x23, [816]=0x63,
+    [817]=0x6f, [818]=0x6c, [819]=0x75, [820]=0x6d, [821]=0x6e, [822]=0x73, [823]=0x3d, [824]=0x31,
+    [825]=0x30, [826]=0x30, [828]=0x73, [829]=0x63, [830]=0x72, [831]=0x65, [832]=0x65, [833]=0x6e,
+    [834]=0x2d, [835]=0x23, [836]=0x72, [837]=0x6f, [838]=0x77, [839]=0x73, [840]=0x3d, [841]=0x34,
+    [842]=0x30, [844]=0x73, [845]=0x65, [846]=0x6c, [847]=0x66, [848]=0x74, [849]=0x65, [850]=0x73,
+    [851]=0x74, [852]=0x2d, [853]=0x23, [854]=0x6d, [855]=0x65, [856]=0x67, [857]=0x73, [858]=0x3d,
+    [859]=0x30, [861]=0x62, [862]=0x6f, [863]=0x6f, [864]=0x74, [865]=0x2d, [866]=0x64, [867]=0x65,
+    [868]=0x76, [869]=0x69, [870]=0x63, [871]=0x65, [872]=0x3d, [873]=0x68, [874]=0x64, [875]=0x3a,
+    [876]=0x2c, [877]=0x5c, [878]=0x5c, [879]=0x3a, [880]=0x74, [881]=0x62, [882]=0x78, [883]=0x69,
+    [885]=0x62, [886]=0x6f, [887]=0x6f, [888]=0x74, [889]=0x2d, [890]=0x66, [891]=0x69, [892]=0x6c,
+    [893]=0x65, [894]=0x3d, [896]=0x62, [897]=0x6f, [898]=0x6f, [899]=0x74, [900]=0x2d, [901]=0x73,
+    [902]=0x63, [903]=0x72, [904]=0x65, [905]=0x65, [906]=0x6e, [907]=0x3d, [909]=0x63, [910]=0x6f,
+    [911]=0x6e, [912]=0x73, [913]=0x6f, [914]=0x6c, [915]=0x65, [916]=0x2d, [917]=0x73, [918]=0x63,
+    [919]=0x72, [920]=0x65, [921]=0x65, [922]=0x6e, [923]=0x3d, [925]=0x64, [926]=0x69, [927]=0x61,
+    [928]=0x67, [929]=0x2d, [930]=0x64, [931]=0x65, [932]=0x76, [933]=0x69, [934]=0x63, [935]=0x65,
+    [936]=0x3d, [937]=0x65, [938]=0x6e, [939]=0x65, [940]=0x74, [942]=0x64, [943]=0x69, [944]=0x61,
+    [945]=0x67, [946]=0x2d, [947]=0x66, [948]=0x69, [949]=0x6c, [950]=0x65, [951]=0x3d, [952]=0x2c,
+    [953]=0x64, [954]=0x69, [955]=0x61, [956]=0x67, [957]=0x73, [959]=0x69, [960]=0x6e, [961]=0x70,
+    [962]=0x75, [963]=0x74, [964]=0x2d, [965]=0x64, [966]=0x65, [967]=0x76, [968]=0x69, [969]=0x63,
+    [970]=0x65, [971]=0x3d, [972]=0x6b, [973]=0x65, [974]=0x79, [975]=0x62, [976]=0x6f, [977]=0x61,
+    [978]=0x72, [979]=0x64, [981]=0x6f, [982]=0x75, [983]=0x74, [984]=0x70, [985]=0x75, [986]=0x74,
+    [987]=0x2d, [988]=0x64, [989]=0x65, [990]=0x76, [991]=0x69, [992]=0x63, [993]=0x65, [994]=0x3d,
+    [995]=0x73, [996]=0x63, [997]=0x72, [998]=0x65, [999]=0x65, [1000]=0x6e, [1002]=0x69, [1003]=0x6e,
+    [1004]=0x70, [1005]=0x75, [1006]=0x74, [1007]=0x2d, [1008]=0x64, [1009]=0x65, [1010]=0x76, [1011]=0x69,
+    [1012]=0x63, [1013]=0x65, [1014]=0x2d, [1015]=0x31, [1016]=0x3d, [1017]=0x73, [1018]=0x63, [1019]=0x63,
+    [1020]=0x61, [1022]=0x6f, [1023]=0x75, [1024]=0x74, [1025]=0x70, [1026]=0x75, [1027]=0x74, [1028]=0x2d,
+    [1029]=0x64, [1030]=0x65, [1031]=0x76, [1032]=0x69, [1033]=0x63, [1034]=0x65, [1035]=0x2d, [1036]=0x31,
+    [1037]=0x3d, [1038]=0x73, [1039]=0x63, [1040]=0x63, [1041]=0x61, [1043]=0x6d, [1044]=0x6f, [1045]=0x75,
+    [1046]=0x73, [1047]=0x65, [1048]=0x2d, [1049]=0x64, [1050]=0x65, [1051]=0x76, [1052]=0x69, [1053]=0x63,
+    [1054]=0x65, [1055]=0x3d, [1056]=0x6d, [1057]=0x6f, [1058]=0x75, [1059]=0x73, [1060]=0x65, [1062]=0x6f,
+    [1063]=0x65, [1064]=0x6d, [1065]=0x2d, [1066]=0x62, [1067]=0x61, [1068]=0x6e, [1069]=0x6e, [1070]=0x65,
+    [1071]=0x72, [1072]=0x3d, [1074]=0x6f, [1075]=0x65, [1076]=0x6d, [1077]=0x2d, [1078]=0x6c, [1079]=0x6f,
+    [1080]=0x67, [1081]=0x6f, [1082]=0x3d, [1084]=0x6e, [1085]=0x76, [1086]=0x72, [1087]=0x61, [1088]=0x6d,
+    [1089]=0x72, [1090]=0x63, [1091]=0x3d, [1093]=0x62, [1094]=0x6f, [1095]=0x6f, [1096]=0x74, [1097]=0x2d,
+    [1098]=0x63, [1099]=0x6f, [1100]=0x6d, [1101]=0x6d, [1102]=0x61, [1103]=0x6e, [1104]=0x64, [1105]=0x3d,
+    [1106]=0x6d, [1107]=0x61, [1108]=0x63, [1109]=0x2d, [1110]=0x62, [1111]=0x6f, [1112]=0x6f, [1113]=0x74,
+    [1115]=0x64, [1116]=0x65, [1117]=0x66, [1118]=0x61, [1119]=0x75, [1120]=0x6c, [1121]=0x74, [1122]=0x2d,
+    [1123]=0x63, [1124]=0x6c, [1125]=0x69, [1126]=0x65, [1127]=0x6e, [1128]=0x74, [1129]=0x2d, [1130]=0x69,
+    [1131]=0x70, [1132]=0x3d, [1134]=0x64, [1135]=0x65, [1136]=0x66, [1137]=0x61, [1138]=0x75, [1139]=0x6c,
+    [1140]=0x74, [1141]=0x2d, [1142]=0x73, [1143]=0x65, [1144]=0x72, [1145]=0x76, [1146]=0x65, [1147]=0x72,
+    [1148]=0x2d, [1149]=0x69, [1150]=0x70, [1151]=0x3d, [1153]=0x64, [1154]=0x65, [1155]=0x66, [1156]=0x61,
+    [1157]=0x75, [1158]=0x6c, [1159]=0x74, [1160]=0x2d, [1161]=0x67, [1162]=0x61, [1163]=0x74, [1164]=0x65,
+    [1165]=0x77, [1166]=0x61, [1167]=0x79, [1168]=0x2d, [1169]=0x69, [1170]=0x70, [1171]=0x3d, [1173]=0x64,
+    [1174]=0x65, [1175]=0x66, [1176]=0x61, [1177]=0x75, [1178]=0x6c, [1179]=0x74, [1180]=0x2d, [1181]=0x73,
+    [1182]=0x75, [1183]=0x62, [1184]=0x6e, [1185]=0x65, [1186]=0x74, [1187]=0x2d, [1188]=0x6d, [1189]=0x61,
+    [1190]=0x73, [1191]=0x6b, [1192]=0x3d, [1194]=0x64, [1195]=0x65, [1196]=0x66, [1197]=0x61, [1198]=0x75,
+    [1199]=0x6c, [1200]=0x74, [1201]=0x2d, [1202]=0x72, [1203]=0x6f, [1204]=0x75, [1205]=0x74, [1206]=0x65,
+    [1207]=0x72, [1208]=0x2d, [1209]=0x69, [1210]=0x70, [1211]=0x3d, [1213]=0x62, [1214]=0x6f, [1215]=0x6f,
+    [1216]=0x74, [1217]=0x2d, [1218]=0x73, [1219]=0x63, [1220]=0x72, [1221]=0x69, [1222]=0x70, [1223]=0x74,
+    [1224]=0x3d, [1226]=0x61, [1227]=0x61, [1228]=0x70, [1229]=0x6c, [1230]=0x2c, [1231]=0x70, [1232]=0x63,
+    [1233]=0x69, [1234]=0x3d, [1236]=0x72, [1237]=0x61, [1238]=0x6d, [1239]=0x2d, [1240]=0x73, [1241]=0x69,
+    [1242]=0x7a, [1243]=0x65, [1244]=0x3d, [1245]=0x30, [1246]=0x78, [1247]=0x34, [1248]=0x30, [1249]=0x30,
+    [1250]=0x30, [1251]=0x30, [1252]=0x30, [1253]=0x30, [1254]=0x30, [4624]=0xa0, [4625]=0x1d, [4627]=0x51,
+    [4628]=0x41, [4629]=0x50, [4630]=0x4c, [4631]=0x2c, [4632]=0x4d, [4633]=0x61, [4634]=0x63, [4635]=0x4f,
+    [4636]=0x53, [4637]=0x37, [4638]=0x35, [5920]=0x7f, [5921]=0xa7, [5923]=0x8e, [5924]=0x77, [5925]=0x77,
+    [5926]=0x77, [5927]=0x77, [5928]=0x77, [5929]=0x77, [5930]=0x77, [5931]=0x77, [5932]=0x77, [5933]=0x77,
+    [5934]=0x77, [5935]=0x77,
+};
+
+/*
+ * True if the flash is genuinely blank (all-0xff, real erased-flash state --
+ * see macio_nvram_default_blk()'s own "must start out erased" comment).
+ * Deliberately not macio_nvram_is_blank(), which checks for all-*zero*
+ * bytes -- the correct blank state for the *non*-flash nvram.img path this
+ * function is not used for.
+ */
+static bool core99_nvram_flash_is_blank(const uint8_t *data, uint32_t size)
+{
+    uint32_t i;
+
+    for (i = 0; i < size; i++) {
+        if (data[i] != 0xff) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * Seed the real default structure into a blank flash nvram so the grafts
+ * below always have a valid "common" partition to patch into, even on the
+ * very first boot against a brand-new nvram-flash-*.img.
+ */
+static void core99_nvram_seed_if_blank(uint8_t *data, uint32_t size)
+{
+    if (size < 2 * CORE99_NVRAM_TEMPLATE_SIZE ||
+        !core99_nvram_flash_is_blank(data, size)) {
+        return;
+    }
+    memcpy(&data[CORE99_NVRAM_TEMPLATE_SIZE], core99_nvram_flash_template,
+          CORE99_NVRAM_TEMPLATE_SIZE);
+}
+
 
 static void ppc_core99_reset(void *opaque)
 {
@@ -262,6 +483,48 @@ static void cpu_kick(void *opaque, int n, int level)
     }
 }
 
+/* OpenBIOS is an ELF; a real Apple ROM is a flat binary image. */
+static bool firmware_is_elf(const char *filename)
+{
+    uint8_t magic[4];
+    bool is_elf = false;
+    FILE *f = fopen(filename, "rb");
+
+    if (f) {
+        is_elf = fread(magic, 1, sizeof(magic), f) == sizeof(magic) &&
+                 !memcmp(magic, ELFMAG, sizeof(magic));
+        fclose(f);
+    }
+    return is_elf;
+}
+
+static void macio_map_at_hw_base(void *opaque)
+{
+    PCIDevice *macio = opaque;
+
+    pci_default_write_config(macio, PCI_BASE_ADDRESS_0, MACIO_BASE, 4);
+    pci_default_write_config(macio, PCI_COMMAND,
+                             PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER, 2);
+}
+
+typedef struct MacIOHwBaseNotifier {
+    Notifier notifier;
+    PCIDevice *macio;
+} MacIOHwBaseNotifier;
+
+static void macio_arm_hw_base_reset(Notifier *n, void *opaque)
+{
+    MacIOHwBaseNotifier *mn = container_of(n, MacIOHwBaseNotifier, notifier);
+
+    /*
+     * Deferred to machine-init-done on purpose: the sysbus (and with it the
+     * whole device tree) only becomes resettable at the end of machine
+     * creation, so a handler registered during ppc_core99_init() would run
+     * *before* MacIO's own reset and have its config write thrown away.
+     */
+    qemu_register_reset(macio_map_at_hw_base, mn->macio);
+}
+
 /* PowerPC Mac99 hardware initialisation */
 static void ppc_core99_init(MachineState *machine)
 {
@@ -275,6 +538,8 @@ static void ppc_core99_init(MachineState *machine)
     int i, j, k, ppc_boot_device, machine_arch, bios_size = -1;
     const char *bios_name = machine->firmware ?: PROM_FILENAME;
     MemoryRegion *bios = g_new(MemoryRegion, 1);
+    MemoryRegion *rom_chip = g_new(MemoryRegion, 1);
+    bool rom_is_flash;
     hwaddr kernel_base = 0, initrd_base = 0, cmdline_base = 0;
     long kernel_size = 0, initrd_size = 0;
     PCIBus *pci_bus;
@@ -288,6 +553,9 @@ static void ppc_core99_init(MachineState *machine)
     SysBusDevice *s;
     DeviceState *dev, *pic_dev, *uninorth_pci_dev;
     DeviceState *uninorth_internal_dev = NULL, *uninorth_agp_dev = NULL;
+    MemoryRegion *macio_win;
+    I2CBus *unin_i2c;
+    MacIOHwBaseNotifier *macio_notifier;
     hwaddr nvram_addr = 0xFFF04000;
     uint64_t tbfreq = kvm_enabled() ? kvmppc_get_tbfreq() : TBFREQ;
 
@@ -326,12 +594,66 @@ static void ppc_core99_init(MachineState *machine)
     }
     memory_region_add_subregion(get_system_memory(), 0, machine->ram);
 
-    /* allocate and load firmware ROM */
-    memory_region_init_rom(bios, NULL, "ppc_core99.bios", PROM_SIZE,
-                           &error_fatal);
-    memory_region_add_subregion(get_system_memory(), PROM_BASE, bios);
-
     filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
+    rom_is_flash = filename && !firmware_is_elf(filename);
+
+    /*
+     * A real PowerMac3,4/3,6 has a PMU, never a CUDA, and a real Apple ROM
+     * depends on it for more than the VIA itself: the KeyLargo GPIO block
+     * only exists alongside the PMU. Left on the OpenBIOS-era CUDA default,
+     * the ROM's POST reads the programmer's switch line from unmapped space,
+     * gets 0 -- "switch held down at power-on" -- and enters firmware-update
+     * mode, which never boots. An explicit via= still wins.
+     */
+    if (rom_is_flash && core99_machine->via_config == CORE99_VIA_CONFIG_CUDA) {
+        core99_machine->via_config = CORE99_VIA_CONFIG_PMU;
+    }
+
+    /*
+     * A ROM *device* rather than plain ROM so that guest stores into the
+     * boot-flash range are visible (traced) instead of silently dropped:
+     * the real part is one flash chip, and a guest flash driver may issue
+     * its command/ID cycles anywhere in it, not only inside the 16KB
+     * NVRAM window that mac_nvram.c models. Reads still come straight
+     * from the RAM backing.
+     */
+    memory_region_init_rom_device(bios, NULL, &core99_rom_ops, NULL,
+                                  "ppc_core99.bios", PROM_SIZE,
+                                  &error_fatal);
+    /*
+     * "rom_chip" is the whole 1MB flash part: the ROM image with, on the
+     * Apple ROM machines, the 16KB NVRAM window overlaid at 0x4000 (added
+     * below once the nvram device exists). Everything that decodes the
+     * part -- the primary slot at PROM_BASE and every alias -- goes
+     * through this container, so the NVRAM shows up in every alias too.
+     */
+    memory_region_init(rom_chip, NULL, "ppc_core99.rom-chip", PROM_SIZE);
+    memory_region_add_subregion(rom_chip, 0, bios);
+    memory_region_add_subregion(get_system_memory(), PROM_BASE, rom_chip);
+
+    /*
+     * The ROM socket decodes ROM_WINDOW_SIZE at ROM_WINDOW_BASE, but only
+     * the top 1MB is populated, so the part aliases through the rest of the
+     * window. The real Apple ROM makes use of that: after its low-level init
+     * it jumps to code via a window-relative address such as 0xff80b644,
+     * which on hardware is simply offset 0xb644 of the same flash part --
+     * and Mac OS 9's "nvram,flash" native driver (Mac OS ROM 8.x parcel
+     * nvram,flash-1.0d1) reads and programs the two NVRAM banks at
+     * 0xff004000/0xff006000: the same 0x4000/0x6000 offsets of the part,
+     * decoded 16MB below the top. With only 8MB mirrored it read zeros
+     * there, found no 0x5a bank signature, and silently never wrote --
+     * Startup Disk / PRAM changes were lost on every restart.
+     */
+    for (i = 0; i < ROM_WINDOW_SIZE / PROM_SIZE - 1; i++) {
+        MemoryRegion *mirror = g_new(MemoryRegion, 1);
+        g_autofree char *name = g_strdup_printf("ppc_core99.bios.mirror%d", i);
+
+        memory_region_init_alias(mirror, NULL, name, rom_chip, 0, PROM_SIZE);
+        memory_region_add_subregion(get_system_memory(),
+                                    ROM_WINDOW_BASE + (hwaddr)i * PROM_SIZE,
+                                    mirror);
+    }
+
     if (filename) {
         /* Load OpenBIOS (ELF) */
         bios_size = load_elf(filename, NULL, NULL, NULL, NULL,
@@ -437,6 +759,38 @@ static void ppc_core99_init(MachineState *machine)
     memory_region_add_subregion(get_system_memory(), 0xf8000000,
                                 sysbus_mmio_get_region(s, 0));
 
+    /*
+     * UniNorth's own I2C controller sits inside that 16MB window (at
+     * +0x1000), so it needs the higher priority to win the overlap. Its bus
+     * reaches the DIMM SPD EEPROMs and the processor module's configuration
+     * EEPROM, which a real Apple ROM reads during early bring-up; OpenBIOS
+     * never touches it.
+     */
+    memory_region_add_subregion_overlap(get_system_memory(), UNINORTH_I2C_BASE,
+                                        sysbus_mmio_get_region(s, 1), 1);
+
+    /*
+     * The processor module carries an SPD-format configuration EEPROM. The
+     * Tangent schematic labels it "ADDRESS = 6 (AC/AD)" next to the module
+     * connector's I2C pins, i.e. 8-bit 0xac/0xad, 7-bit 0x56. A real Apple
+     * ROM reads it during bring-up and refuses to continue without it.
+     */
+    unin_i2c = UNI_NORTH(s)->i2c.bus;
+    at24c_eeprom_init_rom(unin_i2c, 0x56, 256, NULL, 0);
+
+    /*
+     * SPD EEPROMs for the memory slots, at the usual 0x50 + slot. The ROM
+     * walks these to size RAM, so populate one per 256MB of configured
+     * memory (the images are a real PowerMac3,4's, checksums included).
+     */
+    for (i = 0; i < MAC_SPD_NUM_DIMMS; i++) {
+        if (machine->ram_size <= (uint64_t)i * MAC_SPD_DIMM_BYTES) {
+            break;
+        }
+        at24c_eeprom_init_rom(unin_i2c, 0x50 + i, MAC_SPD_SIZE,
+                              mac_spd_dimms[i], MAC_SPD_SIZE);
+    }
+
     if (PPC_INPUT(env) == PPC_FLAGS_INPUT_970) {
         machine_arch = ARCH_MAC99_U3;
         /* 970 gets a U3 bus */
@@ -494,7 +848,12 @@ static void ppc_core99_init(MachineState *machine)
     pci_bus = PCI_HOST_BRIDGE(uninorth_pci_dev)->bus;
 
     /* MacIO */
-    macio = OBJECT(pci_new(-1, TYPE_NEWWORLD_MACIO));
+    /*
+     * Slot numbers matter to a real Apple ROM, which expects the built-in
+     * devices where the hardware puts them: the PowerMac3,4 device tree has
+     * mac-io@17 and usb@18 / usb@19 on this bus.
+     */
+    macio = OBJECT(pci_new(PCI_DEVFN(0x17, 0), TYPE_NEWWORLD_MACIO));
     dev = DEVICE(macio);
     qdev_prop_set_uint64(dev, "frequency", tbfreq);
     qdev_prop_set_bit(dev, "has-pmu", has_pmu);
@@ -508,6 +867,41 @@ static void ppc_core99_init(MachineState *machine)
     qdev_prop_set_uint32(pic_dev, "nb_cpus", machine->smp.cpus);
 
     pci_realize_and_unref(PCI_DEVICE(macio), pci_bus, &error_fatal);
+
+    /*
+     * Have MacIO come out of reset already decoding at the address real
+     * hardware uses, instead of leaving it to firmware. Registered as a
+     * reset handler because PCI config space (including BARs) is cleared when
+     * the device is reset, which happens after machine init.
+     *
+     * OpenBIOS enumerates the PCI bus and assigns BARs itself, so it never
+     * needed this -- and the notifier arms a *reset* handler, so arming it
+     * unconditionally would rewrite the BAR on every later reset as well,
+     * behind the back of firmware that had legitimately assigned it
+     * elsewhere (that is what broke the Mac OS 9 OpenBIOS boot in 3d1a4add).
+     * A real Apple boot ROM does not enumerate: its early hardware-init code
+     * reaches straight for KeyLargo at the hardwired 0xf3000000 and spins
+     * forever if nothing answers.
+     */
+    if (rom_is_flash) {
+        macio_notifier = g_new0(MacIOHwBaseNotifier, 1);
+        macio_notifier->notifier.notify = macio_arm_hw_base_reset;
+        macio_notifier->macio = PCI_DEVICE(macio);
+        qemu_add_machine_init_done_notifier(&macio_notifier->notifier);
+
+        /*
+         * UniNorth's only CPU-visible window into PCI memory space is the
+         * 256MB "PCI hole" at 0x80000000, so a BAR at 0xf3000000 would decode
+         * on the bus but be unreachable from the CPU. Real UniNorth also
+         * forwards the 0xf3000000 range, which is where MacIO lives; add that
+         * window so the BAR above is actually usable.
+         */
+        macio_win = g_new(MemoryRegion, 1);
+        memory_region_init_alias(macio_win, macio, "unin-pci-macio-hole",
+                                 pci_address_space(PCI_DEVICE(macio)),
+                                 MACIO_BASE, MACIO_WIN_SIZE);
+        memory_region_add_subregion(get_system_memory(), MACIO_BASE, macio_win);
+    }
 
     /* Connect GPIO reset IRQs for secondary CPUs */
     s = SYS_BUS_DEVICE(object_resolve_path_component(macio, "gpio"));
@@ -581,7 +975,8 @@ static void ppc_core99_init(MachineState *machine)
     }
 
     if (machine->usb) {
-        pci_create_simple(pci_bus, -1, "pci-ohci");
+        pci_create_simple(pci_bus, rom_is_flash ? PCI_DEVFN(0x18, 0) : -1,
+                          "pci-ohci");
 
         /* U3 needs to use USB for input because Linux doesn't support via-cuda
         on PPC64 */
@@ -619,21 +1014,36 @@ static void ppc_core99_init(MachineState *machine)
         nvram_addr = 0xFFE00000;
     }
     dev = qdev_new(TYPE_MACIO_NVRAM);
-    qdev_prop_set_uint32(dev, "size", MACIO_NVRAM_SIZE);
-    qdev_prop_set_uint32(dev, "it_shift", 1);
+    if (rom_is_flash) {
+        /* Flat bytes, flash command set, and erased rather than zeroed. */
+        qdev_prop_set_uint32(dev, "size", NVRAM_FLASH_SIZE);
+        qdev_prop_set_uint32(dev, "it_shift", 0);
+        qdev_prop_set_bit(dev, "flash", true);
+    } else {
+        qdev_prop_set_uint32(dev, "size", MACIO_NVRAM_SIZE);
+        qdev_prop_set_uint32(dev, "it_shift", 1);
+    }
 
     /*
      * Back the NVRAM with a file so that what firmware stores in it (the OF
      * variables, boot-device among them) survives a restart: the user's own
-     * -drive if=mtd,... if there is one, otherwise a default "nvram.img" in
-     * the working directory, the same convention g3beige uses. Without this
-     * the contents were re-stamped from scratch on every run.
+     * -drive if=mtd,... if there is one, otherwise a default image in the
+     * working directory, the same convention g3beige uses. Without this the
+     * contents were re-stamped from scratch on every run. The flash image
+     * must start out erased (all ones), not zeroed: firmware tells "never
+     * written" from "written and invalid", and a block of zeroes is neither.
      */
     dinfo = drive_get(IF_MTD, 0, 0);
     if (dinfo) {
         qdev_prop_set_drive(dev, "drive", blk_by_legacy_dinfo(dinfo));
     } else {
-        BlockBackend *nvram_blk =
+        /*
+         * One default filename: the per-model nvram-flash-34/36.img split of
+         * the source branch needs its model= property, which is part of the
+         * PowerMac3,4/3,6 split this tree does not have yet.
+         */
+        BlockBackend *nvram_blk = rom_is_flash ?
+            macio_nvram_default_blk("nvram-flash.img", NVRAM_FLASH_SIZE, 0xff) :
             macio_nvram_default_blk("nvram.img", MACIO_NVRAM_SIZE, 0);
 
         if (nvram_blk) {
@@ -642,15 +1052,33 @@ static void ppc_core99_init(MachineState *machine)
     }
 
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
-    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, nvram_addr);
+    if (rom_is_flash && nvram_addr == 0xFFF04000) {
+        /* Part of the flash chip: overlay it inside every ROM alias. */
+        memory_region_add_subregion_overlap(rom_chip, nvram_addr - PROM_BASE,
+                                            sysbus_mmio_get_region(
+                                                SYS_BUS_DEVICE(dev), 0), 1);
+    } else {
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, nvram_addr);
+    }
     nvr = MACIO_NVRAM(dev);
     /*
-     * Only seed the default partitions into a genuinely fresh image --
-     * otherwise the firmware's own persisted variables get overwritten on
-     * every boot, which is exactly what the backing file is there to stop.
+     * The Apple ROM lays out and validates its own partitions; only the
+     * OpenBIOS-style NVRAM wants the CHRP ones seeded, and even then only
+     * into a genuinely fresh image -- otherwise the firmware's own persisted
+     * variables get overwritten on every boot, which is exactly what the
+     * backing file is there to stop.
      */
-    if (macio_nvram_is_blank(nvr, MACIO_NVRAM_SIZE)) {
+    if (!rom_is_flash && macio_nvram_is_blank(nvr, MACIO_NVRAM_SIZE)) {
         pmac_format_nvram_partition(nvr, MACIO_NVRAM_SIZE);
+    }
+    /*
+     * A brand-new flash image is all-0xff and has no partition structure at
+     * all -- seed the real default one, otherwise the ROM sees "NVRAM
+     * corrupted" and rebuilds its own in-guest copy that never reaches the
+     * backing file.
+     */
+    if (rom_is_flash) {
+        core99_nvram_seed_if_blank(nvr->data, nvr->size);
     }
     core99_report_boot_device(nvr);
     /* No PCI init: the BIOS will do it */
