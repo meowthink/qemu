@@ -25,6 +25,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qemu/error-report.h"
 #include "qemu/module.h"
 #include "hw/misc/macio/cuda.h"
 #include "hw/pci/pci.h"
@@ -33,6 +34,7 @@
 #include "migration/vmstate.h"
 #include "hw/char/escc.h"
 #include "hw/misc/macio/macio.h"
+#include "hw/misc/macio/keylargo.h"
 #include "hw/intc/heathrow_pic.h"
 #include "hw/net/bmac.h"
 #include "net/net.h"
@@ -296,12 +298,56 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
         return;
     }
 
+    /*
+     * KeyLargo's own cells (FCR, the two I2S cells and the Keywest I2C
+     * controller) live in mac-io's first 0x20000 bytes.  They are not
+     * devices: keylargo_cells_init() maps the regions into the BAR and
+     * hands back the state the DMA/IRQ wiring below needs.
+     */
+    KeyLargoState *keylargo = keylargo_cells_init(DEVICE(s), &s->bar);
+
+    if (!audio_be_check(&ns->audio_be, errp)) {
+        return;
+    }
+    keylargo->i2s[0].audio_be = ns->audio_be;
+    keylargo->i2s[1].audio_be = ns->audio_be;
+    if (ns->i2s_dump_path && *ns->i2s_dump_path) {
+        keylargo->i2s[0].dump_fp = fopen(ns->i2s_dump_path, "wb");
+        if (!keylargo->i2s[0].dump_fp) {
+            warn_report("macio: cannot open i2s dumpfile %s",
+                        ns->i2s_dump_path);
+        } else {
+            setvbuf(keylargo->i2s[0].dump_fp, NULL, _IOFBF, 1 << 16);
+        }
+    }
+
     /* OpenPIC */
     qdev_prop_set_uint32(pic_dev, "model", OPENPIC_MODEL_KEYLARGO);
     sbd = SYS_BUS_DEVICE(&ns->pic);
     sysbus_realize_and_unref(sbd, &error_fatal);
     memory_region_add_subregion(&s->bar, 0x40000,
                                 sysbus_mmio_get_region(sbd, 0));
+
+    /*
+     * i2s-a's DBDMA channels (0 and 1): the interrupt sources are the
+     * real device tree's 0x01/0x02, *not* 0x29/0x2a -- 0x29 is the
+     * on-board GMAC's line, and Mac OS 9's non-sharing interrupt
+     * dispatch freezes the machine when the audio DMA completion is
+     * delivered to the GMAC's handler instead (see the comment on the
+     * NEWWORLD_I2S0_* defines in macio.h).
+     */
+    keylargo_i2s_register_dma(keylargo, &s->dbdma,
+                              qdev_get_gpio_in(pic_dev,
+                                               NEWWORLD_I2S0_TX_DMA_IRQ),
+                              qdev_get_gpio_in(pic_dev,
+                                               NEWWORLD_I2S0_RX_DMA_IRQ));
+
+    /*
+     * Keywest I2C interrupt. Open Firmware only ever polls the cell, but
+     * Mac OS X's AppleI2C does interrupt-driven transfers and hangs --
+     * and on 10.4 eventually powers the machine off -- without it.
+     */
+    keylargo->i2c.irq = qdev_get_gpio_in(pic_dev, NEWWORLD_KEYWEST_IRQ);
 
     sbd = SYS_BUS_DEVICE(&s->escc);
     sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev, NEWWORLD_ESCCB_IRQ));
@@ -433,6 +479,8 @@ static const VMStateDescription vmstate_macio_newworld = {
 
 static const Property macio_newworld_properties[] = {
     DEFINE_PROP_BOOL("has-pmu", NewWorldMacIOState, has_pmu, false),
+    DEFINE_AUDIO_PROPERTIES(NewWorldMacIOState, audio_be),
+    DEFINE_PROP_STRING("i2s-dumpfile", NewWorldMacIOState, i2s_dump_path),
     DEFINE_PROP_BOOL("has-adb", NewWorldMacIOState, has_adb, false),
 };
 

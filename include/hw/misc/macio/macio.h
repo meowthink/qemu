@@ -33,6 +33,7 @@
 #include "hw/misc/macio/cuda.h"
 #include "hw/misc/macio/gpio.h"
 #include "hw/misc/macio/pmu.h"
+#include "qemu/audio.h"
 #include "hw/nvram/mac_nvram.h"
 #include "hw/ppc/mac_dbdma.h"
 #include "hw/ppc/openpic.h"
@@ -57,6 +58,26 @@
 #define NEWWORLD_IDE0_DMA_IRQ  0x2
 #define NEWWORLD_IDE1_IRQ      0xe
 #define NEWWORLD_IDE1_DMA_IRQ  0x3
+/* i2c@18000: the real PowerMac3,4 tree says interrupts = <0x1a 1> */
+#define NEWWORLD_KEYWEST_IRQ   0x1a
+/*
+ * i2s-a ("i2s@10000"): the real PowerMac3,4 device tree says
+ * interrupts = <0x1e 1> <0x01 0> <0x02 0> -- the cell itself on 0x1e,
+ * tx-dma on 0x01 and rx-dma on 0x02, i.e. the same "DBDMA channel + 1"
+ * scheme the ESCC (4..7 -> 5..8) and IDE channels follow; i2s-a's DMA
+ * channels are 0 and 1.
+ *
+ * These were 0x29/0x2a, from an OS X IORegistry readback. 0x29 is the
+ * on-board GMAC's line (pci@f4000000 interrupt-map, slot 0xf), so the
+ * audio TX-DMA interrupt shared the GMAC's OpenPIC input. Mac OS X
+ * survives that (IOKit shares interrupt sources); Mac OS 9 does not:
+ * once its GMAC driver owns 0x29, the first audio DMA interrupt is
+ * dispatched to the GMAC handler, which finds nothing to service and
+ * never clears the DBDMA's level line, so the source is re-delivered
+ * for ever and the machine freezes at "Starting Up...".
+ */
+#define NEWWORLD_I2S0_TX_DMA_IRQ  0x01
+#define NEWWORLD_I2S0_RX_DMA_IRQ  0x02
 #define NEWWORLD_EXTING_GPIO1  0x2f
 #define NEWWORLD_EXTING_GPIO9  0x37
 
@@ -141,6 +162,8 @@ struct NewWorldMacIOState {
 
     bool has_pmu;
     bool has_adb;
+    AudioBackend *audio_be;
+    char *i2s_dump_path;
     OpenPICState pic;
     MACIOIDEState ide[2];
     MacIOGPIOState gpio;
