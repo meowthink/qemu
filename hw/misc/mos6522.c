@@ -26,6 +26,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/core/irq.h"
+#include "hw/core/cpu.h"
 #include "hw/misc/mos6522.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
@@ -36,6 +37,7 @@
 #include "qemu/cutils.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "system/calib-governor.h"
 #include "trace.h"
 
 
@@ -43,6 +45,7 @@ static const char *mos6522_reg_names[MOS6522_NUM_REGS] = {
     "ORB", "ORA", "DDRB", "DDRA", "T1CL", "T1CH", "T1LL", "T1LH",
     "T2CL", "T2CH", "SR", "ACR", "PCR", "IFR", "IER", "ANH"
 };
+
 
 /* XXX: implement all timer modes */
 
@@ -53,7 +56,10 @@ static void mos6522_timer2_update(MOS6522State *s, MOS6522Timer *ti,
 
 static void mos6522_update_irq(MOS6522State *s)
 {
-    if (s->ifr & s->ier) {
+    bool raise = s->ifr & s->ier;
+
+    trace_mos6522_update_irq(s->ifr, s->ier, raise);
+    if (raise) {
         qemu_irq_raise(s->irq);
     } else {
         qemu_irq_lower(s->irq);
@@ -149,12 +155,125 @@ static uint64_t get_load_time(MOS6522State *s, MOS6522Timer *ti)
     }
 }
 
+/*
+ * Real-time window (ns) within which two get_counter() reads of the same
+ * timer are treated as part of one back-to-back measurement pair -- see
+ * the comment in get_counter() for what this guards against. Kept tight
+ * (a couple of this timer's own ~1.276us ticks, CUDA_TIMER_FREQ) rather
+ * than generous: a wider window (10us was tried and measured insufficient
+ * -- still ~80Hz on a Ticks counter that should read 60.15Hz) risks
+ * treating genuinely frequent-but-unrelated legitimate polling as part of
+ * the same pair, re-anchoring the window on every such call and never
+ * actually triggering the reset below.
+ */
+#define TIMER_MONOTONIC_WINDOW_NS 2500
+
+/*
+ * Bound on how far get_counter()'s forced advancement may run ahead of
+ * the honestly-computed value even *within* an active monotonic window
+ * -- belt-and-suspenders alongside the window reset above, for a busy
+ * loop tight enough to make several back-to-back calls within a single
+ * window. At this timer's ~1.276us tick period, 16 ticks is ~20us of
+ * maximum induced drift.
+ */
+#define TIMER_MAX_AHEAD_OF_REAL 16
+
 static unsigned int get_counter(MOS6522State *s, MOS6522Timer *ti)
 {
     int64_t d;
     unsigned int counter;
+    int64_t now_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     d = get_counter_value(s, ti);
+
+    /*
+     * get_counter_value() derives elapsed ticks from real host wall-clock
+     * time (QEMU_CLOCK_VIRTUAL), scaled per-timer (~783kHz/1.276us ticks
+     * for the generic VIA path, a different CUDA-specific transform for
+     * Timer1 -- see cuda_get_counter_value()) -- genuinely correct and
+     * hardware-accurate on its own. But real classic Mac ROM code (the
+     * Time Manager's CPU-speed calibration, backing _InsTime/_RmvTime/
+     * _PrimeTime) measures elapsed time by arming Timer1 with _PrimeTime,
+     * then almost immediately reading it back via _RmvTime -- twice in a
+     * row, once with negligible intervening work and once after a short
+     * busy-loop -- and unconditionally divides by the difference between
+     * the two measurements. Confirmed via live ROM disassembly (the
+     * calibration routine around 0x4f6bde) and register capture: each
+     * _PrimeTime reloads the timer (a fresh load_time epoch), so the two
+     * measurements are independent elapsed-since-reload values, and on a
+     * host fast enough to execute the ROM's own trap-dispatch and Prime/
+     * Remove sequence itself in under one tick period, *both* independent
+     * measurements can honestly compute to the same value -- not just a
+     * single read landing at d=0, but two separate reload-then-read
+     * cycles each doing so, which a fix scoped to a single load epoch
+     * (an earlier version of this fix, keyed only off qemu_clock_get_ns()
+     * vs this load's ti->load_time) cannot catch.
+     *
+     * Real silicon never hits this: a 68K/PPC750-era CPU takes measurable,
+     * non-negligible real time to execute the ROM's own trap dispatch
+     * between two such measurements, comfortably more than one VIA tick
+     * period, because CPU and VIA timer share the same physical clock
+     * domain by design -- so two independent measurements always differ
+     * by at least a little, even when the "real work" between them is
+     * itself negligible. TCG on a modern host can execute that same
+     * sequence far faster than 233-300MHz silicon ever could, decoupling
+     * that inherent pairing.
+     *
+     * Guarantee the same real-hardware invariant this ROM code implicitly
+     * (if unknowingly) depends on -- each read of this timer observes
+     * strictly more progress than the previous one did -- by tracking the
+     * last value ANY read of this timer returned. This CANNOT persist
+     * indefinitely across every future reload the way an earlier version
+     * of this fix did, though: Timer1 gets reloaded constantly during
+     * ordinary Time Manager operation (deferred tasks, scheduling), each
+     * with its own fresh load_time epoch -- so a watermark that's never
+     * reset ends up comparing entirely unrelated, genuinely-separated-in-
+     * real-time reload+read cycles against a stale high-water mark from
+     * some earlier, unconnected access, forcing them to "advance" too.
+     * Measured empirically: that version made the guest's whole notion of
+     * elapsed time (anything timed off this counter, including the
+     * VBL-driven Ticks counter backing double-click/key-repeat timing)
+     * run at 4-16x real speed depending on the exact bound used, not just
+     * a negligible one-time offset. Scope the guarantee to real wall-
+     * clock proximity instead: only force advancement if this read is
+     * happening within TIMER_MONOTONIC_WINDOW_NS of the previous one,
+     * matching the actual narrow case this exists for (two measurements
+     * from the same calibration sequence, genuinely close together in
+     * real host time) -- if real time has clearly moved on since the
+     * last read, trust the honestly-computed value and let the watermark
+     * reset, since that's a fresh, unrelated access, not a continuation
+     * of the same measurement pair. This doesn't affect IRQ scheduling
+     * (computed independently by get_next_irq_time()); it only changes
+     * the guest-visible value in the narrow, real-hardware-unreachable
+     * case where two back-to-back reads would otherwise regress or
+     * repeat.
+     */
+    if (now_ns - ti->last_read_real_ns >= TIMER_MONOTONIC_WINDOW_NS) {
+        ti->last_read_d = -1;
+    }
+    if (d <= ti->last_read_d) {
+        if (ti->last_read_d - d < TIMER_MAX_AHEAD_OF_REAL) {
+            d = ti->last_read_d + 1;
+        } else {
+            d = ti->last_read_d;
+        }
+    } else {
+        /*
+         * Genuine, honest advance: this is a real sync point with real
+         * time, so anchor the window here. Deliberately NOT done on a
+         * forced/held read above -- if it were, a continuous run of
+         * back-to-back-in-real-time calls (each one individually within
+         * the window of the previous) would keep pushing the deadline
+         * forward forever and the reset above would never trigger,
+         * reintroducing unbounded growth by another route. Anchoring
+         * only on genuine advances means the window measures "how long
+         * since we last KNEW we were caught up to real time", so a
+         * sustained forcing streak gets cut off after one window's worth
+         * of real time has elapsed, however many calls happened in it.
+         */
+        ti->last_read_real_ns = now_ns;
+    }
+    ti->last_read_d = d;
 
     if (ti->index == 0) {
         /* the timer goes down from latch to -1 (period of latch + 2) */
@@ -170,11 +289,43 @@ static unsigned int get_counter(MOS6522State *s, MOS6522Timer *ti)
     return counter;
 }
 
+/*
+ * T1 as read back after XNU's CPU-speed probe loop. Reading the counter
+ * is the last thing pe_run_clock_test() does, so the first read of
+ * either byte ends the probe window; the governor says how long the
+ * loop took for the guest's purposes, and both bytes are served from
+ * that one answer so the guest never mixes a real byte with an answered
+ * one whichever order it reads them in. With no window open, or for a
+ * window that ran nothing, this is the plain counter.
+ */
+static unsigned int mos6522_t1_probe_read(MOS6522State *s)
+{
+    MOS6522Timer *ti = &s->timers[0];
+    int64_t answer_ns;
+
+    if (s->t1_probe_pending) {
+        s->t1_probe_pending = false;
+        return s->t1_probe_value;
+    }
+    answer_ns = calib_governor_end_cpu_probe();
+    if (answer_ns <= 0) {
+        return get_counter(s, ti);
+    }
+    /* the loop started from 0xffff and ran for answer_ns of T1 ticks */
+    s->t1_probe_value = 0xffff - (unsigned int)(muldiv64(answer_ns,
+                                                         ti->frequency,
+                                                         NANOSECONDS_PER_SECOND)
+                                                & 0xffff);
+    s->t1_probe_pending = true;
+    return s->t1_probe_value;
+}
+
 static void set_counter(MOS6522State *s, MOS6522Timer *ti, unsigned int val)
 {
     trace_mos6522_set_counter(1 + ti->index, val);
     ti->load_time = get_load_time(s, ti);
     ti->counter_value = val;
+    ti->fired = false;          /* a fresh arm owes exactly one interrupt */
     if (ti->index == 0) {
         mos6522_timer1_update(s, ti, ti->load_time);
     } else {
@@ -256,7 +407,105 @@ static void mos6522_timer1(void *opaque)
     MOS6522Timer *ti = &s->timers[0];
 
     mos6522_timer1_update(s, ti, ti->next_irq_time);
-    s->ifr |= T1_INT;
+    /*
+     * The lazy catch-up in mos6522_read() may have delivered this
+     * period's interrupt already; don't deliver it twice. Clear the
+     * token afterwards either way: in continuous mode the update above
+     * armed the NEXT period, which owes its own interrupt.
+     */
+    if (!ti->fired) {
+        s->ifr |= T1_INT;
+    }
+    ti->fired = false;
+    mos6522_update_irq(s);
+}
+
+/*
+ * May a due T2 expiry be made visible right now?
+ *
+ * Mac OS reads the 16-bit T2 counter with interrupts masked, in a ROM
+ * routine (0xffc347e0 in the G3 ROM) that tests IFR.T2 first, skips the
+ * T2C-L read when the flag is set or the high byte is zero, and re-reads
+ * T2C-L/T2C-H until they agree. On real hardware that is watertight:
+ * with the high byte nonzero the counter cannot reach zero within the
+ * few instructions of the loop, so the loop never clears a flag that
+ * was raised after its IFR test. Under TCG the vCPU can be parked for
+ * milliseconds between two of those instructions (BQL held by the main
+ * loop: display updates, block completions, monitor commands), the
+ * time-based counter wraps meanwhile, and an expiry delivered inside the
+ * loop -- by whichever thread -- is wiped by the next T2C-L read before
+ * anything observes it. Measured on Mac OS 8.5 and 9.2: the Time Manager
+ * stopped re-arming T2, Ticks froze, the guest "hung" with keys still
+ * typed and the clock dead. So an expiry is held while the guest is in a
+ * run of consecutive counter reads and delivered at the next other VIA
+ * access (the routine's own IFR test on its next call, the interrupt
+ * dispatcher, the ADB poll...). No cap on the run length: under a stall
+ * storm the routine's consistency loop legitimately spins for dozens of
+ * reads (measured: 19). The only escapes are an IFR read, where the
+ * guest sees the flag in the value it gets, and a 50 ms overdue bound
+ * for a guest that goes quiet right after a query.
+ */
+#define T2_HOLD_MAX_NS       (50 * SCALE_MS)
+#define T2_RETRY_NS          (200 * SCALE_US)
+
+static void mos6522_timer2_deliver(CPUState *cs, run_on_cpu_data data);
+
+static bool mos6522_t2_may_deliver(MOS6522State *s)
+{
+    int64_t overdue;
+
+    if (!s->t2_irq_on_vcpu) {
+        return true;
+    }
+    if (s->t2_counter_run == 0) {
+        return true;
+    }
+    /*
+     * Held too long: the guest went quiet right after a query, or is
+     * doing nothing but short query runs. Virtual time also passes while
+     * the vCPU is parked, so this bound must be well above any stall.
+     */
+    overdue = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->timers[1].next_irq_time;
+    return overdue > T2_HOLD_MAX_NS;
+}
+
+static void mos6522_t2_retry(void *opaque)
+{
+    MOS6522State *s = opaque;
+
+    if (!s->timers[1].fired && first_cpu) {
+        async_run_on_cpu(first_cpu, mos6522_timer2_deliver,
+                         RUN_ON_CPU_HOST_PTR(s));
+    }
+}
+
+static void mos6522_timer2_deliver(CPUState *cs, run_on_cpu_data data)
+{
+    MOS6522State *s = data.host_ptr;
+    MOS6522Timer *ti = &s->timers[1];
+
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    /* Runs on the vCPU thread, BQL held, between two guest instructions. */
+    if (ti->fired) {
+        return;
+    }
+    if (now < ti->next_irq_time) {
+        /*
+         * Stale: queued for an expiry the guest has since consumed (the
+         * lazy path delivered it, the guest acked and re-armed). A flag
+         * now would be premature for the new arm, and marking it fired
+         * would make the real expiry get skipped. The new arm's timer
+         * delivers it.
+         */
+        return;
+    }
+    if (!mos6522_t2_may_deliver(s)) {
+        timer_mod(s->t2_retry, now + T2_RETRY_NS);
+        return;
+    }
+    ti->fired = true;
+    s->ifr |= T2_INT;
     mos6522_update_irq(s);
 }
 
@@ -265,7 +514,96 @@ static void mos6522_timer2(void *opaque)
     MOS6522State *s = opaque;
     MOS6522Timer *ti = &s->timers[1];
 
-    mos6522_timer2_update(s, ti, ti->next_irq_time);
+    /*
+     * Deliver on the vCPU thread, at an instruction boundary. This
+     * callback runs on the main loop, which only gets the BQL while the
+     * vCPU is parked waiting for it -- and the vCPU parks at MMIO
+     * accesses. Raising the flag here therefore lands "inside" whatever
+     * VIA access the guest is in the middle of, most often one of its
+     * T2 counter reads, and by 6522 rules the T2C-L half of that read
+     * then clears the flag before the CPU can recognise the interrupt.
+     * Measured (Mac OS 8.5 and 9.2, event ring): the Time Manager's
+     * expiry vanished exactly that way, nothing re-armed T2, and the
+     * guest's Ticks stopped for good (the "VM on" / IE freezes: keys
+     * still typed, clock dead). On real hardware the expiry is not
+     * correlated with the CPU's accesses and the interrupt is taken
+     * before the next instruction. Queuing the delivery on the vCPU
+     * gives exactly that: the parked access completes first, the flag
+     * and the line rise at the next instruction boundary, and the
+     * interrupt is taken there. The lazy catch-up in mos6522_read()
+     * may deliver first; the fired token keeps it to one delivery.
+     */
+    if (s->t2_irq_on_vcpu && !ti->fired && first_cpu) {
+        async_run_on_cpu(first_cpu, mos6522_timer2_deliver,
+                         RUN_ON_CPU_HOST_PTR(s));
+        return;
+    }
+
+    /*
+     * Unlike T1, real 6522 hardware's T2 (in its only mode relevant here,
+     * timed-interrupt mode) is one-shot: it counts down once, fires, and
+     * then stops -- it does not automatically reload and keep firing.
+     * Software must explicitly rewrite T2C-H to arm it again (see
+     * set_counter(), called from the VIA_REG_T2CH write case). Confirmed
+     * against DingusPPC's ViaCuda, which arms T2 with an explicit
+     * add_oneshot_timer() rather than any repeating/continuous timer.
+     * Re-arming here unconditionally (as this used to do, mirroring T1)
+     * turned T2 into a free-running periodic interrupt source once
+     * enabled via IER, which native ROM code relying on T2's real
+     * one-shot semantics never expects and can spin on forever.
+     *
+     * The fired token keeps this delivery unique per arm: the lazy
+     * catch-up in mos6522_read() or the calibration governor's inline
+     * catch-up may already have delivered this expiry, and re-asserting
+     * an already-acked one-shot is a spurious interrupt no real 6522
+     * generates.
+     */
+    if (!ti->fired) {
+        ti->fired = true;
+        s->ifr |= T2_INT;
+        mos6522_update_irq(s);
+    }
+}
+
+/*
+ * Deliver an overdue T2 one-shot interrupt inline. Invoked (BQL held)
+ * by the calibration governor from the paced vCPU when the one-shot's
+ * expiry has passed on the host clock: the calibration spin is a pure
+ * register loop, so the lazy catch-up in mos6522_read() can never fire
+ * for it, and on hosts whose main loop services QEMU timers later than
+ * the window's guard tail (win32) the spin would otherwise outlive the
+ * paced window and run out at raw host speed -- making the calibrated
+ * value host-dependent however exact the pacing was. Never early: the
+ * expiry is rechecked against the virtual clock here. The pending
+ * main-loop timer is cancelled so the interrupt is not delivered a
+ * second time after the guest's ISR has already cleared it.
+ */
+static void mos6522_t2_irq_catch_up(void *opaque)
+{
+    MOS6522State *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (now < s->timers[1].next_irq_time || (s->ifr & T2_INT) ||
+        s->timers[1].fired) {
+        return;
+    }
+    if (!mos6522_t2_may_deliver(s)) {
+        /*
+         * Same counter-run rule as the other delivery paths: this is
+         * called from the paced vCPU at an arbitrary instruction
+         * boundary, which can be inside the masked counter-read routine
+         * (measured: it was, and the routine's next T2C-L read wiped the
+         * flag). The next VIA access or the retry timer delivers it.
+         */
+        timer_mod(s->t2_retry,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + T2_RETRY_NS);
+        return;
+    }
+    s->timers[1].fired = true;
+    if (s->timers[1].timer) {
+        timer_del(s->timers[1].timer);
+    }
+    trace_mos6522_t2_irq_catch_up(now - s->timers[1].next_irq_time);
     s->ifr |= T2_INT;
     mos6522_update_irq(s);
 }
@@ -299,14 +637,82 @@ uint64_t mos6522_read(void *opaque, hwaddr addr, unsigned size)
     uint32_t val;
     int ctrl;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    /*
+     * Set when the lazy catch-up below is what raised a timer flag during
+     * THIS read. A T1C-L/T2C-L read clears that timer's flag on a real
+     * 6522, but on real silicon the flag was set at the expiry instant
+     * and the IRQ line asserted right then, so an interrupt-enabled CPU
+     * took the interrupt before it could issue the read. Here the flag
+     * is only being set now, inside the read; letting the same access
+     * clear it again would set-and-clear it invisibly, mark the arm as
+     * fired, and lose the interrupt for good. Measured on Mac OS 9.2:
+     * its Time Manager arms 15-25 count (20-30 us) T2 one-shots whose
+     * expiry lands inside the ISR's own tail under TCG, ~2% of them were
+     * lost this way, and each loss parked the whole Time Manager queue
+     * for 100-1000 ms (ticks ran at 48/s instead of 60, QuickTime's
+     * clock ran slow, its audio feed starved for seconds at a time).
+     */
+    bool lazy_t1 = false, lazy_t2 = false;
 
-    if (now >= s->timers[0].next_irq_time) {
+    if (now >= s->timers[0].next_irq_time && !s->timers[0].fired) {
         mos6522_timer1_update(s, &s->timers[0], now);
         s->ifr |= T1_INT;
+        lazy_t1 = true;
+        /* Deliver it now, exactly as the expiry would have: raise the
+         * line so the PIC latches an event. Only some register cases
+         * below update the line; a read of any other register (Cuda's
+         * port B, the shift register) would otherwise leave the flag set
+         * with no interrupt, and the next reload would clear it unseen. */
+        mos6522_update_irq(s);
+        /*
+         * One delivery per period. The update above armed the next
+         * period, which owes its own interrupt in continuous mode; in
+         * one-shot mode there is no next period until the guest
+         * reloads the counter, and without the token every ~84ms
+         * counter wrap re-asserted T1_INT for an arm long consumed.
+         */
+        s->timers[0].fired = (s->acr & T1MODE) != T1MODE_CONT;
     }
-    if (now >= s->timers[1].next_irq_time) {
-        mos6522_timer2_update(s, &s->timers[1], now);
+    /*
+     * A "query run": consecutive T2C-L / T2C-H / IFR reads with nothing
+     * else in between -- the shape of the masked counter-read routine
+     * (T2CH, IFR, T2CL, T2CH, ...). Deliveries between accesses are held
+     * inside a run (see mos6522_t2_may_deliver()); a delivery inside an
+     * IFR read is always fine, the guest sees the flag in the value.
+     */
+    if (addr == VIA_REG_T2CL || addr == VIA_REG_T2CH || addr == VIA_REG_IFR) {
+        s->t2_counter_run++;
+    } else {
+        s->t2_counter_run = 0;
+    }
+    if (now >= s->timers[1].next_irq_time && !s->timers[1].fired &&
+        (addr == VIA_REG_IFR || mos6522_t2_may_deliver(s))) {
+        /* See mos6522_t2_may_deliver() for the counter-run rule. */
+        /*
+         * T2 is one-shot (see mos6522_timer2()) -- unlike T1, do not
+         * call mos6522_timer2_update() here, or this lazy catch-up
+         * check re-arms T2 on every single register read past its
+         * expiry, turning it back into a free-running periodic
+         * interrupt exactly like the bug fixed in the timer callback.
+         *
+         * The fired token matters just as much as the no-re-arm rule:
+         * an expired one-shot's next_irq_time stays in the past, so
+         * without it EVERY register read after the expiry re-asserted
+         * T2_INT -- including the CUDA ISR's own IFR/ORB/SR reads
+         * right after the guest ACKED the interrupt, which turned one
+         * expiry into a train of spurious T2 interrupts until the
+         * guest happened to re-arm. The window between expiry and
+         * re-arm is a few microseconds when QEMU timers are prompt but
+         * stretches with every millisecond of main-loop latency, which
+         * is why win32 hosts saw interrupt storms (and 68K-emulator
+         * re-entrancy assertions during boot) that macOS almost never
+         * produced. A real 6522 sets the IFR flag once per arm, full
+         * stop.
+         */
+        s->timers[1].fired = true;
         s->ifr |= T2_INT;
+        lazy_t2 = true;
+        mos6522_update_irq(s);      /* see the T1 case above */
     }
     switch (addr) {
     case VIA_REG_B:
@@ -337,12 +743,14 @@ uint64_t mos6522_read(void *opaque, hwaddr addr, unsigned size)
         val = s->dira;
         break;
     case VIA_REG_T1CL:
-        val = get_counter(s, &s->timers[0]) & 0xff;
-        s->ifr &= ~T1_INT;
+        val = mos6522_t1_probe_read(s) & 0xff;
+        if (!lazy_t1) {
+            s->ifr &= ~T1_INT;
+        }
         mos6522_update_irq(s);
         break;
     case VIA_REG_T1CH:
-        val = get_counter(s, &s->timers[0]) >> 8;
+        val = mos6522_t1_probe_read(s) >> 8;
         mos6522_update_irq(s);
         break;
     case VIA_REG_T1LL:
@@ -354,7 +762,9 @@ uint64_t mos6522_read(void *opaque, hwaddr addr, unsigned size)
         break;
     case VIA_REG_T2CL:
         val = get_counter(s, &s->timers[1]) & 0xff;
-        s->ifr &= ~T2_INT;
+        if (!lazy_t2) {
+            s->ifr &= ~T2_INT;
+        }
         mos6522_update_irq(s);
         break;
     case VIA_REG_T2CH:
@@ -384,9 +794,7 @@ uint64_t mos6522_read(void *opaque, hwaddr addr, unsigned size)
         g_assert_not_reached();
     }
 
-    if (addr != VIA_REG_IFR || val != 0) {
-        trace_mos6522_read(addr, mos6522_reg_names[addr], val);
-    }
+    trace_mos6522_read(addr, mos6522_reg_names[addr], val);
 
     return val;
 }
@@ -398,6 +806,7 @@ void mos6522_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     int ctrl;
 
     trace_mos6522_write(addr, mos6522_reg_names[addr], val);
+    s->t2_counter_run = 0;
 
     switch (addr) {
     case VIA_REG_B:
@@ -438,6 +847,21 @@ void mos6522_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         s->timers[0].latch = (s->timers[0].latch & 0xff) | (val << 8);
         s->ifr &= ~T1_INT;
         set_counter(s, &s->timers[0], s->timers[0].latch);
+        /*
+         * Loading T1's counter with 0xffff -- the full range, so the
+         * timer cannot expire during whatever comes next -- is the
+         * signature of XNU's pe_run_clock_test(), which uses T1 purely
+         * as a stopwatch across a fixed 10,000,000-CPU-clock loop and
+         * derives the CPU PLL multiplier from how long that took. Under
+         * TCG the loop finishes ~10x too fast; open a CPU-speed probe
+         * window so it is paced to this board's real clock. See
+         * system/calib-governor.c.
+         */
+        s->t1_probe_pending = false;
+        if (s->timers[0].latch == 0xffff) {
+            trace_mos6522_t1_cpu_probe(s->acr,
+                                       calib_governor_arm_cpu_probe());
+        }
         break;
     case VIA_REG_T1LL:
         s->timers[0].latch = (s->timers[0].latch & 0xff00) | val;
@@ -460,6 +884,28 @@ void mos6522_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
         s->timers[1].latch = (s->timers[1].latch & 0xff) | (val << 8);
         s->ifr &= ~T2_INT;
         set_counter(s, &s->timers[1], s->timers[1].latch);
+        /*
+         * Writing T2C-H is the only way to arm T2, and in timed-interrupt
+         * mode (ACR bit 5 clear) it is a one-shot: the guest has just
+         * started a bounded wait it intends to notice the end of. Classic
+         * Mac OS ROMs use exactly this to time their TimeDBRA family of
+         * CPU-speed calibration spins, which are pure register loops that
+         * a modern host runs to completion long before ~1ms of real time
+         * has passed -- storing 0 and poisoning every later consumer that
+         * divides by them. Open a calibration window so the vCPU is paced
+         * to a period-plausible rate for the duration of this one-shot,
+         * and only for that: see system/calib-governor.c.
+         */
+        if (!(s->acr & T2MODE_COUNT)) {
+            int64_t countdown = s->timers[1].next_irq_time -
+                                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            bool governed = calib_governor_arm(countdown,
+                                               mos6522_t2_irq_catch_up, s);
+
+            trace_mos6522_t2_oneshot(s->timers[1].latch, s->ier, s->acr,
+                                     countdown, governed);
+        } else {
+        }
         break;
     case VIA_REG_SR:
         s->sr = val;
@@ -579,9 +1025,26 @@ static int qmp_x_query_via_foreach(Object *obj, void *opaque)
 static HumanReadableText *qmp_x_query_via(Error **errp)
 {
     g_autoptr(GString) buf = g_string_new("");
+    g_autofree char *govcfg = calib_governor_get_config();
+    CalibGovStats gov;
 
     object_child_foreach_recursive(object_get_root(),
                                    qmp_x_query_via_foreach, buf);
+
+    calib_governor_get_stats(&gov);
+    g_string_append_printf(buf, "calibration-governor (%s):\n", govcfg);
+    g_string_append_printf(buf, "    windows=%" PRIu64 " (cpu-probe %" PRIu64
+                                ") re-arms=%" PRIu64
+                                " capped=%" PRIu64 " ignored=%" PRIu64 "\n",
+                           gov.windows, gov.cpu_probes, gov.rearms, gov.capped,
+                           gov.ignored);
+    g_string_append_printf(buf, "    ungoverned=%" PRIu64 " probes=%" PRIu64
+                                "\n", gov.ungoverned, gov.probes);
+    g_string_append_printf(buf, "    governed=%.3f ms slept=%.3f ms"
+                                " insns=%" PRIu64 " irq-catch-ups=%" PRIu64
+                                "\n",
+                           gov.governed_ns / 1.0e6, gov.slept_ns / 1.0e6,
+                           gov.insns, gov.irq_catch_ups);
 
     return human_readable_text_from_str(buf);
 }
@@ -609,7 +1072,7 @@ static const MemoryRegionOps mos6522_ops = {
 
 static const VMStateDescription vmstate_mos6522_timer = {
     .name = "mos6522_timer",
-    .version_id = 0,
+    .version_id = 1,
     .minimum_version_id = 0,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT16(latch, MOS6522Timer),
@@ -617,6 +1080,7 @@ static const VMStateDescription vmstate_mos6522_timer = {
         VMSTATE_INT64(load_time, MOS6522Timer),
         VMSTATE_INT64(next_irq_time, MOS6522Timer),
         VMSTATE_TIMER_PTR(timer, MOS6522Timer),
+        VMSTATE_BOOL_V(fired, MOS6522Timer, 1),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -648,6 +1112,15 @@ static void mos6522_reset_hold(Object *obj, ResetType type)
 
     s->b = 0;
     s->a = 0;
+    /*
+     * A bare 6522 resets with port B as all-inputs, but 0xff here is
+     * de-facto ABI for QEMU's shipped OpenBIOS: its CUDA driver
+     * (drivers/cuda.c) starts bit-banging TIP/TACK on port B without
+     * ever programming DIRB, so an all-inputs reset masks those writes
+     * to nothing and the very first CUDA request hangs firmware boot
+     * (found by bisect -- every -kernel/CD boot through OpenBIOS died).
+     * Real Mac ROMs program DDRB themselves and don't care either way.
+     */
     s->dirb = 0xff;
     s->dira = 0;
     s->sr = 0;
@@ -659,12 +1132,19 @@ static void mos6522_reset_hold(Object *obj, ResetType type)
 
     s->timers[0].frequency = s->frequency;
     s->timers[0].latch = 0xffff;
+    s->timers[0].last_read_d = -1;
+    s->timers[0].last_read_real_ns = -1;
     set_counter(s, &s->timers[0], 0xffff);
     timer_del(s->timers[0].timer);
+    /* nothing armed by the guest yet, so no interrupt is owed */
+    s->timers[0].fired = true;
 
     s->timers[1].frequency = s->frequency;
     s->timers[1].latch = 0xffff;
+    s->timers[1].last_read_d = -1;
+    s->timers[1].last_read_real_ns = -1;
     timer_del(s->timers[1].timer);
+    s->timers[1].fired = true;
 }
 
 static void mos6522_init(Object *obj)
@@ -680,10 +1160,13 @@ static void mos6522_init(Object *obj)
 
     for (i = 0; i < ARRAY_SIZE(s->timers); i++) {
         s->timers[i].index = i;
+        s->timers[i].last_read_d = -1;
+        s->timers[i].last_read_real_ns = -1;
     }
 
     s->timers[0].timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mos6522_timer1, s);
     s->timers[1].timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mos6522_timer2, s);
+    s->t2_retry = timer_new_ns(QEMU_CLOCK_VIRTUAL, mos6522_t2_retry, s);
 
     qdev_init_gpio_in(DEVICE(obj), mos6522_set_irq, VIA_NUM_INTS);
 }
@@ -698,6 +1181,7 @@ static void mos6522_finalize(Object *obj)
 
 static const Property mos6522_properties[] = {
     DEFINE_PROP_UINT64("frequency", MOS6522State, frequency, 0),
+    DEFINE_PROP_BOOL("t2-irq-on-vcpu", MOS6522State, t2_irq_on_vcpu, true),
 };
 
 static void mos6522_class_init(ObjectClass *oc, const void *data)

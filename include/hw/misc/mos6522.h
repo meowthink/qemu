@@ -63,6 +63,9 @@
 /* Bits in ACR */
 #define T1MODE             0xc0    /* Timer 1 mode */
 #define T1MODE_CONT        0x40    /*  continuous interrupts */
+#define T2MODE             0x20    /* Timer 2 mode */
+#define T2MODE_COUNT       0x20    /*  count down pulses on PB6 (else: a
+                                    *  one-shot timed interrupt) */
 
 /* Bits in PCR */
 #define CB2_CTRL_MASK      0xe0
@@ -109,6 +112,35 @@ typedef struct MOS6522Timer {
     int64_t next_irq_time;
     uint64_t frequency;
     QEMUTimer *timer;
+    /*
+     * Elapsed-tick value ("d") returned by the most recent get_counter()
+     * read of this timer, or -1 if it hasn't been read since the last
+     * machine/device reset (or since last_read_real_ns aged out -- see
+     * get_counter()'s comment). Deliberately left out of vmstate: it's
+     * read-side bookkeeping, not architectural state.
+     */
+    int64_t last_read_d;
+    /*
+     * Host QEMU_CLOCK_VIRTUAL time (ns) of the read that produced
+     * last_read_d, or -1 if there hasn't been one since the last reset/
+     * expiry. Used to scope get_counter()'s monotonicity guarantee to
+     * reads that are genuinely close together in real wall-clock time --
+     * see get_counter()'s comment for why this can't just persist across
+     * every reload forever. Deliberately left out of vmstate.
+     */
+    int64_t last_read_real_ns;
+    /*
+     * True once this arm's expiry interrupt has been delivered (by the
+     * QEMU timer callback, the lazy catch-up in mos6522_read(), or the
+     * calibration governor's inline catch-up); cleared when the guest
+     * re-arms the timer via set_counter(). A real 6522 one-shot sets
+     * its IFR flag exactly ONCE per arm -- without this token, every
+     * register read past an expired one-shot's deadline re-asserted
+     * the flag, so an already-acked interrupt came back as a spurious
+     * new one on the very next IFR/ORB/SR read, and each delivery path
+     * could double up with the others.
+     */
+    bool fired;
 } MOS6522Timer;
 
 /**
@@ -148,6 +180,21 @@ struct MOS6522State {
 
     qemu_irq irq;
     uint8_t last_irq_levels;
+
+    /* a CPU-speed probe answer, served across both T1 byte reads */
+    bool t1_probe_pending;
+    unsigned int t1_probe_value;
+
+    /* deliver T2 expiries on the vCPU thread (see mos6522_timer2()) */
+    bool t2_irq_on_vcpu;
+    /*
+     * Length of the guest's current "query run": consecutive T2C-L /
+     * T2C-H / IFR reads with no other VIA access in between. A due T2
+     * expiry is not made visible between accesses inside a run; t2_retry
+     * re-attempts a held delivery. See mos6522_t2_may_deliver().
+     */
+    unsigned t2_counter_run;
+    QEMUTimer *t2_retry;
 };
 
 #define TYPE_MOS6522 "mos6522"
