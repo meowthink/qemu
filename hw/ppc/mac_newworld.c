@@ -151,6 +151,7 @@ typedef enum {
  */
 typedef struct Core99ModelInfo {
     const char *name;
+    const char *nvram_flash_file;
     const char *cpu_type;
     const uint8_t *spd_donor;
     uint32_t tbfreq;
@@ -162,13 +163,13 @@ typedef struct Core99ModelInfo {
 
 static const Core99ModelInfo core99_models[] = {
     /* PowerMac3,1 "Sawtooth", 100MHz bus */
-    { "pm31", POWERPC_CPU_TYPE_NAME("7400_v2.9"),
+    { "pm31", "nvram-flash-31.img", POWERPC_CPU_TYPE_NAME("7400_v2.9"),
       mac_spd_dimm0, 25000000, 500000000, 100000000, 0xB0000000, 3 },
     /* PowerMac3,4 "Digital Audio", 933MHz (the Quicksilver ratio) */
-    { "pm34", POWERPC_CPU_TYPE_NAME("7400_v2.9"),
+    { "pm34", "nvram-flash-34.img", POWERPC_CPU_TYPE_NAME("7400_v2.9"),
       mac_spd_dimm0, 33290001, 933333331, 133160004, 0x20000000, 3 },
     /* PowerMac3,6 "Mirrored Drive Doors", dual 867MHz, 4 DIMM slots */
-    { "pm36", POWERPC_CPU_TYPE_NAME("7455_v2.1"),
+    { "pm36", "nvram-flash-36.img", POWERPC_CPU_TYPE_NAME("7455_v2.1"),
       mac_spd_pm36_dimm0, 33306279, 866666664, 133225119, 0x0000A000, 4 },
 };
 
@@ -1321,13 +1322,11 @@ static void ppc_core99_init(MachineState *machine)
     if (dinfo) {
         qdev_prop_set_drive(dev, "drive", blk_by_legacy_dinfo(dinfo));
     } else {
-        /*
-         * One default filename: the per-model nvram-flash-34/36.img split of
-         * the source branch needs its model= property, which is part of the
-         * PowerMac3,4/3,6 split this tree does not have yet.
-         */
+        /* Per-model filename: their contents are model-specific */
         BlockBackend *nvram_blk = rom_is_flash ?
-            macio_nvram_default_blk("nvram-flash.img", NVRAM_FLASH_SIZE, 0xff) :
+            macio_nvram_default_blk(core99_model_info(core99_machine)
+                                        ->nvram_flash_file,
+                                    NVRAM_FLASH_SIZE, 0xff) :
             macio_nvram_default_blk("nvram.img", MACIO_NVRAM_SIZE, 0);
 
         if (nvram_blk) {
@@ -1511,36 +1510,6 @@ static void core99_machine_class_init(ObjectClass *oc, const void *data)
     fwc->get_dev_path = core99_fw_dev_path;
 }
 
-static char *core99_get_model(Object *obj, Error **errp)
-{
-    Core99MachineState *cms = CORE99_MACHINE(obj);
-
-    return g_strdup(core99_model_info(cms)->name);
-}
-
-/*
- * "pm34", not "3,4": -M's option string is comma-separated, so a literal
- * comma in a property value has to be doubled to parse at all.
- */
-static void core99_set_model(Object *obj, const char *value, Error **errp)
-{
-    Core99MachineState *cms = CORE99_MACHINE(obj);
-    unsigned i;
-
-    for (i = 0; i < ARRAY_SIZE(core99_models); i++) {
-        if (!strcmp(value, core99_models[i].name)) {
-            cms->model = i;
-            return;
-        }
-    }
-    error_setg(errp, "Invalid model value");
-    error_append_hint(errp, "Valid values are");
-    for (i = 0; i < ARRAY_SIZE(core99_models); i++) {
-        error_append_hint(errp, "%s %s", i ? "," : "", core99_models[i].name);
-    }
-    error_append_hint(errp, ".\n");
-}
-
 static char *core99_get_via_config(Object *obj, Error **errp)
 {
     Core99MachineState *cms = CORE99_MACHINE(obj);
@@ -1574,13 +1543,42 @@ static void core99_set_via_config(Object *obj, const char *value, Error **errp)
     }
 }
 
+static char *core99_get_model(Object *obj, Error **errp)
+{
+    Core99MachineState *cms = CORE99_MACHINE(obj);
+
+    return g_strdup(core99_model_info(cms)->name);
+}
+
+/*
+ * "pm34", not "3,4": -M's option string is comma-separated, so a literal
+ * comma in a property value has to be doubled to parse at all.
+ */
+static void core99_set_model(Object *obj, const char *value, Error **errp)
+{
+    Core99MachineState *cms = CORE99_MACHINE(obj);
+    unsigned i;
+
+    for (i = 0; i < ARRAY_SIZE(core99_models); i++) {
+        if (!strcmp(value, core99_models[i].name)) {
+            cms->model = i;
+            return;
+        }
+    }
+    error_setg(errp, "Invalid model value");
+    error_append_hint(errp, "Valid values are");
+    for (i = 0; i < ARRAY_SIZE(core99_models); i++) {
+        error_append_hint(errp, "%s %s", i ? "," : "", core99_models[i].name);
+    }
+    error_append_hint(errp, ".\n");
+}
+
 static void core99_instance_init(Object *obj)
 {
     Core99MachineState *cms = CORE99_MACHINE(obj);
 
     /* Default via_config is CORE99_VIA_CONFIG_CUDA */
     cms->via_config = CORE99_VIA_CONFIG_CUDA;
-    cms->model = CORE99_DEFAULT_MODEL;
     object_property_add_str(obj, "via", core99_get_via_config,
                             core99_set_via_config);
     object_property_set_description(obj, "via",
