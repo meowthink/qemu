@@ -162,6 +162,15 @@ static void macio_gpio_write(void *opaque, hwaddr addr, uint64_t value,
                 ibit = 1; /* Ensure pulled high unless driven low */
             }
             macio_set_gpio(s, 16, ibit);
+        } else if (addr == (KL_GPIO_SMU_DOORBELL -
+                            KEYLARGO_GPIO_EXTINT_0) ||
+                   addr == (KL_GPIO_SMU_DOORBELL2 -
+                            KEYLARGO_GPIO_EXTINT_0)) {
+            /*
+             * The Apple BootROM drives the doorbell low, then polls it until
+             * the SMU acknowledges.  Model the SMU's immediate response.
+             */
+            s->gpio_regs[addr] = (value & ~IN_DATA) | IN_DATA;
         } else {
             s->gpio_regs[addr] = value | ibit;
         }

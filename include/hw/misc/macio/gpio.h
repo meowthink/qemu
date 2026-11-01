@@ -44,6 +44,11 @@
 #define KL_GPIO_RESET_CPU2            (KEYLARGO_GPIO_EXTINT_0 + 0x0f)
 #define KL_GPIO_RESET_CPU3            (KEYLARGO_GPIO_EXTINT_0 + 0x10)
 
+/* G5 SMU doorbell ("os-req-gpio"): GPIO line 31 */
+#define KL_GPIO_SMU_DOORBELL          (KEYLARGO_GPIO_EXTINT_0 + 0x1f)
+/* The PM7,3/Quad generation rings the same doorbell at cell offset 0x12 */
+#define KL_GPIO_SMU_DOORBELL2         (KEYLARGO_GPIO_EXTINT_0 + 0x0a)
+
 #define TYPE_MACIO_GPIO "macio-gpio"
 OBJECT_DECLARE_SIMPLE_TYPE(MacIOGPIOState, MACIO_GPIO)
 
