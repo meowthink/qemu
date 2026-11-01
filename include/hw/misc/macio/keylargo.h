@@ -13,6 +13,7 @@
 
 #include "system/memory.h"
 #include "hw/i2c/i2c.h"
+#include "hw/misc/macio/keywest_i2c.h"
 #include "qemu/audio.h"
 
 /* FCR1 bits (Linux keylargo.h, Apple AudioI2SHardwareConstants.h) */
@@ -157,74 +158,16 @@ typedef struct KeyLargoI2SState {
     FILE *dump_fp;
 } KeyLargoI2SState;
 
-typedef struct KeyLargoI2CState {
-    MemoryRegion mem;
-    const char *name;
-    I2CBus *bus;
-    /*
-     * Interrupt output, asserted while (ISR & IER) is nonzero. May be
-     * left unwired (NULL) on cells nothing listens to. Open Firmware
-     * drives the controller purely by polling ISR, but Mac OS X's
-     * AppleI2C does interrupt-mode transfers -- without this line every
-     * transfer it attempts times out ("APPLE I2C WRITE SEMAPHORE
-     * EXCEEDED TIMEOUT" on the kernel console).
-     */
-    qemu_irq irq;
-    bool xfer_active;
-    /*
-     * DUMB ("manual") mode's START control bit asserts a bare I2C start
-     * condition with no address yet -- unlike XADDR, which addresses the
-     * bus itself from the ADDR/SUBADDR registers. This is set between a
-     * START and the driver's first DATA write, which supplies the address
-     * byte by hand; see keywest_i2c_write()'s CONTROL and DATA cases.
-     */
-    bool manual_addr_pending;
-    /*
-     * DUMB mode's read completion is one ISR-ack later than every other
-     * mode's: the address-ack fires IRQ_DATA "empty" first (no byte pre-
-     * fetched, unlike XADDR-triggered reads), the driver's first ack of
-     * that is what actually clocks the byte in, and only its *second* ack
-     * (once the driver has consumed it) should auto-stop the bus. This
-     * distinguishes those two acks; see keywest_i2c_write()'s ISR case.
-     */
-    bool manual_byte_delivered;
-    /*
-     * XADDR-triggered reads (COMBINED/STANDARD/STANDARDSUB): true from the
-     * address ack until the driver acks IRQ_ADDR, at which point the data
-     * byte is fetched and IRQ_DATA raised. See keywest_i2c_write()'s
-     * CONTROL and ISR cases -- this is the same "defer the byte fetch to
-     * the driver's next ack" contract DUMB mode already uses via
-     * manual_byte_delivered above, applied to the XADDR path so ADDR and
-     * DATA are never visible to the driver as a single simultaneous event
-     * (real hardware clocks the byte in only after the address phase is
-     * acked; a driver's real-hardware-correct "isr |= ADDR" read-modify-
-     * write would otherwise read DATA as already set too, and its write-
-     * back would clear DATA before the driver ever reads it).
-     */
-    bool read_pending;
-    uint8_t mode;
-    uint8_t control;
-    uint8_t status;
-    uint8_t isr;
-    uint8_t ier;
-    uint8_t addr;
-    uint8_t subaddr;
-    uint8_t data;
-} KeyLargoI2CState;
-
 typedef struct KeyLargoState {
     MemoryRegion fcr_mem;
     uint32_t fcr[7];               /* MBCR 0x34, FCR0..FCR5 0x38..0x4c */
     KeyLargoI2SState i2s[2];
-    KeyLargoI2CState i2c;
+    KeyWestI2CState i2c;
 } KeyLargoState;
 
 #define UNINORTH_I2C_BASE           0xf8001000
 #define UNINORTH_I2C_SIZE           0x00001000
 
-void keywest_i2c_init(KeyLargoI2CState *c, DeviceState *owner,
-                      const char *name, uint64_t size);
-void keywest_i2c_reset(KeyLargoI2CState *c);
 /* i2s-a owns DBDMA channels 0 (out) and 1 (in); i2s-b owns 2 and 3. */
 #define KEYLARGO_I2S_DMA_OUT(cell)  ((cell) * 2)
 #define KEYLARGO_I2S_DMA_IN(cell)   ((cell) * 2 + 1)
