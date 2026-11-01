@@ -205,14 +205,22 @@ static target_ulong ppc_hash32_load_hpte0(PowerPCCPU *cpu, hwaddr pte_offset)
 {
     target_ulong base = ppc_hash32_hpt_base(cpu);
 
-    return ldl_phys(CPU(cpu)->as, base + pte_offset);
+    if (cpu->env.bytelaneswap) {
+        return bswap32(ldl_phys(CPU(cpu)->as, (base + pte_offset) ^ 4));
+    } else {
+        return ldl_phys(CPU(cpu)->as, base + pte_offset);
+    }
 }
 
 static target_ulong ppc_hash32_load_hpte1(PowerPCCPU *cpu, hwaddr pte_offset)
 {
     target_ulong base = ppc_hash32_hpt_base(cpu);
 
-    return ldl_phys(CPU(cpu)->as, base + pte_offset + HASH_PTE_SIZE_32 / 2);
+    if (cpu->env.bytelaneswap) {
+        return bswap32(ldl_phys(CPU(cpu)->as, (base + pte_offset + HASH_PTE_SIZE_32 / 2) ^ 4));
+    } else {
+        return ldl_phys(CPU(cpu)->as, base + pte_offset + HASH_PTE_SIZE_32 / 2);
+    }
 }
 
 static hwaddr ppc_hash32_pteg_search(PowerPCCPU *cpu, hwaddr pteg_off,
@@ -250,7 +258,7 @@ static hwaddr ppc_hash32_pteg_search(PowerPCCPU *cpu, hwaddr pteg_off,
 static void ppc_hash32_set_r(PowerPCCPU *cpu, hwaddr pte_offset, uint32_t pte1)
 {
     target_ulong base = ppc_hash32_hpt_base(cpu);
-    hwaddr offset = pte_offset + 6;
+    hwaddr offset = pte_offset + (cpu->env.bytelaneswap ? 1 : 6);
 
     /* The HW performs a non-atomic byte update */
     stb_phys(CPU(cpu)->as, base + offset, ((pte1 >> 8) & 0xff) | 0x01);
@@ -259,7 +267,7 @@ static void ppc_hash32_set_r(PowerPCCPU *cpu, hwaddr pte_offset, uint32_t pte1)
 static void ppc_hash32_set_c(PowerPCCPU *cpu, hwaddr pte_offset, uint64_t pte1)
 {
     target_ulong base = ppc_hash32_hpt_base(cpu);
-    hwaddr offset = pte_offset + 7;
+    hwaddr offset = pte_offset + (cpu->env.bytelaneswap ? 0 : 7);
 
     /* The HW performs a non-atomic byte update */
     stb_phys(CPU(cpu)->as, base + offset, (pte1 & 0xff) | 0x80);
