@@ -27,7 +27,7 @@
 #include "ui/console.h"
 #include "hw/usb/usb.h"
 #include "migration/vmstate.h"
-#include "desc.h"
+#include "hw/usb/desc.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
@@ -588,6 +588,21 @@ static void usb_hid_handle_control(USBDevice *dev, USBPacket *p,
         /* hid specific requests */
     case InterfaceRequest | USB_REQ_GET_DESCRIPTOR:
         switch (value >> 8) {
+        case 0x21:
+            /* HID descriptor - Mac OS X 10.0 requests this explicitly */
+            if (dev->config) {
+                const USBDescIface *iface = dev->config->ifs;
+                if (iface && iface->ndesc > 0 && iface->descs[0].data) {
+                    size_t hid_len = iface->descs[0].data[0]; /* First byte is length */
+                    if (hid_len > (size_t)length) {
+                        hid_len = length;
+                    }
+                    memcpy(data, iface->descs[0].data, hid_len);
+                    p->actual_length = hid_len;
+                    break;
+                }
+            }
+            goto fail;
         case 0x22:
             if (hs->kind == HID_MOUSE) {
                 memcpy(data, qemu_mouse_hid_report_descriptor,
