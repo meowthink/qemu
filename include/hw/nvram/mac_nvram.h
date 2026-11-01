@@ -52,9 +52,15 @@ struct MacIONVRAMState {
 };
 
 void pmac_format_nvram_partition(MacIONVRAMState *nvr, int len);
+
+/* The genuine Old World Open Firmware NVRAM partition (0x1275 v5 at 0x1800)
+ * a Beige G3 ROM validates, plus the Startup-Disk-style helpers. */
+void pmac_format_nvram_partition_oldworld(MacIONVRAMState *nvr);
+bool pmac_oldworld_nvram_is_default(MacIONVRAMState *nvr);
+void pmac_oldworld_nvram_set_osx_startup(MacIONVRAMState *nvr,
+                                         const char *device);
 BlockBackend *macio_nvram_default_blk(const char *filename, uint32_t size,
                                      uint8_t fill);
 bool macio_nvram_is_blank(MacIONVRAMState *nvr, int len);
-void pmac_format_nvram_partition_oldworld(MacIONVRAMState *nvr);
 
 #endif /* MAC_NVRAM_H */

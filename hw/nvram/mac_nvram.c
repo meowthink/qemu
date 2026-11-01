@@ -395,6 +395,72 @@ static bool oldworld_of_partition_valid(const uint8_t *buf)
     return ((~acc) & 0xffff) == stored;
 }
 
+#define OLDWORLD_OF_TOP         0x08
+#define OLDWORLD_OF_FLAGS       0x0c
+#define OLDWORLD_OF_VARS        0x34
+
+enum {
+    OF_VAR_BOOT_DEVICE, OF_VAR_BOOT_FILE, OF_VAR_DIAG_DEVICE,
+    OF_VAR_DIAG_FILE, OF_VAR_INPUT_DEVICE, OF_VAR_OUTPUT_DEVICE,
+    OF_VAR_OEM_BANNER, OF_VAR_OEM_LOGO, OF_VAR_NVRAMRC,
+    OF_VAR_BOOT_COMMAND, OF_VAR__COUNT
+};
+
+#define OLDWORLD_OF_AUTO_BOOT       0x20000000
+#define OLDWORLD_OF_USE_NVRAMRC     0x01000000
+
+static const char *oldworld_of_get_var(const uint8_t *buf, int var,
+                                       unsigned *len)
+{
+    unsigned off = lduw_be_p(buf + OLDWORLD_OF_VARS + 4 * var);
+
+    *len = lduw_be_p(buf + OLDWORLD_OF_VARS + 4 * var + 2);
+    if (off < OLDWORLD_OF_OFFSET ||
+        off + *len > OLDWORLD_OF_OFFSET + OLDWORLD_OF_SIZE) {
+        *len = 0;
+        return NULL;
+    }
+    return (const char *)buf + (off - OLDWORLD_OF_OFFSET);
+}
+
+static bool oldworld_of_set_vars(uint8_t *buf,
+                                 const char *const value[OF_VAR__COUNT],
+                                 uint32_t flags)
+{
+    unsigned heap = OLDWORLD_OF_SIZE, off[OF_VAR__COUNT], len[OF_VAR__COUNT];
+    uint8_t new_part[OLDWORLD_OF_SIZE];
+    unsigned table_end = lduw_be_p(buf + 0x06) - OLDWORLD_OF_OFFSET;
+    int i;
+
+    memcpy(new_part, buf, OLDWORLD_OF_SIZE);
+
+    for (i = 0; i < OF_VAR__COUNT; i++) {
+        len[i] = value[i] ? strlen(value[i]) : 0;
+        if (len[i] > heap || heap - len[i] < table_end) {
+            return false;
+        }
+        heap -= len[i];
+        memcpy(new_part + heap, value[i], len[i]);
+        off[i] = heap;
+    }
+
+    memset(new_part + table_end, 0, heap - table_end);
+    for (i = 0; i < OF_VAR__COUNT; i++) {
+        stw_be_p(new_part + OLDWORLD_OF_VARS + 4 * i,
+                 OLDWORLD_OF_OFFSET + (len[i] ? off[i] : heap));
+        stw_be_p(new_part + OLDWORLD_OF_VARS + 4 * i + 2, len[i]);
+    }
+    stw_be_p(new_part + OLDWORLD_OF_TOP, OLDWORLD_OF_OFFSET + heap);
+    stl_be_p(new_part + OLDWORLD_OF_FLAGS, flags);
+    stw_be_p(new_part + 4, 0);
+    stw_be_p(new_part + 4, oldworld_of_checksum(new_part));
+
+    memcpy(buf, new_part, OLDWORLD_OF_SIZE);
+    return true;
+}
+
+#define OLDWORLD_POST_REQ_OFFSET 0x1043
+
 /* Set up the Old World genuine-OF NVRAM partition (not the CHRP/OpenBIOS
  * one below, which real Old World ROMs never look at). If a backing file
  * (nvr->blk) already holds a valid partition -- persisted from an earlier
@@ -402,6 +468,14 @@ static bool oldworld_of_partition_valid(const uint8_t *buf)
 void pmac_format_nvram_partition_oldworld(MacIONVRAMState *nvr)
 {
     uint8_t *buf = &nvr->data[OLDWORLD_OF_OFFSET];
+
+    if (nvr->data[OLDWORLD_POST_REQ_OFFSET]) {
+        nvr->data[OLDWORLD_POST_REQ_OFFSET] = 0;
+        if (nvr->blk) {
+            blk_pwrite(nvr->blk, OLDWORLD_POST_REQ_OFFSET, 1,
+                       &nvr->data[OLDWORLD_POST_REQ_OFFSET], 0);
+        }
+    }
 
     if (oldworld_of_partition_valid(buf)) {
         return;
@@ -418,6 +492,75 @@ void pmac_format_nvram_partition_oldworld(MacIONVRAMState *nvr)
             error_report("%s: failed to write default Old World NVRAM "
                         "partition", blk_name(nvr->blk));
         }
+    }
+}
+
+static const char oldworld_osx_boot_command[] = "0 bootr ";
+
+static const char oldworld_osx_boot_shim[] =
+    "hex\r"
+    ": qE device-end ;\r"
+    ": qR BRpatch ;\r"
+    ": qprop 0 to my-self property ;\r"
+    ": qargs \" \" encode-string \" machargs\" \" /chosen\" find-device "
+        "qprop qE ;\r"
+    ": qmem ['] install-interrupt-vectors ['] noop qR\r"
+    "0 4000 release-mem 8000 2000 release-mem ;\r"
+    "dev mac-io\r"
+    ": decode-unit parse-1hex ;\r"
+    "qE\r"
+    ": bootr qargs qmem boot ;\r";
+
+bool pmac_oldworld_nvram_is_default(MacIONVRAMState *nvr)
+{
+    const uint8_t *buf = &nvr->data[OLDWORLD_OF_OFFSET];
+    const char *dev;
+    unsigned dev_len, rc_len;
+
+    if (!oldworld_of_partition_valid(buf)) {
+        return false;
+    }
+    dev = oldworld_of_get_var(buf, OF_VAR_BOOT_DEVICE, &dev_len);
+    oldworld_of_get_var(buf, OF_VAR_NVRAMRC, &rc_len);
+
+    return rc_len == 0 && dev_len == strlen("/AAPL,ROM") &&
+           !memcmp(dev, "/AAPL,ROM", dev_len);
+}
+
+void pmac_oldworld_nvram_set_osx_startup(MacIONVRAMState *nvr,
+                                         const char *device)
+{
+    uint8_t *buf = &nvr->data[OLDWORLD_OF_OFFSET];
+    const char *value[OF_VAR__COUNT] = { NULL };
+    unsigned len;
+    int i;
+
+    for (i = 0; i < OF_VAR__COUNT; i++) {
+        value[i] = oldworld_of_get_var(buf, i, &len);
+        value[i] = len ? g_strndup(value[i], len) : NULL;
+    }
+    g_free((char *)value[OF_VAR_BOOT_DEVICE]);
+    value[OF_VAR_BOOT_DEVICE] = g_strdup(device);
+    g_free((char *)value[OF_VAR_NVRAMRC]);
+    value[OF_VAR_NVRAMRC] = g_strdup(oldworld_osx_boot_shim);
+    g_free((char *)value[OF_VAR_BOOT_COMMAND]);
+    value[OF_VAR_BOOT_COMMAND] = g_strdup(oldworld_osx_boot_command);
+
+    if (!oldworld_of_set_vars(buf, value,
+                              ldl_be_p(buf + OLDWORLD_OF_FLAGS) |
+                              OLDWORLD_OF_AUTO_BOOT |
+                              OLDWORLD_OF_USE_NVRAMRC)) {
+        warn_report("NVRAM: Mac OS X startup shim does not fit, leaving "
+                    "the default partition alone");
+    } else if (nvr->blk &&
+               blk_pwrite(nvr->blk, OLDWORLD_OF_OFFSET, OLDWORLD_OF_SIZE,
+                          buf, 0) < 0) {
+        error_report("%s: failed to write the Mac OS X startup NVRAM "
+                     "partition", blk_name(nvr->blk));
+    }
+
+    for (i = 0; i < OF_VAR__COUNT; i++) {
+        g_free((char *)value[i]);
     }
 }
 
