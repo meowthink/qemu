@@ -51,10 +51,24 @@ struct UNINHostState {
     PCIHostState parent_obj;
 
     uint32_t ofw_addr;
-    qemu_irq irqs[4];
+    bool real_irq_map;
+    bool no_self_func;
+    qemu_irq irqs[8];
     MemoryRegion pci_mmio;
     MemoryRegion pci_hole;
     MemoryRegion pci_io;
+
+    /*
+     * UniNorth's AGP GART, programmed through three registers that sit
+     * in the AGP host bridge's own config space right after its AGP
+     * capability (see unin_agp_pci_host_config_write()). Only the AGP
+     * bridge uses these.
+     */
+    uint32_t gart_base;          /* table address | aperture size code */
+    uint32_t agp_base;           /* aperture base on the AGP bus */
+    uint32_t gart_ctrl;
+    IOMMUMemoryRegion agp_iommu;
+    AddressSpace agp_dma_as;
 };
 
 struct UNINState {
