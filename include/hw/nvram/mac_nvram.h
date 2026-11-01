@@ -41,6 +41,10 @@ struct MacIONVRAMState {
 
     uint32_t size;
     uint32_t it_shift;
+    bool flash;                 /* emulate the Intel-style flash interface */
+    uint8_t flash_cmd;          /* command latched by the previous write */
+    uint8_t flash_status;
+    bool flash_read_id;         /* the part is answering an id-part cycle */
 
     MemoryRegion mem;
     uint8_t *data;
@@ -48,5 +52,9 @@ struct MacIONVRAMState {
 };
 
 void pmac_format_nvram_partition(MacIONVRAMState *nvr, int len);
+BlockBackend *macio_nvram_default_blk(const char *filename, uint32_t size,
+                                     uint8_t fill);
+bool macio_nvram_is_blank(MacIONVRAMState *nvr, int len);
+void pmac_format_nvram_partition_oldworld(MacIONVRAMState *nvr);
 
 #endif /* MAC_NVRAM_H */

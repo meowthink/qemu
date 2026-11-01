@@ -32,14 +32,130 @@
 #include "system/block-backend.h"
 #include "migration/vmstate.h"
 #include "qemu/cutils.h"
+#include "qemu/bswap.h"
 #include "qemu/module.h"
 #include "qemu/error-report.h"
+#include "qobject/qdict.h"
+#include "qapi/error.h"
 #include "trace.h"
 #include <zlib.h> /* for adler32 */
 
 #define DEF_SYSTEM_SIZE 0xc10
 
 /* macio style NVRAM device */
+/*
+ * A real Apple ROM keeps its Open Firmware variables in the boot flash and
+ * maintains them with the Intel command set. Its /nvram package decompiles to
+ *
+ *   erase: 20 -> block, d0 -> block, poll status bit 0x80, ff -> block,
+ *          then verify the block reads all ones
+ *   write: 40 -> byte, data -> byte, poll status, ff -> block, verify
+ *
+ * so the window has to answer those commands. Treated as plain RAM every
+ * erase fails its verify and the firmware reports "ERASE failure on NVRAM",
+ * losing every setting. Erase granularity is 8KB: the ROM's own info property
+ * describes fff04000 as 0x4000 long and its package alternates between two
+ * blocks.
+ *
+ * The PowerMac3,6 ROM (4.6.0f1) additionally identifies the part before it
+ * touches it: id-part writes ff then 90 to the window base and reads a
+ * 16-bit manufacturer/device word back, accepting only Sharp b04b/b0ed,
+ * Micron 8999/899d or (after the AMD unlock sequence) 0137. Anything else
+ * takes its "unknown-flash-part" branch, and that branch is broken in the
+ * ROM itself -- it leaves the string's address where encode-string expects
+ * its length, so the property allocator advances `here` by ~4GB and Open
+ * Firmware dies in a DSI storm before it ever probes a boot device. Real
+ * hardware never gets there, so neither may we: answer as the Sharp part,
+ * the first one probed. Its ready?/reset words use 70 (read status) and 50
+ * (clear status) on top of the erase/program commands above.
+ */
+#define NVRAM_FLASH_SECTOR   0x2000
+#define NVRAM_FLASH_READY    0x80
+#define NVRAM_FLASH_MFR_ID   0xb0   /* Sharp */
+#define NVRAM_FLASH_DEV_ID   0x4b
+
+enum {
+    NVRAM_FLASH_CMD_NONE        = 0x00,
+    NVRAM_FLASH_CMD_ERASE_SETUP = 0x20,
+    NVRAM_FLASH_CMD_PROGRAM     = 0x40,
+    NVRAM_FLASH_CMD_CLEAR_STATUS = 0x50,
+    NVRAM_FLASH_CMD_READ_STATUS = 0x70,
+    NVRAM_FLASH_CMD_READ_ID     = 0x90,
+    NVRAM_FLASH_CMD_ERASE_CONF  = 0xd0,
+    NVRAM_FLASH_CMD_READ_ARRAY  = 0xff,
+};
+
+static void macio_nvram_flush(MacIONVRAMState *s, hwaddr addr, int len)
+{
+    if (s->blk) {
+        if (blk_pwrite(s->blk, addr, len, &s->data[addr], 0) < 0) {
+            error_report("%s: cannot write to NVRAM", blk_name(s->blk));
+        }
+    }
+}
+
+/* Returns true if the access was a command rather than plain data. */
+static bool macio_nvram_flash_write(MacIONVRAMState *s, hwaddr addr,
+                                    uint8_t value)
+{
+    if (!s->flash) {
+        return false;
+    }
+
+    switch (s->flash_cmd) {
+    case NVRAM_FLASH_CMD_ERASE_SETUP:
+        s->flash_cmd = NVRAM_FLASH_CMD_NONE;
+        if (value == NVRAM_FLASH_CMD_ERASE_CONF) {
+            hwaddr base = addr & ~(hwaddr)(NVRAM_FLASH_SECTOR - 1);
+
+            memset(&s->data[base], 0xff, NVRAM_FLASH_SECTOR);
+            macio_nvram_flush(s, base, NVRAM_FLASH_SECTOR);
+            s->flash_status = NVRAM_FLASH_READY;
+        }
+        return true;
+
+    case NVRAM_FLASH_CMD_PROGRAM:
+        /* Programming can only clear bits, exactly like the real part. */
+        s->flash_cmd = NVRAM_FLASH_CMD_NONE;
+        s->data[addr] &= value;
+        macio_nvram_flush(s, addr, 1);
+        s->flash_status = NVRAM_FLASH_READY;
+        return true;
+
+    default:
+        break;
+    }
+
+    switch (value) {
+    case NVRAM_FLASH_CMD_ERASE_SETUP:
+    case NVRAM_FLASH_CMD_PROGRAM:
+        s->flash_cmd = value;
+        s->flash_status = 0;
+        s->flash_read_id = false;
+        return true;
+    case NVRAM_FLASH_CMD_READ_ID:
+        s->flash_status = 0;
+        s->flash_read_id = true;
+        return true;
+    case NVRAM_FLASH_CMD_READ_STATUS:
+        /* Nothing here takes time, so the part is always ready. */
+        s->flash_status = NVRAM_FLASH_READY;
+        s->flash_read_id = false;
+        return true;
+    case NVRAM_FLASH_CMD_CLEAR_STATUS:
+        /* No error bits are modelled; the read mode is left alone. */
+        return true;
+    case NVRAM_FLASH_CMD_READ_ARRAY:
+        s->flash_cmd = NVRAM_FLASH_CMD_NONE;
+        s->flash_status = 0;
+        s->flash_read_id = false;
+        return true;
+    default:
+        /* Anything else in the array state is not data: ignore it. */
+        return true;
+    }
+}
+
 static void macio_nvram_writeb(void *opaque, hwaddr addr,
                                uint64_t value, unsigned size)
 {
@@ -47,6 +163,10 @@ static void macio_nvram_writeb(void *opaque, hwaddr addr,
 
     addr = (addr >> s->it_shift) & (s->size - 1);
     trace_macio_nvram_write(addr, value);
+
+    if (macio_nvram_flash_write(s, addr, value)) {
+        return;
+    }
     s->data[addr] = value;
     if (s->blk) {
         if (blk_pwrite(s->blk, addr, 1, &s->data[addr], 0) < 0) {
@@ -64,6 +184,13 @@ static uint64_t macio_nvram_readb(void *opaque, hwaddr addr,
 
     addr = (addr >> s->it_shift) & (s->size - 1);
     value = s->data[addr];
+    /* While a command is in flight the part reports its status register. */
+    if (s->flash && s->flash_status) {
+        value = s->flash_status;
+    } else if (s->flash && s->flash_read_id) {
+        value = (addr & 1) ? NVRAM_FLASH_DEV_ID : NVRAM_FLASH_MFR_ID;
+    }
+
     trace_macio_nvram_read(addr, value);
 
     return value;
@@ -73,7 +200,14 @@ static const MemoryRegionOps macio_nvram_ops = {
     .read = macio_nvram_readb,
     .write = macio_nvram_writeb,
     .valid.min_access_size = 1,
-    .valid.max_access_size = 4,
+    /*
+     * A real Apple ROM verifies an erased block with 64-bit reads (its
+     * /nvram package uses xd@), so the window has to accept them -- they
+     * are still serviced a byte at a time via .impl below. Rejecting them
+     * makes the verify read something other than the erased pattern and
+     * the firmware reports "ERASE failure on NVRAM".
+     */
+    .valid.max_access_size = 8,
     .impl.min_access_size = 1,
     .impl.max_access_size = 1,
     .endianness = DEVICE_BIG_ENDIAN,
@@ -92,6 +226,12 @@ static const VMStateDescription vmstate_macio_nvram = {
 
 static void macio_nvram_reset(DeviceState *dev)
 {
+    MacIONVRAMState *s = MACIO_NVRAM(dev);
+
+    /* A reset part comes back in read-array mode. */
+    s->flash_cmd = NVRAM_FLASH_CMD_NONE;
+    s->flash_status = 0;
+    s->flash_read_id = false;
 }
 
 static void macio_nvram_realizefn(DeviceState *dev, Error **errp)
@@ -137,6 +277,7 @@ static void macio_nvram_unrealizefn(DeviceState *dev)
 static const Property macio_nvram_properties[] = {
     DEFINE_PROP_UINT32("size", MacIONVRAMState, size, 0),
     DEFINE_PROP_UINT32("it_shift", MacIONVRAMState, it_shift, 0),
+    DEFINE_PROP_BOOL("flash", MacIONVRAMState, flash, false),
     DEFINE_PROP_DRIVE("drive", MacIONVRAMState, blk),
 };
 
@@ -178,6 +319,108 @@ static void pmac_format_nvram_partition_of(MacIONVRAMState *nvr, int off,
     chrp_nvram_create_free_partition(&nvr->data[sysp_end], len - sysp_end);
 }
 
+/*
+ * Old World Macs' genuine Open Firmware NVRAM partition: signature 0x1275,
+ * version 5, at a fixed offset (0x1800) -- a completely different layout
+ * from the CHRP/OpenBIOS text partition above (which is what New World
+ * ROMs use instead; see DingusPPC's devices/common/ofnvram.cpp, whose own
+ * comments label OfConfigAppl "Old World" vs OfConfigChrp "New World").
+ * A real Beige G3 ROM's NanoKernel-level NVRAM validation looks for this
+ * exact structure; without it, the boot never leaves the 68K low-memory
+ * init code (confirmed by comparing against a live DingusPPC capture of
+ * the identical ROM, whose own NVRAM has this partition populated and
+ * has nothing at all at the offsets the CHRP partition above uses).
+ *
+ * The two chunks below are copied verbatim from a real, checksum-valid
+ * partition captured from a successful DingusPPC boot of this same ROM
+ * (header + int vars, then the string heap grown down from the partition
+ * end); everything in between is zero, matching the captured data.
+ */
+#define OLDWORLD_OF_OFFSET      0x1800
+#define OLDWORLD_OF_SIZE        0x800
+
+static const uint8_t oldworld_of_partition_head[] = {
+    /* sig=0x1275 version=5 num_pages=8 checksum=0x78fb here=0x185c top=0x1fe2 */
+    0x12, 0x75, 0x05, 0x08, 0x78, 0xfb, 0x18, 0x5c, 0x1f, 0xe2, 0x00, 0x00,
+    /* flags (auto-boot? only) */
+    0x20, 0x00, 0x00, 0x00,
+    /* real-base, real-size, virt-base, virt-size, load-base */
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x10, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00,
+    /* pci-probe-list, screen-#columns, screen-#rows */
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x28,
+    /* selftest-#megs */
+    0x00, 0x00, 0x00, 0x00,
+    /* boot-device, boot-file, diag-device, diag-file, input-device,
+     * output-device, oem-banner, oem-logo, nvramrc, boot-command
+     * (offset,length) pairs into the string heap below */
+    0x1f, 0xf7, 0x00, 0x09, 0x1f, 0xf7, 0x00, 0x00,
+    0x1f, 0xef, 0x00, 0x08, 0x1f, 0xef, 0x00, 0x00, 0x1f, 0xec, 0x00, 0x03,
+    0x1f, 0xe6, 0x00, 0x06, 0x1f, 0xe6, 0x00, 0x00, 0x1f, 0xe6, 0x00, 0x00,
+    0x1f, 0xe6, 0x00, 0x00, 0x1f, 0xe2, 0x00, 0x04,
+};
+
+/* "/AAPL,ROM" (boot-device), "fd:diags" (diag-device), "kbd"
+ * (input-device), "screen" (output-device), "boot" (boot-command) */
+static const uint8_t oldworld_of_partition_strings[] = {
+    'b', 'o', 'o', 't', 's', 'c', 'r', 'e', 'e', 'n', 'k', 'b', 'd',
+    'f', 'd', ':', 'd', 'i', 'a', 'g', 's',
+    '/', 'A', 'A', 'P', 'L', ',', 'R', 'O', 'M',
+};
+
+/* Checks the same signature/version/checksum a real Old World ROM's own
+ * NVRAM validation would (see DingusPPC's OfConfigAppl::validate()) --
+ * used to tell an already-valid, persisted partition (loaded from an
+ * attached backing file, e.g. a prior boot's saved boot-device) apart
+ * from a fresh/blank one that still needs our defaults. */
+static bool oldworld_of_partition_valid(const uint8_t *buf)
+{
+    uint8_t tmp[OLDWORLD_OF_SIZE];
+    uint32_t acc = 0;
+    uint16_t stored;
+    int i;
+
+    if (lduw_be_p(buf) != 0x1275 || buf[2] != 5) {
+        return false;
+    }
+
+    stored = lduw_be_p(buf + 4);
+    memcpy(tmp, buf, OLDWORLD_OF_SIZE);
+    tmp[4] = tmp[5] = 0;
+    for (i = 0; i < OLDWORLD_OF_SIZE; i += 2) {
+        acc += lduw_be_p(tmp + i);
+    }
+    acc = (acc + (acc >> 16)) & 0xffff;
+
+    return ((~acc) & 0xffff) == stored;
+}
+
+/* Set up the Old World genuine-OF NVRAM partition (not the CHRP/OpenBIOS
+ * one below, which real Old World ROMs never look at). If a backing file
+ * (nvr->blk) already holds a valid partition -- persisted from an earlier
+ * run -- it's left untouched instead of being clobbered with defaults. */
+void pmac_format_nvram_partition_oldworld(MacIONVRAMState *nvr)
+{
+    uint8_t *buf = &nvr->data[OLDWORLD_OF_OFFSET];
+
+    if (oldworld_of_partition_valid(buf)) {
+        return;
+    }
+
+    memset(buf, 0, OLDWORLD_OF_SIZE);
+    memcpy(buf, oldworld_of_partition_head, sizeof(oldworld_of_partition_head));
+    memcpy(buf + OLDWORLD_OF_SIZE - sizeof(oldworld_of_partition_strings),
+           oldworld_of_partition_strings, sizeof(oldworld_of_partition_strings));
+
+    if (nvr->blk) {
+        if (blk_pwrite(nvr->blk, OLDWORLD_OF_OFFSET, OLDWORLD_OF_SIZE, buf,
+                       0) < 0) {
+            error_report("%s: failed to write default Old World NVRAM "
+                        "partition", blk_name(nvr->blk));
+        }
+    }
+}
+
 #define OSX_NVRAM_SIGNATURE     (0x5A)
 
 /* Set up a Mac OS X NVRAM partition */
@@ -202,6 +445,66 @@ static void pmac_format_nvram_partition_osx(MacIONVRAMState *nvr, int off,
     stl_be_p(&data[16], adler32(0, &data[20], len - 20));
 }
 
+/*
+ * Manage a default NVRAM backing file when the user has not attached one
+ * with -drive if=mtd,... Without this the contents are re-stamped from
+ * scratch on every run, so nothing a firmware writes -- boot-device,
+ * auto-boot?, the lot -- ever survives a restart.
+ */
+BlockBackend *macio_nvram_default_blk(const char *filename, uint32_t size,
+                                     uint8_t fill)
+{
+    struct stat st;
+    BlockBackend *blk;
+    Error *local_err = NULL;
+    QDict *options;
+    int fd;
+
+    fd = qemu_open_old(filename, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) {
+        warn_report("could not open/create default NVRAM image '%s': %s",
+                    filename, strerror(errno));
+        return NULL;
+    }
+    if (fstat(fd, &st) == 0 && st.st_size < size) {
+        /*
+         * Flash-backed NVRAM must start out erased (all ones), not zeroed:
+         * firmware tells "never written" from "written and invalid", and a
+         * block of zeroes is neither.
+         */
+        g_autofree uint8_t *blank = g_malloc(size);
+
+        memset(blank, fill, size);
+        if (ftruncate(fd, 0) != 0 || write(fd, blank, size) != size) {
+            warn_report("could not size default NVRAM image '%s': %s",
+                        filename, strerror(errno));
+        }
+    }
+    close(fd);
+
+    options = qdict_new();
+    qdict_put_str(options, "driver", "raw");
+    blk = blk_new_open(filename, NULL, options, BDRV_O_RDWR, &local_err);
+    if (!blk) {
+        warn_report_err(local_err);
+        return NULL;
+    }
+    return blk;
+}
+
+/* True if nothing has ever been stored here. */
+bool macio_nvram_is_blank(MacIONVRAMState *nvr, int len)
+{
+    int i;
+
+    for (i = 0; i < len; i++) {
+        if (nvr->data[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Set up NVRAM with OF and OSX partitions */
 void pmac_format_nvram_partition(MacIONVRAMState *nvr, int len)
 {
@@ -212,5 +515,12 @@ void pmac_format_nvram_partition(MacIONVRAMState *nvr, int len)
      */
     pmac_format_nvram_partition_of(nvr, 0, len / 2);
     pmac_format_nvram_partition_osx(nvr, len / 2, len / 2);
+
+    if (nvr->blk) {
+        if (blk_pwrite(nvr->blk, 0, len, nvr->data, 0) < 0) {
+            error_report("%s: failed to write default NVRAM partitions",
+                         blk_name(nvr->blk));
+        }
+    }
 }
 type_init(macio_nvram_register_types)
