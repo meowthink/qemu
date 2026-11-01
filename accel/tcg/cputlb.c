@@ -1916,6 +1916,12 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
  * We don't bother with this widened value for SOFTMMU_CODE_ACCESS.
  */
 
+/* The BQL around a device access, unless the region does its own locking. */
+static inline BQLLockAuto *mmio_bql_lock(MemoryRegion *mr)
+{
+    return mr->lockless_io ? NULL : bql_auto_lock(__FILE__, __LINE__);
+}
+
 /**
  * do_ld_mmio_beN:
  * @cpu: generic cpu state
@@ -1925,7 +1931,7 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
  * @size: number of bytes
  * @mmu_idx: virtual address context
  * @ra: return address into tcg generated code, or 0
- * Context: BQL held
+ * Context: BQL held, unless the region is lockless_io
  *
  * Load @size bytes from @addr, which is memory-mapped i/o.
  * The bytes are concatenated in big-endian order with @ret_be.
@@ -1977,7 +1983,7 @@ static uint64_t do_ld_mmio_beN(CPUState *cpu, CPUTLBEntryFull *full,
     section = io_prepare(&mr_offset, cpu, full, addr, ra);
     mr = section->mr;
 
-    BQL_LOCK_GUARD();
+    g_autoptr(BQLLockAuto) bql G_GNUC_UNUSED = mmio_bql_lock(mr);
     return int_ld_mmio_beN(cpu, full, ret_be, addr, size, mmu_idx,
                            type, ra, mr, mr_offset);
 }
@@ -1996,7 +2002,7 @@ static Int128 do_ld16_mmio_beN(CPUState *cpu, CPUTLBEntryFull *full,
     section = io_prepare(&mr_offset, cpu, full, addr, ra);
     mr = section->mr;
 
-    BQL_LOCK_GUARD();
+    g_autoptr(BQLLockAuto) bql G_GNUC_UNUSED = mmio_bql_lock(mr);
     a = int_ld_mmio_beN(cpu, full, ret_be, addr, size - 8, mmu_idx,
                         MMU_DATA_LOAD, ra, mr, mr_offset);
     b = int_ld_mmio_beN(cpu, full, ret_be, addr + size - 8, 8, mmu_idx,
@@ -2438,7 +2444,7 @@ static Int128 do_ld16_mmu(CPUState *cpu, vaddr addr,
  * @size: number of bytes
  * @mmu_idx: virtual address context
  * @ra: return address into tcg generated code, or 0
- * Context: BQL held
+ * Context: BQL held, unless the region is lockless_io
  *
  * Store @size bytes at @addr, which is memory-mapped i/o.
  * The bytes to store are extracted in little-endian order from @val_le;
@@ -2491,7 +2497,7 @@ static uint64_t do_st_mmio_leN(CPUState *cpu, CPUTLBEntryFull *full,
     section = io_prepare(&mr_offset, cpu, full, addr, ra);
     mr = section->mr;
 
-    BQL_LOCK_GUARD();
+    g_autoptr(BQLLockAuto) bql G_GNUC_UNUSED = mmio_bql_lock(mr);
     return int_st_mmio_leN(cpu, full, val_le, addr, size, mmu_idx,
                            ra, mr, mr_offset);
 }
@@ -2509,7 +2515,7 @@ static uint64_t do_st16_mmio_leN(CPUState *cpu, CPUTLBEntryFull *full,
     section = io_prepare(&mr_offset, cpu, full, addr, ra);
     mr = section->mr;
 
-    BQL_LOCK_GUARD();
+    g_autoptr(BQLLockAuto) bql G_GNUC_UNUSED = mmio_bql_lock(mr);
     int_st_mmio_leN(cpu, full, int128_getlo(val_le), addr, 8,
                     mmu_idx, ra, mr, mr_offset);
     return int_st_mmio_leN(cpu, full, int128_gethi(val_le), addr + 8,
