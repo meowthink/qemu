@@ -303,19 +303,22 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
                           0x1000);
     memory_region_add_subregion(&s->bar, 0x15000, timer_memory);
 
-    if (ns->has_pmu) {
-        /* GPIOs */
-        if (!qdev_realize(DEVICE(&ns->gpio), BUS(&s->macio_bus), errp)) {
-            return;
-        }
-        sbd = SYS_BUS_DEVICE(&ns->gpio);
-        sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev,
-                           NEWWORLD_EXTING_GPIO1));
-        sysbus_connect_irq(sbd, 9, qdev_get_gpio_in(pic_dev,
-                           NEWWORLD_EXTING_GPIO9));
-        memory_region_add_subregion(&s->bar, 0x50,
-                                    sysbus_mmio_get_region(sbd, 0));
+    /*
+     * GPIOs - always realize regardless of CUDA/PMU configuration.
+     * The GPIO device is needed for SMP CPU reset lines even with CUDA.
+     */
+    if (!qdev_realize(DEVICE(&ns->gpio), BUS(&s->macio_bus), errp)) {
+        return;
+    }
+    sbd = SYS_BUS_DEVICE(&ns->gpio);
+    sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev,
+                       NEWWORLD_EXTING_GPIO1));
+    sysbus_connect_irq(sbd, 9, qdev_get_gpio_in(pic_dev,
+                       NEWWORLD_EXTING_GPIO9));
+    memory_region_add_subregion(&s->bar, 0x50,
+                                sysbus_mmio_get_region(sbd, 0));
 
+    if (ns->has_pmu) {
         /* PMU */
         object_initialize_child(OBJECT(s), "pmu", &s->pmu, TYPE_VIA_PMU);
         object_property_set_link(OBJECT(&s->pmu), "gpio", OBJECT(sbd),
@@ -329,8 +332,6 @@ static void macio_newworld_realize(PCIDevice *d, Error **errp)
         memory_region_add_subregion(&s->bar, 0x16000,
                                     sysbus_mmio_get_region(sbd, 0));
     } else {
-        object_unparent(OBJECT(&ns->gpio));
-
         /* CUDA */
         object_initialize_child(OBJECT(s), "cuda", &s->cuda, TYPE_CUDA);
         qdev_prop_set_uint64(DEVICE(&s->cuda), "timebase-frequency",
