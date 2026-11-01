@@ -209,6 +209,7 @@ enum {
     LSI_DMA_SCRIPTS, /* processing DMA from lsi_execute_script */
     LSI_DMA_IN_PROGRESS, /* DMA operation is in progress */
     LSI_WAIT_SCRIPTS, /* SCRIPTS stopped because of instruction count limit */
+    LSI_WAIT_SELECT, /* Select is waiting for STIME0's selection time-out */
 };
 
 enum {
@@ -230,6 +231,7 @@ struct LSIState {
     AddressSpace pci_io_as;
     QEMUTimer *scripts_timer;
     QEMUTimer *scsi_reset_timer;
+    QEMUTimer *select_timer;
     bool scsi_reset_asserted;
     bool scsi_reset_pending;
 
@@ -282,6 +284,9 @@ struct LSIState {
     uint8_t scid;
     uint8_t sxfer;
     uint8_t socl;
+    uint8_t sodl;
+    uint8_t slpar;
+    uint8_t macntl;
     uint8_t sdid;
     uint8_t ssid;
     uint8_t sfbr;
@@ -311,10 +316,23 @@ struct LSIState {
     uint8_t sbr;
     uint32_t adder;
 
+    bool select_no_atn_cmd;
+    bool disconnect_udc;
+    bool disconnect_pending;
+    bool select_timeout;
+    bool defer_start;
+    bool select_atn_bit24;
+    bool reset_devices;
+    bool identify_seen;
+    uint8_t sist_stacked;
+    bool select_timeout_armed;
+    uint32_t select_timeout_id;
+
     uint8_t script_ram[2048 * sizeof(uint32_t)];
 };
 
 #define TYPE_LSI53C810  "lsi53c810"
+#define TYPE_LSI53C825  "lsi53c825"
 #define TYPE_LSI53C895A "lsi53c895a"
 
 OBJECT_DECLARE_SIMPLE_TYPE(LSIState, LSI53C895A)
@@ -356,6 +374,9 @@ static void lsi_soft_reset(LSIState *s)
 {
     trace_lsi_reset();
     timer_del(s->scsi_reset_timer);
+    /* A reset abandons a selection in progress; its time-out must not land. */
+    timer_del(s->select_timer);
+    s->select_timeout_armed = false;
     s->scsi_reset_asserted = false;
     s->scsi_reset_pending = false;
     s->carry = 0;
@@ -377,6 +398,8 @@ static void lsi_soft_reset(LSIState *s)
     s->sist1 = 0;
     s->sien0 = 0;
     s->sien1 = 0;
+    s->sist_stacked = 0;
+    s->identify_seen = false;
     s->mbox0 = 0;
     s->mbox1 = 0;
     s->dfifo = 0;
@@ -485,9 +508,20 @@ static inline uint32_t read_dword(LSIState *s, uint32_t addr)
     return cpu_to_le32(buf);
 }
 
+static void lsi_script_scsi_interrupt(LSIState *s, int stat0, int stat1);
+
 static void lsi_stop_script(LSIState *s)
 {
     s->istat1 &= ~LSI_ISTAT1_SRUN;
+    /*
+     * Raised when the engine halts, not when the bus went free: a driver that
+     * tests DCMD for the $98 INT opcode must see that opcode, not the
+     * Clear-ACK one.  See "disconnect-udc".
+     */
+    if (s->disconnect_pending) {
+        s->disconnect_pending = false;
+        lsi_script_scsi_interrupt(s, LSI_SIST0_UDC, 0);
+    }
 }
 
 static void lsi_set_irq(LSIState *s, int level)
@@ -542,6 +576,16 @@ static void lsi_update_irq(LSIState *s)
         if (p) {
             lsi_reselect(s, p);
         }
+    }
+}
+
+/* Move a stacked second-level SCSI interrupt into view; see lsi_bad_selection. */
+static void lsi_sist_read_done(LSIState *s)
+{
+    if (!(s->sist0 | s->sist1) && s->sist_stacked) {
+        s->sist0 |= s->sist_stacked;
+        s->sist_stacked = 0;
+        lsi_update_irq(s);
     }
 }
 
@@ -626,7 +670,57 @@ static void lsi_bad_selection(LSIState *s, uint32_t id)
 {
     trace_lsi_bad_selection(id);
     lsi_script_scsi_interrupt(s, 0, LSI_SIST1_STO);
+    /*
+     * A selection time-out also sets SIST0.UDC, but second-level: the part
+     * stacks it behind the pending STO and presents it once the first level
+     * has been read (TM v3.1 2.4.13.5, 4.2 Register 0x42).  The AIX pscsidd
+     * driver matches SIST words by equality, so the causes need both reads.
+     */
+    if (s->disconnect_udc) {
+        s->sist_stacked |= LSI_SIST0_UDC;
+    }
     lsi_disconnect(s);
+}
+
+/*
+ * The selection time-out is the 200 us selection abort time plus STIME0's
+ * SEL value doubled from 100 us (LSI53C825A TM v3.1, STIME0).  SEL = 0
+ * leaves only the abort time, so an absent target never fails inside the
+ * store that started the selection.
+ */
+static uint64_t lsi_select_timeout_ns(LSIState *s)
+{
+    unsigned sel = s->stime0 & 0xf;
+
+    return 200000ULL + (sel ? (100000ULL << (sel - 1)) : 0);
+}
+
+static void lsi_select_timeout_cb(void *opaque)
+{
+    LSIState *s = opaque;
+
+    if (!s->select_timeout_armed) {
+        return;
+    }
+    s->select_timeout_armed = false;
+    s->waiting = LSI_NOWAIT;
+    lsi_bad_selection(s, s->select_timeout_id);
+    lsi_stop_script(s);
+}
+
+/*
+ * An abort or a SCSI bus reset drops the selection still arbitrating: the
+ * part is no longer on the bus, so the time-out must not land later against
+ * whatever the driver is doing by then.
+ */
+static void lsi_select_timeout_cancel(LSIState *s)
+{
+    if (!s->select_timeout_armed) {
+        return;
+    }
+    timer_del(s->select_timer);
+    s->select_timeout_armed = false;
+    s->waiting = LSI_NOWAIT;
 }
 
 /* Initiate a SCSI layer data transfer.  */
@@ -871,6 +965,14 @@ static void lsi_do_command(LSIState *s)
     s->command_complete = 0;
 
     id = (s->select_tag >> 8) & 0xf;
+    /*
+     * A selection that did not assert ATN carries no IDENTIFY message, so the
+     * LUN is the one in the CDB (byte 1 bits 7:5).  scsi_device_find() would
+     * otherwise fall back to the target's first device whatever LUN is named.
+     */
+    if (s->select_no_atn_cmd && !s->identify_seen) {
+        s->current_lun = buf[1] >> 5;
+    }
     dev = scsi_device_find(&s->bus, 0, id, s->current_lun);
     if (!dev) {
         lsi_bad_selection(s, id);
@@ -954,6 +1056,9 @@ static void lsi_do_msgin(LSIState *s)
             lsi_set_phase(s, PHASE_CMD);
             break;
         case LSI_MSG_ACTION_DISCONNECT:
+            if (s->disconnect_udc) {
+                s->disconnect_pending = true;
+            }
             lsi_disconnect(s);
             break;
         case LSI_MSG_ACTION_DOUT:
@@ -1107,6 +1212,7 @@ static void lsi_do_msgout(LSIState *s)
                 goto bad;
             }
             s->current_lun = msg & 7;
+            s->identify_seen = true;
             trace_lsi_do_msgout_select(s->current_lun);
             lsi_set_phase(s, PHASE_CMD);
             break;
@@ -1159,6 +1265,26 @@ static void lsi_scripts_timer_start(LSIState *s)
 {
     trace_lsi_scripts_timer_start();
     timer_mod(s->scripts_timer, qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) + 500);
+}
+
+/*
+ * A guest store starts the engine; the part then runs SCRIPTS off its own
+ * clock (fetches over PCI, every SCSI phase costing microseconds), so no
+ * command can complete inside the store that started it.  Deferring the run
+ * is what a driver waiting on the completion interrupt sees on the wire.
+ */
+static void lsi_start_script(LSIState *s)
+{
+    /* A chip that is arbitrating is busy and ignores a start meanwhile. */
+    if (s->select_timeout_armed) {
+        return;
+    }
+    if (s->defer_start) {
+        s->waiting = LSI_WAIT_SCRIPTS;
+        lsi_scripts_timer_start(s);
+        return;
+    }
+    lsi_execute_script(s);
 }
 
 static void lsi_execute_script(LSIState *s)
@@ -1331,6 +1457,7 @@ again:
         opcode = (insn >> 27) & 7;
         if (opcode < 5) {
             uint32_t id;
+            uint32_t atn;
 
             if (insn & (1 << 25)) {
                 id = read_dword(s, s->dsa + sextract32(insn, 0, 24));
@@ -1344,6 +1471,10 @@ again:
             s->dnad = addr;
             switch (opcode) {
             case 0: /* Select */
+                /* SATN/ is bit 24 in the part's own Select encoding (DCMD
+                 * $41 = "Select with ATN") and bit 3 in the reading this
+                 * model grew up with; see "select-atn-bit24". */
+                atn = insn & (s->select_atn_bit24 ? (1u << 24) : (1u << 3));
                 s->sdid = id;
                 if (s->scntl1 & LSI_SCNTL1_CON) {
                     trace_lsi_execute_script_io_alreadyreselected();
@@ -1353,22 +1484,45 @@ again:
                 s->sstat0 |= LSI_SSTAT0_WOA;
                 s->scntl1 &= ~LSI_SCNTL1_IARB;
                 if (!scsi_device_find(&s->bus, 0, id, 0)) {
+                    /*
+                     * An absent target is not an immediate failure: the part
+                     * keeps arbitrating for STIME0's selection time-out and
+                     * reports the failure when it expires (see "disconnect-udc"
+                     * for why the AIX driver needs the delayed form).
+                     */
+                    if (s->select_timeout && lsi_select_timeout_ns(s)) {
+                        s->select_timeout_id = id;
+                        s->select_timeout_armed = true;
+                        s->waiting = LSI_WAIT_SELECT;
+                        timer_mod_ns(s->select_timer,
+                                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                                     lsi_select_timeout_ns(s));
+                        break;
+                    }
                     lsi_bad_selection(s, id);
                     break;
                 }
-                trace_lsi_execute_script_io_selected(id,
-                                             insn & (1 << 3) ? " ATN" : "");
+                trace_lsi_execute_script_io_selected(id, atn ? " ATN" : "");
                 /* ??? Linux drivers complain when this is set.  Maybe
                    it only applies in low-level mode (unimplemented).
                 lsi_script_scsi_interrupt(s, LSI_SIST0_CMP, 0); */
                 s->select_tag = id << 8;
+                s->identify_seen = false;
                 s->scntl1 |= LSI_SCNTL1_CON;
-                if (insn & (1 << 3)) {
+                if (atn) {
                     s->socl |= LSI_SOCL_ATN;
                     s->sbcl |= LSI_SBCL_ATN;
                 }
                 s->sbcl |= LSI_SBCL_BSY;
-                lsi_set_phase(s, PHASE_MO);
+                /* MESSAGE OUT only when the selection asserted ATN; SCSI-2
+                 * puts a selection that carried no message into COMMAND.
+                 * See "select-no-atn-cmd". */
+                if (!s->select_no_atn_cmd || atn ||
+                    (s->scntl0 & LSI_SCNTL0_WATN)) {
+                    lsi_set_phase(s, PHASE_MO);
+                } else {
+                    lsi_set_phase(s, PHASE_CMD);
+                }
                 s->waiting = LSI_NOWAIT;
                 break;
             case 1: /* Disconnect */
@@ -1795,11 +1949,13 @@ static uint8_t lsi_reg_readb(LSIState *s, int offset)
             s->sist0 |= LSI_SIST0_RST;
             lsi_update_irq(s);
         }
+        lsi_sist_read_done(s);
         break;
     case 0x43: /* SIST1 */
         ret = s->sist1;
         s->sist1 = 0;
         lsi_update_irq(s);
+        lsi_sist_read_done(s);
         break;
     case 0x46: /* MACNTL */
         ret = 0x0f;
@@ -1873,6 +2029,12 @@ static uint8_t lsi_reg_readb(LSIState *s, int offset)
         ret = (s->scratch[n] >> shift) & 0xff;
         break;
     }
+    case 0x44: /* SLPAR */
+        ret = s->slpar;
+        break;
+    case 0x54: /* SODL */
+        ret = s->sodl;
+        break;
     default:
     {
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -1925,8 +2087,11 @@ static void lsi_reg_writeb(LSIState *s, int offset, uint8_t val)
         if (val & LSI_SCNTL1_RST) {
             if (!s->scsi_reset_asserted) {
                 s->scsi_reset_asserted = true;
-                bus_cold_reset(BUS(&s->bus));
+                if (s->reset_devices) {
+                    bus_cold_reset(BUS(&s->bus));
+                }
                 s->sstat0 |= LSI_SSTAT0_RST;
+                lsi_select_timeout_cancel(s);
                 lsi_script_scsi_interrupt(s, LSI_SIST0_RST, 0);
             }
         } else {
@@ -1977,10 +2142,15 @@ static void lsi_reg_writeb(LSIState *s, int offset, uint8_t val)
     case 0x14: /* ISTAT0 */
         s->istat0 = (s->istat0 & 0x0f) | (val & 0xf0);
         if (val & LSI_ISTAT0_SRST) {
-            device_cold_reset(DEVICE(s));
+            if (s->reset_devices) {
+                device_cold_reset(DEVICE(s));
+            } else {
+                lsi_soft_reset(s);
+            }
             return;
         }
         if (val & LSI_ISTAT0_ABRT) {
+            lsi_select_timeout_cancel(s);
             lsi_script_dma_interrupt(s, LSI_DSTAT_ABRT);
         }
         if (val & LSI_ISTAT0_INTF) {
@@ -2047,7 +2217,7 @@ static void lsi_reg_writeb(LSIState *s, int offset, uint8_t val)
          * trigger.
          */
         if ((s->istat1 & LSI_ISTAT1_SRUN) == 0) {
-            lsi_execute_script(s);
+            lsi_start_script(s);
         }
         break;
     CASE_SET_REG32(dsps, 0x30)
@@ -2069,7 +2239,7 @@ static void lsi_reg_writeb(LSIState *s, int offset, uint8_t val)
          * instruction.  Is this correct?
          */
         if ((val & LSI_DCNTL_STD) && (s->istat1 & LSI_ISTAT1_SRUN) == 0)
-            lsi_execute_script(s);
+            lsi_start_script(s);
         break;
     case 0x40: /* SIEN0 */
         s->sien0 = val;
@@ -2121,6 +2291,29 @@ static void lsi_reg_writeb(LSIState *s, int offset, uint8_t val)
         break;
     case 0x57: /* CCNTL1 */
         s->ccntl1 = val;
+        break;
+    /*
+     * Registers the network server's AIX driver programs per command from its
+     * SCRIPTS program: the SCSI output control and data latches, the SCRIPTS
+     * load address and the memory access control.  The parts accept them at
+     * any time; the model used to log them as invalid writes and drop them.
+     */
+    case 0x09: /* SOCL */
+        s->socl = val;
+        break;
+    case 0x27: /* DCMD */
+        s->dcmd = val;
+        break;
+    case 0x44: /* SLPAR */
+        s->slpar = val;
+        break;
+    case 0x46: /* MACNTL */
+        s->macntl = val;
+        break;
+    case 0x54: /* SODL */
+        s->sodl = val;
+        break;
+    case 0x55: /* reserved / write-only on the part */
         break;
     CASE_SET_REG32(mmrs, 0xa0)
     CASE_SET_REG32(mmws, 0xa4)
@@ -2315,6 +2508,9 @@ static const VMStateDescription vmstate_lsi_scsi = {
         VMSTATE_UINT8(scid, LSIState),
         VMSTATE_UINT8(sxfer, LSIState),
         VMSTATE_UINT8(socl, LSIState),
+        VMSTATE_UINT8(sodl, LSIState),
+        VMSTATE_UINT8(slpar, LSIState),
+        VMSTATE_UINT8(macntl, LSIState),
         VMSTATE_UINT8(sdid, LSIState),
         VMSTATE_UINT8(ssid, LSIState),
         VMSTATE_UINT8(sfbr, LSIState),
@@ -2363,6 +2559,10 @@ static void scripts_timer_cb(void *opaque)
 {
     LSIState *s = opaque;
 
+    /* A chip that is arbitrating is busy and ignores a start meanwhile. */
+    if (s->select_timeout_armed) {
+        return;
+    }
     trace_lsi_scripts_timer_triggered();
     s->waiting = LSI_NOWAIT;
     lsi_execute_script(s);
@@ -2401,6 +2601,8 @@ static void lsi_scsi_realize_8xx(PCIDevice *dev, Error **errp, uint16_t type)
     s->scripts_timer = timer_new_us(QEMU_CLOCK_VIRTUAL, scripts_timer_cb, s);
     s->scsi_reset_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                        scsi_reset_timer_cb, s);
+    s->select_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                   lsi_select_timeout_cb, s);
 
     /*
      * Since we use the address-space API to interact with ram_io, disable the
@@ -2426,7 +2628,10 @@ static void lsi_scsi_realize_8xx(PCIDevice *dev, Error **errp, uint16_t type)
 
     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_IO, &s->io_io);
     pci_register_bar(dev, 1, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio_io);
-    pci_register_bar(dev, 2, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->ram_io);
+    /* A real 53C810 has no SCRIPTS RAM BAR; SNI ARC firmware wants just two */
+    if (!object_dynamic_cast(OBJECT(dev), TYPE_LSI53C810)) {
+        pci_register_bar(dev, 2, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->ram_io);
+    }
     QTAILQ_INIT(&s->queue);
 
     scsi_bus_init(&s->bus, sizeof(s->bus), d, &lsi_scsi_info);
@@ -2442,6 +2647,11 @@ static void lsi_scsi_realize_810(PCIDevice *dev, Error **errp)
     lsi_scsi_realize_8xx(dev, errp, PCI_DEVICE_ID_LSI_53C810);
 }
 
+static void lsi_scsi_realize_825(PCIDevice *dev, Error **errp)
+{
+    lsi_scsi_realize_8xx(dev, errp, PCI_DEVICE_ID_LSI_53C825);
+}
+
 static void lsi_scsi_exit(PCIDevice *dev)
 {
     LSIState *s = LSI53C895A(dev);
@@ -2449,7 +2659,24 @@ static void lsi_scsi_exit(PCIDevice *dev)
     address_space_destroy(&s->pci_io_as);
     timer_free(s->scripts_timer);
     timer_free(s->scsi_reset_timer);
+    timer_free(s->select_timer);
 }
+
+static const Property lsi_properties[] = {
+    /* false: a non-ATN Select goes to MESSAGE OUT (what the drivers written
+     * for this model expect).  true: COMMAND, as SCSI-2 specifies. */
+    DEFINE_PROP_BOOL("select-no-atn-cmd", LSIState, select_no_atn_cmd, false),
+    /* raise SIST0.UDC when the target releases the bus (see lsi_stop_script) */
+    DEFINE_PROP_BOOL("disconnect-udc", LSIState, disconnect_udc, false),
+    /* hold an absent target in arbitration for STIME0's period (see
+     * lsi_select_timeout_cb); ANS needs it off, the driver advances faster */
+    DEFINE_PROP_BOOL("select-timeout", LSIState, select_timeout, false),
+    DEFINE_PROP_BOOL("defer-start", LSIState, defer_start, false),
+    DEFINE_PROP_BOOL("select-atn-bit24", LSIState, select_atn_bit24, false),
+    /* SCNTL1.RST asserts SCSI RST/.  bus_cold_reset also resets device state
+     * and re-arms unit attention; the ANS leaves the reset to the bus. */
+    DEFINE_PROP_BOOL("reset-devices", LSIState, reset_devices, true),
+};
 
 static void lsi_class_init(ObjectClass *klass, const void *data)
 {
@@ -2465,6 +2692,7 @@ static void lsi_class_init(ObjectClass *klass, const void *data)
     device_class_set_legacy_reset(dc, lsi_scsi_reset);
     dc->vmsd = &vmstate_lsi_scsi;
     set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
+    device_class_set_props(dc, lsi_properties);
 }
 
 static const TypeInfo lsi_info = {
@@ -2492,10 +2720,28 @@ static const TypeInfo lsi53c810_info = {
     .class_init    = lsi53c810_class_init,
 };
 
+static void lsi53c825_class_init(ObjectClass *klass, const void *data)
+{
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+
+    k->realize = lsi_scsi_realize_825;
+    k->device_id = PCI_DEVICE_ID_LSI_53C825;
+    /* 825A revision: upper nibble 1 (bit 4 set), revision level 4.  Firmware
+     * identifies the part by that nibble, not by vendor/device. */
+    k->revision = 0x14;
+}
+
+static const TypeInfo lsi53c825_info = {
+    .name          = TYPE_LSI53C825,
+    .parent        = TYPE_LSI53C895A,
+    .class_init    = lsi53c825_class_init,
+};
+
 static void lsi53c895a_register_types(void)
 {
     type_register_static(&lsi_info);
     type_register_static(&lsi53c810_info);
+    type_register_static(&lsi53c825_info);
 }
 
 type_init(lsi53c895a_register_types)

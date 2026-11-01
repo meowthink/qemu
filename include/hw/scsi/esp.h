@@ -45,6 +45,18 @@ struct ESPState {
     uint8_t lun;
     uint32_t do_cmd;
     uint8_t asc_mode;
+    /*
+     * Accept every command whatever the bus state is.  The ASC mode gate
+     * this bypasses is the Am53c974's; a 53C9x gates by command mode group
+     * instead (Curio 79C950, command register).
+     */
+    bool cmd_any_state;
+    /*
+     * A Message Accepted in the disconnected state reports the selection
+     * state, not a disconnect: hscsi's chip self-test reads the latched
+     * Valid Group Code and the Reselected cause back from this command.
+     */
+    bool msgacc_selftest;
 
     bool data_ready;
     int dma_enabled;
@@ -154,6 +166,10 @@ struct SysBusESPState {
 #define INTR_DC 0x20
 #define INTR_IL 0x40
 #define INTR_RST 0x80
+
+#define INTR_RESEL 0x04
+
+#define STAT_VGC 0x08
 
 #define SEQ_0 0x0
 #define SEQ_MO 0x1

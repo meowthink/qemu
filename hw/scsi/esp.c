@@ -1135,6 +1135,15 @@ static bool esp_cmd_is_valid(ESPState *s, uint8_t cmd)
 {
     uint8_t cmd_group = (cmd & CMD_GRP_MASK) >> 4;
 
+    /*
+     * The ANS's hscsidd issues a Message accepted with the chip reset,
+     * which this gate rejects; the gate models the Am53c974's ASC mode
+     * register, while a 53C9x gates commands by mode group.
+     */
+    if (s->cmd_any_state) {
+        return true;
+    }
+
     /* Always allow misc commands */
     if (cmd_group == CMD_GRP_MISC) {
         return true;
@@ -1208,8 +1217,13 @@ static void esp_run_cmd(ESPState *s)
         break;
     case CMD_MSGACC:
         trace_esp_mem_writeb_cmd_msgacc(cmd);
+        if (s->msgacc_selftest && s->asc_mode == ESP_ASC_MODE_DIS) {
+            s->rregs[ESP_RSTAT] |= STAT_VGC;
+            s->rregs[ESP_RINTR] |= INTR_RESEL;
+        } else {
+            s->rregs[ESP_RINTR] |= INTR_DC;
+        }
         s->asc_mode = ESP_ASC_MODE_DIS;
-        s->rregs[ESP_RINTR] |= INTR_DC;
         s->rregs[ESP_RSEQ] = 0;
         s->rregs[ESP_RFLAGS] = 0;
         esp_raise_irq(s);
@@ -1638,6 +1652,17 @@ static const VMStateDescription vmstate_sysbus_esp_scsi = {
     }
 };
 
+/*
+ * `cmd-any-state` exists for the ANS's hscsidd, which issues commands the
+ * Am53c974's ASC mode gate rejects; `msgacc-selftest` for its chip self-test.
+ */
+static const Property sysbus_esp_props[] = {
+    DEFINE_PROP_BOOL("cmd-any-state", SysBusESPState, esp.cmd_any_state,
+                     false),
+    DEFINE_PROP_BOOL("msgacc-selftest", SysBusESPState, esp.msgacc_selftest,
+                     false),
+};
+
 static void sysbus_esp_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -1646,6 +1671,7 @@ static void sysbus_esp_class_init(ObjectClass *klass, const void *data)
     device_class_set_legacy_reset(dc, sysbus_esp_hard_reset);
     dc->vmsd = &vmstate_sysbus_esp_scsi;
     set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
+    device_class_set_props(dc, sysbus_esp_props);
 }
 
 static void esp_finalize(Object *obj)
