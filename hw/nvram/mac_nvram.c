@@ -30,32 +30,24 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/qdev-properties-system.h"
 #include "system/block-backend.h"
+#include "block/block_int.h"
 #include "migration/vmstate.h"
 #include "qemu/cutils.h"
-#include "qemu/bswap.h"
 #include "qemu/module.h"
 #include "qemu/error-report.h"
+#include "system/system.h"
 #include "qobject/qdict.h"
-#include "qapi/error.h"
 #include "trace.h"
 #include <zlib.h> /* for adler32 */
 
 #define DEF_SYSTEM_SIZE 0xc10
 
-/* macio style NVRAM device */
 /*
- * A real Apple ROM keeps its Open Firmware variables in the boot flash and
- * maintains them with the Intel command set. Its /nvram package decompiles to
- *
- *   erase: 20 -> block, d0 -> block, poll status bit 0x80, ff -> block,
- *          then verify the block reads all ones
- *   write: 40 -> byte, data -> byte, poll status, ff -> block, verify
- *
- * so the window has to answer those commands. Treated as plain RAM every
- * erase fails its verify and the firmware reports "ERASE failure on NVRAM",
- * losing every setting. Erase granularity is 8KB: the ROM's own info property
- * describes fff04000 as 0x4000 long and its package alternates between two
- * blocks.
+ * Flash NVRAM, Intel command set as used by Apple firmware and by the
+ * Sharp/Micron parts Linux drives:
+ *   erase: 20, d0 to the block, poll status bit 0x80, ff
+ *   write: 40, data to the byte, poll status, ff
+ * Erase granularity is 8 KB.
  *
  * The PowerMac3,6 ROM (4.6.0f1) additionally identifies the part before it
  * touches it: id-part writes ff then 90 to the window base and reads a
@@ -89,12 +81,13 @@ static void macio_nvram_flush(MacIONVRAMState *s, hwaddr addr, int len)
 {
     if (s->blk) {
         if (blk_pwrite(s->blk, addr, len, &s->data[addr], 0) < 0) {
-            error_report("%s: cannot write to NVRAM", blk_name(s->blk));
+            error_report("%s: write of NVRAM data to backing store failed",
+                         blk_name(s->blk));
         }
     }
 }
 
-/* Returns true if the access was a command rather than plain data. */
+/* Returns true if the write was a command rather than plain data */
 static bool macio_nvram_flash_write(MacIONVRAMState *s, hwaddr addr,
                                     uint8_t value)
 {
@@ -115,11 +108,12 @@ static bool macio_nvram_flash_write(MacIONVRAMState *s, hwaddr addr,
         return true;
 
     case NVRAM_FLASH_CMD_PROGRAM:
-        /* Programming can only clear bits, exactly like the real part. */
+        /* programming can only clear bits */
         s->flash_cmd = NVRAM_FLASH_CMD_NONE;
         s->data[addr] &= value;
         macio_nvram_flush(s, addr, 1);
         s->flash_status = NVRAM_FLASH_READY;
+        s->flash_read_id = false;
         return true;
 
     default:
@@ -132,30 +126,34 @@ static bool macio_nvram_flash_write(MacIONVRAMState *s, hwaddr addr,
         s->flash_cmd = value;
         s->flash_status = 0;
         s->flash_read_id = false;
-        return true;
+        break;
     case NVRAM_FLASH_CMD_READ_ID:
+        s->flash_cmd = NVRAM_FLASH_CMD_NONE;
         s->flash_status = 0;
         s->flash_read_id = true;
-        return true;
+        break;
     case NVRAM_FLASH_CMD_READ_STATUS:
         /* Nothing here takes time, so the part is always ready. */
+        s->flash_cmd = NVRAM_FLASH_CMD_NONE;
         s->flash_status = NVRAM_FLASH_READY;
         s->flash_read_id = false;
-        return true;
+        break;
     case NVRAM_FLASH_CMD_CLEAR_STATUS:
         /* No error bits are modelled; the read mode is left alone. */
-        return true;
+        break;
     case NVRAM_FLASH_CMD_READ_ARRAY:
         s->flash_cmd = NVRAM_FLASH_CMD_NONE;
         s->flash_status = 0;
         s->flash_read_id = false;
-        return true;
+        break;
     default:
-        /* Anything else in the array state is not data: ignore it. */
-        return true;
+        /* status and other commands leave the array untouched */
+        break;
     }
+    return true;
 }
 
+/* macio style NVRAM device */
 static void macio_nvram_writeb(void *opaque, hwaddr addr,
                                uint64_t value, unsigned size)
 {
@@ -163,7 +161,6 @@ static void macio_nvram_writeb(void *opaque, hwaddr addr,
 
     addr = (addr >> s->it_shift) & (s->size - 1);
     trace_macio_nvram_write(addr, value);
-
     if (macio_nvram_flash_write(s, addr, value)) {
         return;
     }
@@ -184,13 +181,12 @@ static uint64_t macio_nvram_readb(void *opaque, hwaddr addr,
 
     addr = (addr >> s->it_shift) & (s->size - 1);
     value = s->data[addr];
-    /* While a command is in flight the part reports its status register. */
+    /* while a command is in flight the part answers with its status */
     if (s->flash && s->flash_status) {
         value = s->flash_status;
     } else if (s->flash && s->flash_read_id) {
         value = (addr & 1) ? NVRAM_FLASH_DEV_ID : NVRAM_FLASH_MFR_ID;
     }
-
     trace_macio_nvram_read(addr, value);
 
     return value;
@@ -200,13 +196,6 @@ static const MemoryRegionOps macio_nvram_ops = {
     .read = macio_nvram_readb,
     .write = macio_nvram_writeb,
     .valid.min_access_size = 1,
-    /*
-     * A real Apple ROM verifies an erased block with 64-bit reads (its
-     * /nvram package uses xd@), so the window has to accept them -- they
-     * are still serviced a byte at a time via .impl below. Rejecting them
-     * makes the verify read something other than the erased pattern and
-     * the firmware reports "ERASE failure on NVRAM".
-     */
     .valid.max_access_size = 8,
     .impl.min_access_size = 1,
     .impl.max_access_size = 1,
@@ -393,6 +382,22 @@ static bool oldworld_of_partition_valid(const uint8_t *buf)
     acc = (acc + (acc >> 16)) & 0xffff;
 
     return ((~acc) & 0xffff) == stored;
+}
+
+static uint16_t oldworld_of_checksum(const uint8_t *buf)
+{
+    uint8_t tmp[OLDWORLD_OF_SIZE];
+    uint32_t acc = 0;
+    int i;
+
+    memcpy(tmp, buf, OLDWORLD_OF_SIZE);
+    tmp[4] = tmp[5] = 0;
+    for (i = 0; i < OLDWORLD_OF_SIZE; i += 2) {
+        acc += lduw_be_p(tmp + i);
+    }
+    acc = (acc + (acc >> 16)) & 0xffff;
+
+    return (~acc) & 0xffff;
 }
 
 #define OLDWORLD_OF_TOP         0x08
@@ -589,6 +594,324 @@ static void pmac_format_nvram_partition_osx(MacIONVRAMState *nvr, int off,
 }
 
 /*
+ * A G5's flash NVRAM, as its firmware, Mac OS X and Linux keep it: two
+ * 8 KB banks, the live one being the valid bank with the higher
+ * generation. Each starts with a header partition (0x5a "nvram": Adler-32
+ * of the bank from byte 20, then the generation), followed by the Open
+ * Firmware variables in "common" and free space. Bank A is written,
+ * bank B left erased.
+ */
+void pmac_format_nvram_core99(MacIONVRAMState *nvr)
+{
+    uint8_t *bank = nvr->data;
+    ChrpNvramPartHdr *hdr = (ChrpNvramPartHdr *)bank;
+    ChrpNvramPartHdr *common;
+    int end;
+
+    memset(nvr->data, 0xff, nvr->size);
+
+    memset(bank, 0, 32);
+    hdr->signature = OSX_NVRAM_SIGNATURE;
+    pstrcpy(hdr->name, sizeof(hdr->name), "nvram");
+    chrp_nvram_finish_partition(hdr, 32);
+
+    common = (ChrpNvramPartHdr *)&bank[32];
+    end = chrp_nvram_create_system_partition(&bank[32], DEF_SYSTEM_SIZE,
+                                             MACIO_NVRAM_SIZE - 32);
+    pstrcpy(common->name, sizeof(common->name), "common");
+    chrp_nvram_finish_partition(common, end);
+    chrp_nvram_create_free_partition(&bank[32 + end],
+                                     MACIO_NVRAM_SIZE - 32 - end);
+
+    stl_be_p(&bank[20], 1);
+    stl_be_p(&bank[16], adler32(1, &bank[20], MACIO_NVRAM_SIZE - 20));
+
+    if (nvr->blk &&
+        blk_pwrite(nvr->blk, 0, nvr->size, nvr->data, 0) < 0) {
+        error_report("%s: write of default NVRAM failed", blk_name(nvr->blk));
+    }
+}
+
+/* Length of the CHRP partition at p, 0 if its header is not valid */
+static uint32_t chrp_partition_len(const uint8_t *p)
+{
+    ChrpNvramPartHdr hdr;
+    uint32_t len;
+
+    memcpy(&hdr, p, sizeof(hdr));
+    len = be16_to_cpu(hdr.len) << 4;
+    chrp_nvram_finish_partition(&hdr, len);
+    return hdr.checksum == p[1] ? len : 0;
+}
+
+/* Generation of a valid Core99 bank, 0 if it is not one */
+static uint32_t core99_bank_generation(const uint8_t *bank)
+{
+    if (bank[0] != OSX_NVRAM_SIGNATURE || chrp_partition_len(bank) == 0 ||
+        (uint32_t)ldl_be_p(&bank[16]) !=
+        adler32(1, &bank[20], MACIO_NVRAM_SIZE - 20)) {
+        return 0;
+    }
+    return ldl_be_p(&bank[20]);
+}
+
+/*
+ * True if the bank the firmware will pick (the valid one with the higher
+ * generation, B on a tie) is a valid bank whose partitions tile it and
+ * include the Open Firmware "common" partition.
+ */
+bool pmac_nvram_core99_valid(MacIONVRAMState *nvr)
+{
+    uint32_t gen_a, gen_b, off, len;
+    const uint8_t *bank;
+    bool common = false;
+
+    if (nvr->size != MACIO_NVRAM_FLASH_SIZE) {
+        return false;
+    }
+    gen_a = core99_bank_generation(nvr->data);
+    gen_b = core99_bank_generation(nvr->data + MACIO_NVRAM_SIZE);
+    if (MAX(gen_a, gen_b) == 0) {
+        return false;
+    }
+    bank = nvr->data + (gen_a > gen_b ? 0 : MACIO_NVRAM_SIZE);
+    for (off = 0; off < MACIO_NVRAM_SIZE; off += len) {
+        len = chrp_partition_len(&bank[off]);
+        if (len == 0 || len > MACIO_NVRAM_SIZE - off) {
+            return false;
+        }
+        if (bank[off] == CHRP_NVPART_SYSTEM &&
+            !strncmp((const char *)&bank[off + 4], "common", 12)) {
+            common = true;
+        }
+    }
+    return common;
+}
+
+/* True if the -prom-env list sets the variable of the "name=value" var */
+static bool prom_env_sets(const char *var)
+{
+    const char *eq = strchr(var, '=');
+    unsigned int i;
+
+    for (i = 0; eq && i < nb_prom_envs; i++) {
+        if (!strncmp(prom_envs[i], var, eq - var + 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+#define PANIC_INFO_VAR "aapl,panic-info="
+
+/*
+ * Undo the IODTNVRAM escaping of a data value: 0xff, then a byte whose
+ * low 7 bits count a run of 0x00 (bit 7 clear) or 0xff (bit 7 set).
+ * Returns the length of the result, at most n.
+ */
+static size_t nvram_unescape_data(uint8_t *out, const uint8_t *in, size_t n)
+{
+    size_t i, o = 0;
+    unsigned int run;
+
+    for (i = 0; i < n; i++) {
+        if (in[i] != 0xff) {
+            out[o++] = in[i];
+            continue;
+        }
+        if (++i == n) {
+            break;
+        }
+        for (run = in[i] & 0x7f; run && o < n; run--) {
+            out[o++] = (in[i] & 0x80) ? 0xff : 0x00;
+        }
+    }
+    return o;
+}
+
+/*
+ * Unpack text stored as 7-bit characters, 8 in 7 bytes, most significant
+ * bit first. Returns a g_malloc'd string.
+ */
+static char *nvram_unpack7(const uint8_t *in, size_t n)
+{
+    size_t chars = n * 8 / 7, i;
+    char *out = g_malloc(chars + 1);
+
+    for (i = 0; i < chars; i++) {
+        size_t bit = i * 7, b = bit >> 3, sh = bit & 7;
+        unsigned int v = in[b] << 8 | (b + 1 < n ? in[b + 1] : 0);
+
+        out[i] = (v >> (9 - sh)) & 0x7f;
+    }
+    out[chars] = 0;
+    return out;
+}
+
+static bool nvram_text_ok(const char *t)
+{
+    size_t i, good = 0;
+
+    for (i = 0; t[i]; i++) {
+        good += (t[i] >= 0x20 && t[i] < 0x7f) || t[i] == '\n' ||
+                t[i] == '\r' || t[i] == '\t';
+    }
+    return i >= 8 && good * 10 >= i * 9;
+}
+
+/*
+ * The panic log of an aapl,panic-info value as text: unescaped, then
+ * unpacked from the 7-bit stream after the best-fitting header length
+ * if that reads as text, else a hex dump of the unescaped bytes.
+ */
+static char *nvram_panic_text(const uint8_t *val, size_t n)
+{
+    g_autofree uint8_t *raw = g_malloc(n + 1);
+    size_t len = nvram_unescape_data(raw, val, n), hdr, i;
+    GString *str;
+
+    for (hdr = 0; hdr <= 16 && hdr < len; hdr += 4) {
+        char *t = nvram_unpack7(raw + hdr, len - hdr);
+
+        if (nvram_text_ok(t)) {
+            return t;
+        }
+        g_free(t);
+    }
+    str = g_string_new(NULL);
+    for (i = 0; i < len; i++) {
+        g_string_append_printf(str, "%02x%c", raw[i],
+                               (i & 15) == 15 || i + 1 == len ? '\n' : ' ');
+    }
+    return g_string_free(str, false);
+}
+
+/* Save the panic log in val next to the NVRAM image; its path, or NULL */
+static char *nvram_save_panic(MacIONVRAMState *nvr, const uint8_t *val,
+                              size_t n)
+{
+    g_autofree char *dir = NULL;
+    g_autofree char *text = NULL;
+    const char *name;
+    char *path;
+
+    if (!nvr->blk || !blk_bs(nvr->blk)) {
+        return NULL;
+    }
+    name = blk_bs(nvr->blk)->filename;
+    if (!name[0] || strstart(name, "json:", NULL)) {
+        return NULL;
+    }
+    dir = g_path_get_dirname(name);
+    path = g_build_filename(dir, "last-panic.txt", NULL);
+    text = nvram_panic_text(val, n);
+    if (!g_file_set_contents(path, text, -1, NULL)) {
+        g_free(path);
+        return NULL;
+    }
+    return path;
+}
+
+/*
+ * Set the -prom-env variables in the "common" partition of the live bank
+ * of a valid Core99 NVRAM, in place of any of the same name.
+ */
+void pmac_nvram_core99_set_prom_env(MacIONVRAMState *nvr)
+{
+    g_autofree uint8_t *buf = NULL;
+    g_autofree char *panic_path = NULL;
+    uint32_t gen_a, gen_b, off, len, size, pos, p, n;
+    uint8_t *bank, *vars;
+    unsigned int i;
+    bool drop_panic = false;
+
+    if (!nb_prom_envs || !pmac_nvram_core99_valid(nvr)) {
+        return;
+    }
+    gen_a = core99_bank_generation(nvr->data);
+    gen_b = core99_bank_generation(nvr->data + MACIO_NVRAM_SIZE);
+    bank = nvr->data + (gen_a > gen_b ? 0 : MACIO_NVRAM_SIZE);
+    for (off = 0; ; off += len) {
+        len = chrp_partition_len(&bank[off]);
+        if (bank[off] == CHRP_NVPART_SYSTEM &&
+            !strncmp((const char *)&bank[off + 4], "common", 12)) {
+            break;
+        }
+    }
+    vars = &bank[off + sizeof(ChrpNvramPartHdr)];
+    size = len - sizeof(ChrpNvramPartHdr);
+    buf = g_malloc0(size);
+
+retry:
+    memset(buf, 0, size);
+    pos = 0;
+    for (p = 0; p < size && vars[p]; p += n + 1) {
+        n = strnlen((const char *)&vars[p], size - p);
+        if (n == size - p) {
+            break;
+        }
+        if (prom_env_sets((const char *)&vars[p]) ||
+            (drop_panic && strstart((const char *)&vars[p], PANIC_INFO_VAR,
+                                    NULL))) {
+            continue;
+        }
+        if (pos + n + 1 >= size) {
+            goto full;
+        }
+        memcpy(&buf[pos], &vars[p], n + 1);
+        pos += n + 1;
+    }
+    for (i = 0; i < nb_prom_envs; i++) {
+        n = strlen(prom_envs[i]);
+        if (pos + n + 1 >= size) {
+            goto full;
+        }
+        memcpy(&buf[pos], prom_envs[i], n + 1);
+        pos += n + 1;
+    }
+
+    memcpy(vars, buf, size);
+    if (drop_panic) {
+        if (panic_path) {
+            warn_report("NVRAM was full: saved the last panic log to %s",
+                        panic_path);
+        } else {
+            warn_report("NVRAM was full: dropped the last panic log");
+        }
+    }
+    stl_be_p(&bank[16], adler32(1, &bank[20], MACIO_NVRAM_SIZE - 20));
+    if (nvr->blk && blk_pwrite(nvr->blk, bank - nvr->data, MACIO_NVRAM_SIZE,
+                               bank, 0) < 0) {
+        error_report("%s: write of NVRAM failed", blk_name(nvr->blk));
+    }
+    return;
+
+full:
+    if (!drop_panic) {
+        for (p = 0; p < size && vars[p]; p += n + 1) {
+            n = strnlen((const char *)&vars[p], size - p);
+            if (n == size - p) {
+                break;
+            }
+            if (strstart((const char *)&vars[p], PANIC_INFO_VAR, NULL)) {
+                char *path = nvram_save_panic(nvr,
+                    &vars[p + strlen(PANIC_INFO_VAR)],
+                    n - strlen(PANIC_INFO_VAR));
+
+                if (path || !nvr->blk || !blk_bs(nvr->blk)) {
+                    panic_path = path;
+                    drop_panic = true;
+                    goto retry;
+                }
+                break;
+            }
+        }
+    }
+    warn_report("NVRAM has no room for the -prom-env variables");
+}
+
+
+/*
  * Manage a default NVRAM backing file when the user has not attached one
  * with -drive if=mtd,... Without this the contents are re-stamped from
  * scratch on every run, so nothing a firmware writes -- boot-device,
@@ -635,7 +958,19 @@ BlockBackend *macio_nvram_default_blk(const char *filename, uint32_t size,
     return blk;
 }
 
-/* True if nothing has ever been stored here. */
+/* Set up NVRAM with OF and OSX partitions */
+void pmac_format_nvram_partition(MacIONVRAMState *nvr, int len)
+{
+    /*
+     * Mac OS X expects side "B" of the flash at the second half of NVRAM,
+     * so we use half of the chip for OF and the other half for a free OSX
+     * partition.
+     */
+    pmac_format_nvram_partition_of(nvr, 0, len / 2);
+    pmac_format_nvram_partition_osx(nvr, len / 2, len / 2);
+}
+type_init(macio_nvram_register_types)
+
 bool macio_nvram_is_blank(MacIONVRAMState *nvr, int len)
 {
     int i;
@@ -647,23 +982,3 @@ bool macio_nvram_is_blank(MacIONVRAMState *nvr, int len)
     }
     return true;
 }
-
-/* Set up NVRAM with OF and OSX partitions */
-void pmac_format_nvram_partition(MacIONVRAMState *nvr, int len)
-{
-    /*
-     * Mac OS X expects side "B" of the flash at the second half of NVRAM,
-     * so we use half of the chip for OF and the other half for a free OSX
-     * partition.
-     */
-    pmac_format_nvram_partition_of(nvr, 0, len / 2);
-    pmac_format_nvram_partition_osx(nvr, len / 2, len / 2);
-
-    if (nvr->blk) {
-        if (blk_pwrite(nvr->blk, 0, len, nvr->data, 0) < 0) {
-            error_report("%s: failed to write default NVRAM partitions",
-                         blk_name(nvr->blk));
-        }
-    }
-}
-type_init(macio_nvram_register_types)

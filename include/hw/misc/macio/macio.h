@@ -138,6 +138,10 @@ struct MACIOIDEState {
 #define MACIO_IDE_PMAC_NIRQS 2
 
 #define MACIO_IDE_PMAC_DMA_IRQ 0
+
+#define TYPE_K2_UATA "k2-uata"
+#define K2_UATA_DMA_IRQ 0x0d
+OBJECT_DECLARE_SIMPLE_TYPE(K2UATAState, K2_UATA)
 #define MACIO_IDE_PMAC_IDE_IRQ 1
 
 void macio_ide_init_drives(MACIOIDEState *ide, DriveInfo **hd_table);
@@ -188,6 +192,7 @@ struct NewWorldMacIOState {
 
     bool has_pmu;
     bool has_adb;
+    bool k2;        /* U3/K2 south bridge wiring */
     AudioBackend *audio_be;
     char *i2s_dump_path;
     OpenPICState pic;

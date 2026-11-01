@@ -153,6 +153,9 @@ config MAC_NEWWORLD
     select ADB
     select MACIO
     select MACIO_GPIO
+    select IDE_K2_SATA
+    select KEYWEST_I2C
+    select TAS3004
     select MAC_PMU
     select UNIN_PCI
     select FW_CFG_PPC

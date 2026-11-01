@@ -123,3 +123,10 @@ handle_cmd_fis_dump(void *s, int port, const char *fis) "ahci(%p)[%d]: %s"
 # ahci-allwinner.c
 allwinner_ahci_mem_read(void *s, void *a, uint64_t addr, uint64_t val, unsigned size) "ahci(%p): read a=%p addr=0x%"PRIx64" val=0x%"PRIx64", size=%d"
 allwinner_ahci_mem_write(void *s, void *a, uint64_t addr, uint64_t val, unsigned size) "ahci(%p): write a=%p addr=0x%"PRIx64" val=0x%"PRIx64", size=%d"
+
+k2_sata_mmio_read(uint64_t addr, unsigned size, uint64_t val) "addr 0x%"PRIx64" size %u val 0x%"PRIx64
+k2_sata_mmio_write(uint64_t addr, unsigned size, uint64_t val) "addr 0x%"PRIx64" size %u val 0x%"PRIx64
+k2_sata_irq(int port, int level, uint8_t cmd, uint32_t pending) "port %d level %d ctl 0x%02x pending 0x%x"
+ahci_populate_sglist_no_cmd(void *s, int port) "ahci(%p)[%d]: no command header"
+handle_cmd_badcfl(void *s, int port, uint16_t opts) "ahci(%p)[%d]: guest provided an invalid cmd FIS length: 0x%04x"
+ahci_pio_transfer_no_cmd(void *s, int port) "ahci(%p)[%d]: PIO transfer without a command header"

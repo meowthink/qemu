@@ -30,6 +30,10 @@
 #include "hw/core/sysbus.h"
 
 #define MACIO_NVRAM_SIZE 0x2000
+/* Two 8 KB flash banks, byte-addressed, as on a G5 */
+#define MACIO_NVRAM_FLASH_SIZE 0x4000
+/* Two 8 KB flash banks, byte-addressed, as on a G5 */
+#define MACIO_NVRAM_FLASH_SIZE 0x4000
 
 #define TYPE_MACIO_NVRAM "macio-nvram"
 OBJECT_DECLARE_SIMPLE_TYPE(MacIONVRAMState, MACIO_NVRAM)
@@ -41,8 +45,8 @@ struct MacIONVRAMState {
 
     uint32_t size;
     uint32_t it_shift;
-    bool flash;                 /* emulate the Intel-style flash interface */
-    uint8_t flash_cmd;          /* command latched by the previous write */
+    bool flash;                 /* Intel-style flash command interface */
+    uint8_t flash_cmd;
     uint8_t flash_status;
     bool flash_read_id;         /* the part is answering an id-part cycle */
 
@@ -59,6 +63,9 @@ void pmac_format_nvram_partition_oldworld(MacIONVRAMState *nvr);
 bool pmac_oldworld_nvram_is_default(MacIONVRAMState *nvr);
 void pmac_oldworld_nvram_set_osx_startup(MacIONVRAMState *nvr,
                                          const char *device);
+void pmac_format_nvram_core99(MacIONVRAMState *nvr);
+bool pmac_nvram_core99_valid(MacIONVRAMState *nvr);
+void pmac_nvram_core99_set_prom_env(MacIONVRAMState *nvr);
 BlockBackend *macio_nvram_default_blk(const char *filename, uint32_t size,
                                      uint8_t fill);
 bool macio_nvram_is_blank(MacIONVRAMState *nvr, int len);

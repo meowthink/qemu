@@ -399,6 +399,9 @@ static void dbdma_end(DBDMA_io *io)
 wait:
     /* Indicate that we're ready for a new DMA round */
     ch->io.processing = false;
+    if (!ch->io.as) {
+        ch->io.as = &address_space_memory;
+    }
 
     if (dbdma_should_continue_sync(ch)) {
         channel_run(ch);

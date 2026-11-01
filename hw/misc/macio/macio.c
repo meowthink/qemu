@@ -604,6 +604,7 @@ static const Property macio_newworld_properties[] = {
     DEFINE_AUDIO_PROPERTIES(NewWorldMacIOState, audio_be),
     DEFINE_PROP_STRING("i2s-dumpfile", NewWorldMacIOState, i2s_dump_path),
     DEFINE_PROP_BOOL("has-adb", NewWorldMacIOState, has_adb, false),
+    DEFINE_PROP_BOOL("k2", NewWorldMacIOState, k2, false),
 };
 
 static void macio_newworld_class_init(ObjectClass *oc, const void *data)

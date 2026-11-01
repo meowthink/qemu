@@ -300,7 +300,7 @@ static void k2_sata_reset(DeviceState *dev)
     int i;
 
     for (i = 0; i < K2_SATA_NUM_PORTS; i++) {
-        ide_bus_reset(&s->parent_obj.bus[i], IDE_RESET_HARDWARE);
+        ide_bus_reset(&s->parent_obj.bus[i]);
     }
     for (i = 0; i < K2_SATA_NUM_REGS; i++) {
         s->serror[i] = 0;

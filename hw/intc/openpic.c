@@ -729,12 +729,6 @@ static void qemu_timer_cb(void *opaque)
 static void openpic_tmr_set_tmr(OpenPICTimer *tmr, uint32_t val, bool enabled)
 {
     uint64_t ns = ticks_to_ns(val & ~TCCR_TOG);
-
-    /* Only the Freescale models create the timers; the others map the regs */
-    if (!tmr->qemu_timer) {
-        tmr->qemu_timer_active = false;
-        return;
-    }
     /*
      * A count of zero causes a timer to be set to expire immediately.  This
      * effectively stops the simulation since the timer is constantly expiring
@@ -1636,7 +1630,7 @@ static void openpic_realize(DeviceState *dev, Error **errp)
             return;
         }
 #endif
-        map_list(opp, list_le, &list_count);
+        map_list(opp, opp->big_endian ? list_be : list_le, &list_count);
         break;
     }
 
@@ -1659,6 +1653,7 @@ static void openpic_realize(DeviceState *dev, Error **errp)
 static const Property openpic_properties[] = {
     DEFINE_PROP_UINT32("model", OpenPICState, model, OPENPIC_MODEL_FSL_MPIC_20),
     DEFINE_PROP_UINT32("nb_cpus", OpenPICState, nb_cpus, 1),
+    DEFINE_PROP_BOOL("big-endian", OpenPICState, big_endian, false),
 };
 
 static void openpic_class_init(ObjectClass *oc, const void *data)

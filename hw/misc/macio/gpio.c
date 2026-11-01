@@ -254,10 +254,17 @@ static void macio_gpio_nmi(NMIState *n, int cpu_index, Error **errp)
     macio_set_gpio(MACIO_GPIO(n), 9, false);
 }
 
+static const Property macio_gpio_properties[] = {
+    DEFINE_PROP_UINT32("nb-cpus", MacIOGPIOState, nb_cpus, 1),
+    DEFINE_PROP_BOOL("k2", MacIOGPIOState, k2, false),
+};
+
 static void macio_gpio_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
     NMIClass *nc = NMI_CLASS(oc);
+
+    device_class_set_props(dc, macio_gpio_properties);
 
     device_class_set_legacy_reset(dc, macio_gpio_reset);
     dc->vmsd = &vmstate_macio_gpio;

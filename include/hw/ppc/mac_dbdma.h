@@ -37,6 +37,8 @@ typedef void (*DBDMA_rw)(DBDMA_io *io);
 typedef void (*DBDMA_end)(DBDMA_io *io);
 struct DBDMA_io {
     void *opaque;
+    /* address space the channel's DMA goes through (macio sets it) */
+    AddressSpace *as;
     void *channel;
     hwaddr addr;
     int len;

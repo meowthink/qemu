@@ -72,3 +72,13 @@ dbdma_io_latency(int channel, int64_t ns, int is_last) "ch=%d latency=%"PRId64"n
 # mac99_firewire_stub.c
 mac99_firewire_stub_read(uint64_t addr, unsigned size, uint64_t val) "R addr=0x%03"PRIx64" size=%u val=0x%08"PRIx64
 mac99_firewire_stub_write(uint64_t addr, unsigned size, uint64_t val) "W addr=0x%03"PRIx64" size=%u val=0x%08"PRIx64
+
+keywest_i2c_read(const char *n, uint64_t addr, uint32_t val) "%s R reg=0x%02"PRIx64" val=0x%02x"
+keywest_i2c_write(const char *n, uint64_t addr, uint32_t val) "%s W reg=0x%02"PRIx64" val=0x%02x"
+tas3004_write(uint8_t subaddr, int pos, uint8_t val) "reg=0x%02x byte %d = 0x%02x"
+cs8420_write(uint8_t reg, uint8_t val) "reg=0x%02x = 0x%02x"
+k2_fcr_read(uint32_t addr, uint32_t val) "0x%02x -> 0x%08x"
+k2_fcr_write(uint32_t addr, uint32_t val) "0x%02x <- 0x%08x"
+k2_i2s_read(uint64_t addr, uint32_t val) "0x%02"PRIx64" -> 0x%08x"
+k2_i2s_write(uint64_t addr, uint32_t val) "0x%02"PRIx64" <- 0x%08x"
+k2_i2s_dma(int out, uint64_t addr, int len, int rate) "out=%d addr=0x%"PRIx64" len=%d rate=%d"

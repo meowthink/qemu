@@ -135,6 +135,7 @@ struct OpenPICState {
 
     /* Behavior control */
     FslMpicInfo *fsl;
+    bool big_endian;            /* KeyLargo model: registers big-endian */
     uint32_t model;
     uint32_t flags;
     uint32_t nb_irqs;

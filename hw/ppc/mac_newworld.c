@@ -58,6 +58,8 @@
 #include "system/blockdev.h"
 #include "hw/core/boards.h"
 #include "hw/pci-host/uninorth.h"
+#include "hw/pci-host/u3_dart.h"
+#include "hw/i2c/i2c.h"
 #include "hw/input/adb.h"
 #include "hw/ppc/mac_dbdma.h"
 #include "hw/pci/pci.h"
@@ -69,6 +71,8 @@
 #include "hw/misc/macio/macio.h"
 #include "hw/nvram/eeprom_at24c.h"
 #include "hw/nvram/mac_spd.h"
+
+#include "hw/ide/k2-sata.h"
 #include "hw/ppc/openpic.h"
 #include "hw/core/loader.h"
 #include "hw/core/fw-path-provider.h"
@@ -83,10 +87,18 @@
 #include "hw/core/irq.h"
 #include "system/cpus.h"
 #include "exec/cpu-common.h"
+
+#include "hw/core/cpu.h"
 #include "trace.h"
 
 #define MAX_IDE_BUS 2
 #define CFG_ADDR 0xf0000510
+#define TBFREQ (25UL * 1000UL * 1000UL)
+#define CLOCKFREQ (900UL * 1000UL * 1000UL)
+#define BUSFREQ (100UL * 1000UL * 1000UL)
+/* PowerMac7,3: 2.0 GHz 970, processor bus at half the core clock */
+#define U3_CLOCKFREQ (2000UL * 1000UL * 1000UL)
+#define U3_BUSFREQ (1000UL * 1000UL * 1000UL)
 #define U3_TBFREQ 33333333UL
 
 #define NDRV_VGA_FILENAME "qemu_vga.ndrv"
@@ -117,6 +129,13 @@ static const MemoryRegionOps core99_rom_ops = {
 /* KeyLargo/MacIO base decoded by real hardware (and by real Apple ROMs) */
 #define MACIO_BASE 0xf3000000
 #define MACIO_WIN_SIZE 0x01000000
+/*
+ * On the U3 (PowerMac7,3) the K2's mac-io register block is decoded at the
+ * bottom of the HT-PCI memory window, not at the G4's hardwired 0xf3000000;
+ * an Apple G5 ROM reaches straight for 0x80016000 and spins if that window
+ * answers with zeroes.
+ */
+#define K2_MACIO_BASE 0x80000000
 #define PROM_SIZE (1 * MiB)
 /*
  * A real Apple ROM stores its Open Firmware variables in the boot flash --
@@ -727,6 +746,7 @@ static void ppc_core99_reset(void *opaque)
     }
 }
 
+/* KeyLargo GPIO soft-reset line of a secondary CPU; level 0 = released */
 static void cpu_kick(void *opaque, int n, int level)
 {
     PowerPCCPU *cpu = opaque;
@@ -794,19 +814,20 @@ static bool firmware_is_elf(const char *filename)
     return is_elf;
 }
 
-static void macio_map_at_hw_base(void *opaque)
-{
-    PCIDevice *macio = opaque;
-
-    pci_default_write_config(macio, PCI_BASE_ADDRESS_0, MACIO_BASE, 4);
-    pci_default_write_config(macio, PCI_COMMAND,
-                             PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER, 2);
-}
-
 typedef struct MacIOHwBaseNotifier {
     Notifier notifier;
     PCIDevice *macio;
+    uint32_t hw_base;
 } MacIOHwBaseNotifier;
+
+static void macio_map_at_hw_base(void *opaque)
+{
+    MacIOHwBaseNotifier *mn = opaque;
+
+    pci_default_write_config(mn->macio, PCI_BASE_ADDRESS_0, mn->hw_base, 4);
+    pci_default_write_config(mn->macio, PCI_COMMAND,
+                             PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER, 2);
+}
 
 static void macio_arm_hw_base_reset(Notifier *n, void *opaque)
 {
@@ -818,7 +839,7 @@ static void macio_arm_hw_base_reset(Notifier *n, void *opaque)
      * creation, so a handler registered during ppc_core99_init() would run
      * *before* MacIO's own reset and have its config write thrown away.
      */
-    qemu_register_reset(macio_map_at_hw_base, mn->macio);
+    qemu_register_reset(macio_map_at_hw_base, mn);
 }
 
 /* PowerPC Mac99 hardware initialisation */
@@ -831,6 +852,7 @@ static void ppc_core99_init(MachineState *machine)
     CPUPPCState *env = NULL;
     char *filename;
     IrqLines *openpic_irqs;
+    qemu_irq cpu_kick_irq;
     int i, j, k, ppc_boot_device, machine_arch, bios_size = -1;
     const char *bios_name = machine->firmware ?: PROM_FILENAME;
     MemoryRegion *bios = g_new(MemoryRegion, 1);
@@ -852,6 +874,16 @@ static void ppc_core99_init(MachineState *machine)
     MemoryRegion *macio_win;
     I2CBus *unin_i2c;
     MacIOHwBaseNotifier *macio_notifier;
+
+    DeviceState *ht_dev = NULL;
+    uint64_t low_ram_size;
+    DeviceState *dart;
+    SysBusDevice *unin_dev;
+    PCIBus *macio_bus;
+    PCIDevice *usb0, *usb1, *ehci, *ohci;
+    PCIBus *nec_bus;
+    BusState *ehci_bus;
+    int macio_devfn;
     hwaddr nvram_addr = 0xFFF04000;
     uint64_t tbfreq = kvm_enabled() ? kvmppc_get_tbfreq()
                                     : core99_tbfreq(core99_machine);
@@ -890,12 +922,28 @@ static void ppc_core99_init(MachineState *machine)
     }
     env = &cpus[0]->env;
 
-    /* allocate RAM */
+    /* allocate RAM; on U3, RAM beyond 2 GiB continues at 4 GiB */
+    low_ram_size = machine->ram_size;
     if (machine->ram_size > 2 * GiB) {
-        error_report("RAM size more than 2 GiB is not supported");
-        exit(1);
+        MemoryRegion *low, *high;
+
+        if (PPC_INPUT(env) != PPC_FLAGS_INPUT_970) {
+            error_report("RAM size more than 2 GiB is not supported");
+            exit(1);
+        }
+        low_ram_size = 2 * GiB;
+        low = g_new(MemoryRegion, 1);
+        high = g_new(MemoryRegion, 1);
+        memory_region_init_alias(low, NULL, "ram-low", machine->ram, 0,
+                                 low_ram_size);
+        memory_region_init_alias(high, NULL, "ram-high", machine->ram,
+                                 low_ram_size,
+                                 machine->ram_size - low_ram_size);
+        memory_region_add_subregion(get_system_memory(), 0, low);
+        memory_region_add_subregion(get_system_memory(), 4 * GiB, high);
+    } else {
+        memory_region_add_subregion(get_system_memory(), 0, machine->ram);
     }
-    memory_region_add_subregion(get_system_memory(), 0, machine->ram);
 
     filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
     rom_is_flash = filename && !firmware_is_elf(filename);
@@ -983,13 +1031,13 @@ static void ppc_core99_init(MachineState *machine)
                                NULL, NULL, ELFDATA2MSB, PPC_ELF_MACHINE, 0, 0);
         if (kernel_size < 0) {
             kernel_size = load_aout(machine->kernel_filename, kernel_base,
-                                    machine->ram_size - kernel_base,
+                                    low_ram_size - kernel_base,
                                     true, TARGET_PAGE_SIZE);
         }
         if (kernel_size < 0) {
             kernel_size = load_image_targphys(machine->kernel_filename,
                                               kernel_base,
-                                              machine->ram_size - kernel_base,
+                                              low_ram_size - kernel_base,
                                               &error_fatal);
         }
         /* load initrd */
@@ -997,7 +1045,7 @@ static void ppc_core99_init(MachineState *machine)
             initrd_base = TARGET_PAGE_ALIGN(kernel_base + kernel_size + KERNEL_GAP);
             initrd_size = load_image_targphys(machine->initrd_filename,
                                               initrd_base,
-                                              machine->ram_size - initrd_base,
+                                              low_ram_size - initrd_base,
                                               &error_fatal);
             cmdline_base = TARGET_PAGE_ALIGN(initrd_base + initrd_size);
         } else {
@@ -1059,9 +1107,13 @@ static void ppc_core99_init(MachineState *machine)
 
     /* UniN init */
     s = SYS_BUS_DEVICE(qdev_new(TYPE_UNI_NORTH));
+    if (PPC_INPUT(env) == PPC_FLAGS_INPUT_970) {
+        qdev_prop_set_uint32(DEVICE(s), "version", U3_VERSION_23);
+    }
     sysbus_realize_and_unref(s, &error_fatal);
     memory_region_add_subregion(get_system_memory(), 0xf8000000,
                                 sysbus_mmio_get_region(s, 0));
+    unin_dev = s;
 
     /*
      * UniNorth's own I2C controller sits inside that 16MB window (at
@@ -1094,11 +1146,29 @@ static void ppc_core99_init(MachineState *machine)
         sysbus_mmio_map(s, 0, 0xf0800000);
         sysbus_mmio_map(s, 1, 0xf0c00000);
         /* PCI hole */
-        memory_region_add_subregion(get_system_memory(), 0x80000000,
+        memory_region_add_subregion(get_system_memory(), 0x90000000,
                                     sysbus_mmio_get_region(s, 2));
         /* Register 8 MB of ISA IO space */
-        memory_region_add_subregion(get_system_memory(), 0xf2000000,
+        memory_region_add_subregion(get_system_memory(), 0xf0000000,
                                     sysbus_mmio_get_region(s, 3));
+
+        /* U3 I2C is mapped above (our stage3 window).  TODO(stage6): the Pulsar
+         * clock chip (TYPE_PULSAR_CLOCK, cat7's keywest_i2c.c) is not wired yet. */
+
+        /* HyperTransport */
+        ht_dev = qdev_new(TYPE_U3_HT_HOST_BRIDGE);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(ht_dev), &error_fatal);
+        u3_ht_map(SYS_BUS_DEVICE(ht_dev));
+
+        /* DMA from both host buses goes through the DART */
+        dart = qdev_new(TYPE_U3_DART);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dart), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dart), 0, U3_DART_BASE);
+        u3_dart_attach(U3_DART(dart),
+                       PCI_HOST_BRIDGE(uninorth_pci_dev)->bus);
+        u3_agp_set_dma_as(U3_AGP_HOST_BRIDGE(uninorth_pci_dev),
+                          &U3_DART(dart)->as);
+        u3_dart_attach(U3_DART(dart), PCI_HOST_BRIDGE(ht_dev)->bus);
     } else {
         machine_arch = ARCH_MAC99;
         /* Use values found on a real PowerMac */
@@ -1154,6 +1224,13 @@ static void ppc_core99_init(MachineState *machine)
     has_adb = (core99_machine->via_config == CORE99_VIA_CONFIG_CUDA ||
                core99_machine->via_config == CORE99_VIA_CONFIG_PMU_ADB);
 
+    /* Secondary CPUs are released through the KeyLargo GPIOs, PMU only */
+    if (machine->smp.cpus > 1 && !has_pmu) {
+        error_report("mac99: -smp %u needs via=pmu or via=pmu-adb",
+                     machine->smp.cpus);
+        exit(1);
+    }
+
     /* init basic PC hardware */
     pci_bus = PCI_HOST_BRIDGE(uninorth_pci_dev)->bus;
 
@@ -1163,11 +1240,20 @@ static void ppc_core99_init(MachineState *machine)
      * devices where the hardware puts them: the PowerMac3,4 device tree has
      * mac-io@17 and usb@18 / usb@19 on this bus.
      */
-    macio = OBJECT(pci_new(PCI_DEVFN(0x17, 0), TYPE_NEWWORLD_MACIO));
+    if (machine_arch == ARCH_MAC99_U3) {
+        /* The K2 is behind the first HT-PCI bridge, the KeyLargo on the PCI bus */
+        macio_bus = pci_bridge_get_sec_bus(U3_HT_HOST_BRIDGE(ht_dev)->k2[0]);
+        macio_devfn = PCI_DEVFN(7, 0);
+    } else {
+        macio_bus = pci_bus;
+        macio_devfn = PCI_DEVFN(0x17, 0);
+    }
+    macio = OBJECT(pci_new(macio_devfn, TYPE_NEWWORLD_MACIO));
     dev = DEVICE(macio);
     qdev_prop_set_uint64(dev, "frequency", tbfreq);
     qdev_prop_set_bit(dev, "has-pmu", has_pmu);
     qdev_prop_set_bit(dev, "has-adb", has_adb);
+    qdev_prop_set_bit(dev, "k2", machine_arch == ARCH_MAC99_U3);
 
     dev = DEVICE(object_resolve_path_component(macio, "escc"));
     qdev_prop_set_chr(dev, "chrA", serial_hd(0));
@@ -1176,7 +1262,11 @@ static void ppc_core99_init(MachineState *machine)
     pic_dev = DEVICE(object_resolve_path_component(macio, "pic"));
     qdev_prop_set_uint32(pic_dev, "nb_cpus", machine->smp.cpus);
 
-    pci_realize_and_unref(PCI_DEVICE(macio), pci_bus, &error_fatal);
+    dev = DEVICE(object_resolve_path_component(macio, "gpio"));
+    qdev_prop_set_uint32(dev, "nb-cpus", machine->smp.cpus);
+    qdev_prop_set_bit(dev, "k2", machine_arch == ARCH_MAC99_U3);
+
+    pci_realize_and_unref(PCI_DEVICE(macio), macio_bus, &error_fatal);
 
     /*
      * Have MacIO come out of reset already decoding at the address real
@@ -1197,6 +1287,17 @@ static void ppc_core99_init(MachineState *machine)
         macio_notifier = g_new0(MacIOHwBaseNotifier, 1);
         macio_notifier->notifier.notify = macio_arm_hw_base_reset;
         macio_notifier->macio = PCI_DEVICE(macio);
+        /*
+         * The K2 machine reaches mac-io at 0x80000000 over HT-PCI, so its BAR
+         * has to live inside that bridge's memory window instead of the G4's
+         * 0xf3000000; there is no separate CPU-visible window to add either,
+         * the HT window already forwards 0x80000000-0x8fffffff.
+         */
+        if (machine_arch == ARCH_MAC99_U3) {
+            macio_notifier->hw_base = K2_MACIO_BASE;
+        } else {
+            macio_notifier->hw_base = MACIO_BASE;
+        }
         qemu_add_machine_init_done_notifier(&macio_notifier->notifier);
 
         /*
@@ -1207,10 +1308,18 @@ static void ppc_core99_init(MachineState *machine)
          * window so the BAR above is actually usable.
          */
         macio_win = g_new(MemoryRegion, 1);
-        memory_region_init_alias(macio_win, macio, "unin-pci-macio-hole",
+        memory_region_init_alias(macio_win, macio, "macio-hw-base",
                                  pci_address_space(PCI_DEVICE(macio)),
-                                 MACIO_BASE, MACIO_WIN_SIZE);
-        memory_region_add_subregion(get_system_memory(), MACIO_BASE, macio_win);
+                                 macio_notifier->hw_base, MACIO_WIN_SIZE);
+        if (machine_arch == ARCH_MAC99_U3) {
+            /* above the u3-ht-mem alias so the K2 registers shadow it */
+            memory_region_add_subregion_overlap(get_system_memory(),
+                                                macio_notifier->hw_base,
+                                                macio_win, 1);
+        } else {
+            memory_region_add_subregion(get_system_memory(),
+                                        macio_notifier->hw_base, macio_win);
+        }
     }
 
     /* Connect GPIO reset IRQs for secondary CPUs */
@@ -1250,6 +1359,25 @@ static void ppc_core99_init(MachineState *machine)
             qdev_connect_gpio_out(uninorth_pci_dev, i,
                                   qdev_get_gpio_in(pic_dev, 0x1b + i));
         }
+    }
+    if (machine_arch == ARCH_MAC99_U3) {
+        qdev_connect_gpio_out(uninorth_pci_dev, U3_AGP_SLOT_IRQ_LINE,
+                              qdev_get_gpio_in(pic_dev, U3_AGP_SLOT_IRQ));
+        for (i = 0; i < U3_HT_NUM_IRQS; i++) {
+            qdev_connect_gpio_out(ht_dev, i, qdev_get_gpio_in(pic_dev, i));
+        }
+
+        /*
+         * U3 MPIC, cascaded into the K2 MPIC. Its window also spans the
+         * HT self registers, which take precedence.
+         */
+        dev = qdev_new(TYPE_OPENPIC);
+        qdev_prop_set_uint32(dev, "model", OPENPIC_MODEL_KEYLARGO);
+        qdev_prop_set_bit(dev, "big-endian", true);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, U3_MPIC_BASE, -1);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), OPENPIC_OUTPUT_INT,
+                           qdev_get_gpio_in(pic_dev, U3_MPIC_CASCADE_IRQ));
     }
 
     /* TODO: additional PCI buses only wired up for 32-bit machines */
@@ -1291,14 +1419,59 @@ static void ppc_core99_init(MachineState *machine)
     }
     g_free(openpic_irqs);
 
-    /* We only emulate 2 out of 3 IDE controllers for now */
+    /* CPU1-3 soft-reset lines */
+    dev = DEVICE(object_resolve_path_component(macio, "gpio"));
+    for (i = 1; i < machine->smp.cpus; i++) {
+        cpu_kick_irq = qemu_allocate_irq(cpu_kick, cpus[i], 0);
+        qdev_connect_gpio_out_named(dev, "cpu-reset", i, cpu_kick_irq);
+    }
+    g_free(cpus);
+
     ide_drive_get(hd, ARRAY_SIZE(hd));
 
-    macio_ide = MACIO_IDE(object_resolve_path_component(macio, "ide[0]"));
-    macio_ide_init_drives(macio_ide, hd);
+    if (machine_arch == ARCH_MAC99_U3) {
+        /*
+         * As on a G5, the K2 ATA-100 behind the third HT-PCI bridge
+         * holds the optical drives, and the K2 SATA behind the fifth the
+         * hard disks.  IDE drive 0 stays on the ATA-100 so that existing
+         * command lines keep their system disk; the other hard disks go
+         * to SATA ports A and B, then to the ATA-100's free slot.  Drives
+         * given with -device ide-hd,bus=sata.N land where they say.
+         */
+        DriveInfo *uata_hd[MAX_IDE_DEVS] = {};
+        DriveInfo *sata_hd[K2_SATA_NUM_PORTS] = {};
+        PCIDevice *uata, *sata;
+        int nuata = 0, nsata = 0;
 
-    macio_ide = MACIO_IDE(object_resolve_path_component(macio, "ide[1]"));
-    macio_ide_init_drives(macio_ide, &hd[MAX_IDE_DEVS]);
+        for (i = 0; i < ARRAY_SIZE(hd); i++) {
+            if (!hd[i]) {
+                continue;
+            }
+            if (i > 0 && !hd[i]->media_cd && nsata < K2_SATA_NUM_PORTS) {
+                sata_hd[nsata++] = hd[i];
+            } else if (nuata < MAX_IDE_DEVS) {
+                uata_hd[nuata++] = hd[i];
+            } else {
+                error_report("mac99: no IDE slot left for drive %d", i);
+                exit(1);
+            }
+        }
+
+        /* TODO(stage6): K2 UATA (ATA-100) -- needs cat7's hw/ide/macio.c K2 device,
+         * which is on a newer IDE API than this tree; SATA carries the disks for now. */
+        sata = pci_new(PCI_DEVFN(12, 0), TYPE_K2_SATA);
+        pci_realize_and_unref(sata, pci_bridge_get_sec_bus(
+                              U3_HT_HOST_BRIDGE(ht_dev)->k2[4]),
+                              &error_fatal);
+        k2_sata_init_drives(K2_SATA(sata), sata_hd);
+    } else {
+        /* We only emulate 2 out of 3 IDE controllers for now */
+        macio_ide = MACIO_IDE(object_resolve_path_component(macio, "ide[0]"));
+        macio_ide_init_drives(macio_ide, hd);
+
+        macio_ide = MACIO_IDE(object_resolve_path_component(macio, "ide[1]"));
+        macio_ide_init_drives(macio_ide, &hd[MAX_IDE_DEVS]);
+    }
 
     if (has_adb) {
         if (has_pmu) {
@@ -1316,8 +1489,13 @@ static void ppc_core99_init(MachineState *machine)
     }
 
     if (machine->usb) {
-        pci_create_simple(pci_bus, rom_is_flash ? PCI_DEVFN(0x18, 0) : -1,
-                          "pci-ohci");
+        if (machine_arch == ARCH_MAC99_U3) {
+            usb0 = pci_create_simple(macio_bus, PCI_DEVFN(8, 0), "pci-ohci");
+            pci_config_set_device_id(usb0->config, PCI_DEVICE_ID_APPLE_K2_USB);
+        } else {
+            pci_create_simple(pci_bus, rom_is_flash ? PCI_DEVFN(0x18, 0) : -1,
+                              "pci-ohci");
+        }
 
         /* U3 needs to use USB for input because Linux doesn't support via-cuda
         on PPC64 */
@@ -1329,15 +1507,27 @@ static void ppc_core99_init(MachineState *machine)
             usb_create_simple(usb_bus, "usb-kbd");
             usb_create_simple(usb_bus, "usb-mouse");
         }
+
+        /* The K2 has a second USB controller */
+        if (machine_arch == ARCH_MAC99_U3) {
+            usb1 = pci_create_simple(macio_bus, PCI_DEVFN(9, 0), "pci-ohci");
+            pci_config_set_device_id(usb1->config, PCI_DEVICE_ID_APPLE_K2_USB);
+
+            /*
+             * TODO(stage6): the NEC uPD720101 EHCI (cat7's hcd-ehci-pci NEC
+             * model, "nec-usb-ehci") is not in this tree yet; the K2 OHCI is.
+             */
+            (void)nec_bus; (void)ehci; (void)ehci_bus; (void)ohci;
+        }
     }
 
     pci_vga_init(pci_bus);
 
     if (!graphic_width) {
-        graphic_width = 800;
+        graphic_width = machine_arch == ARCH_MAC99_U3 ? 1024 : 800;
     }
     if (!graphic_height) {
-        graphic_height = 600;
+        graphic_height = machine_arch == ARCH_MAC99_U3 ? 768 : 600;
     }
     if (!graphic_depth) {
         graphic_depth = 32;
@@ -1346,6 +1536,22 @@ static void ppc_core99_init(MachineState *machine)
         graphic_depth = 15;
     }
 
+    if (machine_arch == ARCH_MAC99_U3) {
+        /* The K2 GMAC is behind the fourth HT-PCI bridge */
+        PCIDevice *gmac = pci_new(PCI_DEVFN(15, 0), mc->default_nic);
+
+        /* The K2 GMAC's PHY is at MII address 1 */
+        qdev_prop_set_uint32(DEVICE(gmac), "phy_addr", 1);
+        if (qemu_configure_nic_device(DEVICE(gmac), true, NULL)) {
+            pci_realize_and_unref(gmac, pci_bridge_get_sec_bus(
+                                  U3_HT_HOST_BRIDGE(ht_dev)->k2[3]),
+                                  &error_fatal);
+            pci_config_set_device_id(gmac->config,
+                                     PCI_DEVICE_ID_APPLE_K2_GMAC);
+        } else {
+            object_unref(OBJECT(gmac));
+        }
+    }
     pci_init_nic_devices(pci_bus, mc->default_nic);
 
     /* The NewWorld NVRAM is not located in the MacIO device */
@@ -1355,7 +1561,22 @@ static void ppc_core99_init(MachineState *machine)
         nvram_addr = 0xFFE00000;
     }
     dev = qdev_new(TYPE_MACIO_NVRAM);
-    if (rom_is_flash) {
+    if (machine_arch == ARCH_MAC99_U3) {
+        /* The G5's NVRAM is flat, two 8 KB flash banks */
+        qdev_prop_set_uint32(dev, "size", MACIO_NVRAM_FLASH_SIZE);
+        qdev_prop_set_uint32(dev, "it_shift", 0);
+        qdev_prop_set_bit(dev, "flash", true);
+        if (!MACIO_NVRAM(dev)->blk) {
+            DriveInfo *u3_dinfo = drive_get(IF_MTD, 0, 0);
+            BlockBackend *blk = u3_dinfo ? blk_by_legacy_dinfo(u3_dinfo) :
+                macio_nvram_default_blk("nvram.img", MACIO_NVRAM_FLASH_SIZE,
+                                        0xff);
+
+            if (blk) {
+                qdev_prop_set_drive(dev, "drive", blk);
+            }
+        }
+    } else if (rom_is_flash) {
         /* Flat bytes, flash command set, and erased rather than zeroed. */
         qdev_prop_set_uint32(dev, "size", NVRAM_FLASH_SIZE);
         qdev_prop_set_uint32(dev, "it_shift", 0);
@@ -1400,6 +1621,18 @@ static void ppc_core99_init(MachineState *machine)
         sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, nvram_addr);
     }
     nvr = MACIO_NVRAM(dev);
+    if (machine_arch == ARCH_MAC99_U3) {
+        /*
+         * Keep what the file holds unless the firmware could not use it;
+         * -prom-env variables override the saved ones
+         */
+        if (!pmac_nvram_core99_valid(nvr)) {
+            if (nvr->blk && nvr->data[0] != 0xff) {
+                warn_report("NVRAM image holds no valid bank, reformatting it");
+            }
+            pmac_format_nvram_core99(nvr);
+        }
+        pmac_nvram_core99_set_prom_env(nvr);
     /*
      * The Apple ROM lays out and validates its own partitions; only the
      * OpenBIOS-style NVRAM wants the CHRP ones seeded, and even then only
@@ -1421,6 +1654,7 @@ static void ppc_core99_init(MachineState *machine)
         core99_nvram_graft(nvr, core99_clockfreq(core99_machine) / 2);
     }
     core99_report_boot_device(nvr);
+    }
     /* No PCI init: the BIOS will do it */
 
     /*
@@ -1445,7 +1679,9 @@ static void ppc_core99_init(MachineState *machine)
 
     fw_cfg_add_i16(fw_cfg, FW_CFG_NB_CPUS, (uint16_t)machine->smp.cpus);
     fw_cfg_add_i16(fw_cfg, FW_CFG_MAX_CPUS, (uint16_t)machine->smp.max_cpus);
-    fw_cfg_add_i64(fw_cfg, FW_CFG_RAM_SIZE, (uint64_t)machine->ram_size);
+    fw_cfg_add_i64(fw_cfg, FW_CFG_RAM_SIZE, low_ram_size);
+    fw_cfg_add_i64(fw_cfg, FW_CFG_PPC_HIGH_RAM_SIZE,
+                   machine->ram_size - low_ram_size);
     fw_cfg_add_i16(fw_cfg, FW_CFG_MACHINE_ID, machine_arch);
     fw_cfg_add_i32(fw_cfg, FW_CFG_KERNEL_ADDR, kernel_base);
     fw_cfg_add_i32(fw_cfg, FW_CFG_KERNEL_SIZE, kernel_size);
@@ -1465,6 +1701,8 @@ static void ppc_core99_init(MachineState *machine)
     fw_cfg_add_i16(fw_cfg, FW_CFG_PPC_DEPTH, graphic_depth);
 
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_VIACONFIG, core99_machine->via_config);
+    fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_NVRAM_FLAT,
+                   machine_arch == ARCH_MAC99_U3);
 
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_IS_KVM, kvm_enabled());
     if (kvm_enabled()) {
@@ -1478,9 +1716,11 @@ static void ppc_core99_init(MachineState *machine)
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_TBFREQ, tbfreq);
     /* Mac OS X requires a "known good" clock-frequency value; pass it one. */
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_CLOCKFREQ,
-                   core99_clockfreq(core99_machine));
+                   machine_arch == ARCH_MAC99_U3 ? U3_CLOCKFREQ :
+                       core99_clockfreq(core99_machine));
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_BUSFREQ,
-                   core99_busfreq(core99_machine));
+                   machine_arch == ARCH_MAC99_U3 ? U3_BUSFREQ :
+                       core99_busfreq(core99_machine));
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_NVRAM_ADDR, nvram_addr);
 
     /* MacOS NDRV VGA driver */
