@@ -86,21 +86,6 @@
 
 #define MAX_IDE_BUS 2
 #define CFG_ADDR 0xf0000510
-/*
- * The frequencies a real PowerMac3,4 (Digital Audio) publishes in its own
- * device tree, taken verbatim from an lsprop dump of /cpus/PowerPC,G4@0:
- *
- *   timebase-frequency  0x01fbf711    33,290,001 Hz
- *   clock-frequency     0x1bd0c4a9   466,666,665 Hz
- *   bus-frequency       0x07efdc44   133,160,004 Hz
- *
- * The real firmware measured these on real silicon, so they are not round
- * numbers -- but the timebase = bus/4 relationship holds, as on every 60x-bus
- * PowerPC, and guests derive one frequency from the other.
- */
-#define TBFREQ    33290001UL
-#define CLOCKFREQ 466666665UL
-#define BUSFREQ   133160004UL
 
 #define NDRV_VGA_FILENAME "qemu_vga.ndrv"
 
@@ -146,14 +131,6 @@ static const MemoryRegionOps core99_rom_ops = {
  */
 #define ROM_WINDOW_BASE 0xff000000
 #define ROM_WINDOW_SIZE (16 * MiB)
-/*
- * The L2 clock the boot-command graft publishes.  L2CR 0xb9000000 has
- * L2CLK = divide-by-2 and the donor PowerMac3,4's backside cache runs at
- * 233MHz off a 466.67MHz core; this tree has no model= property yet, so this
- * is the constant the source branch used before its PM34/PM36 clock work.
- */
-#define CORE99_L2CLOCK 233333332
-
 #define KERNEL_LOAD_ADDR 0x01000000
 #define KERNEL_GAP       0x00100000
 
@@ -168,24 +145,69 @@ typedef enum {
     CORE99_VIA_CONFIG_PMU_ADB
 } Core99ViaConfig;
 
+/*
+ * The board data a boot ROM reads for itself, one row per machine.  This
+ * generalizes the source branch's per-model files: a model is a table row.
+ */
+typedef struct Core99ModelInfo {
+    const char *name;
+    uint32_t tbfreq;
+    uint32_t clockfreq;
+    uint32_t busfreq;
+    uint32_t hid1;      /* PLL_CFG is HID1[0:3] on 7400, [15:19] on 7455 */
+    unsigned spd_slots;
+} Core99ModelInfo;
+
+static const Core99ModelInfo core99_models[] = {
+    /* PowerMac3,4 "Digital Audio", 933MHz (the Quicksilver ratio) */
+    { "pm34", 33290001, 933333331, 133160004, 0x20000000, 3 },
+};
+
+#define CORE99_DEFAULT_MODEL 0  /* pm34 */
+
 struct Core99MachineState {
     /*< private >*/
     MachineState parent;
 
     Core99ViaConfig via_config;
+    unsigned model;
 };
+
+static const Core99ModelInfo *core99_model_info(const Core99MachineState *cms)
+{
+    return &core99_models[cms->model];
+}
+
+static uint32_t core99_tbfreq(const Core99MachineState *cms)
+{
+    return core99_model_info(cms)->tbfreq;
+}
+
+static uint32_t core99_clockfreq(const Core99MachineState *cms)
+{
+    return core99_model_info(cms)->clockfreq;
+}
+
+static uint32_t core99_busfreq(const Core99MachineState *cms)
+{
+    return core99_model_info(cms)->busfreq;
+}
 
 /*
  * The Apple ROM measures the bus and multiplies by HID1's ratio itself, so
  * this has to agree with clockfreq; SPRs snap back to their registered
- * defaults on reset, so the default matters as much as the live value.  A
- * 466MHz Digital Audio runs 3.5x on its 133MHz bus, which MPC7400EC Table 14
- * encodes as 0b1110.
+ * defaults on reset, so the default matters as much as the live value.
  */
-static void core99_cpu_defaults(PowerPCCPU *cpu)
+static void core99_cpu_defaults(const Core99MachineState *cms,
+                                PowerPCCPU *cpu)
 {
-    cpu->env.spr_cb[SPR_HID1].default_value = 0xE0000000;
-    cpu->env.spr[SPR_HID1] = 0xE0000000;
+    uint32_t hid1 = core99_model_info(cms)->hid1;
+
+    if (!hid1) {
+        return;
+    }
+    cpu->env.spr_cb[SPR_HID1].default_value = hid1;
+    cpu->env.spr[SPR_HID1] = hid1;
 }
 
 /*
@@ -193,7 +215,8 @@ static void core99_cpu_defaults(PowerPCCPU *cpu)
  * RAM -- it never asks QEMU.  One donor module's geometry bytes are patched
  * and its byte-63 checksum re-summed per slot, so every -m has images.
  */
-static void core99_add_spd_dimms(I2CBus *bus, uint64_t ram_size)
+static void core99_add_spd_dimms(const Core99MachineState *cms, I2CBus *bus,
+                                 uint64_t ram_size)
 {
     static const struct {
         unsigned mb, rows, cols, ranks, density;
@@ -204,11 +227,12 @@ static void core99_add_spd_dimms(I2CBus *bus, uint64_t ram_size)
         {  64, 12,  9, 1, 0x10 },
         {  32, 11,  9, 1, 0x08 },
     };
+    const Core99ModelInfo *model = core99_model_info(cms);
     uint64_t left = ram_size;
     int slot = 0;
     unsigned g = 0;
 
-    while (left && slot < 3 && g < ARRAY_SIZE(spd_geom)) {
+    while (left && slot < model->spd_slots && g < ARRAY_SIZE(spd_geom)) {
         uint8_t spd[MAC_SPD_SIZE];
         unsigned sum, b;
 
@@ -232,8 +256,9 @@ static void core99_add_spd_dimms(I2CBus *bus, uint64_t ram_size)
     }
     if (left) {
         warn_report("mac99: %" PRIu64 "MB of RAM not representable as "
-                    "1-3 DIMMs; the firmware will see %" PRIu64 "MB",
-                    left / MiB, (ram_size - left) / MiB);
+                    "1-%u %s DIMMs; the firmware will see %" PRIu64 "MB",
+                    left / MiB, model->spd_slots, model->name,
+                    (ram_size - left) / MiB);
     }
 }
 
@@ -649,7 +674,7 @@ static void core99_nvram_set_bootcmd(uint8_t *data, uint32_t size,
  * the firewire stub and the AGP work); the cache and gmac grafts are the two
  * that apply to any mac99.
  */
-static void core99_nvram_graft(MacIONVRAMState *nvr)
+static void core99_nvram_graft(MacIONVRAMState *nvr, uint32_t l2clock)
 {
     Object *o = object_resolve_path_type("", "sungem", NULL);
     g_autofree char *macstr = o ? object_property_get_str(o, "mac", NULL)
@@ -666,8 +691,9 @@ static void core99_nvram_graft(MacIONVRAMState *nvr)
         have_mac = true;
     }
     core99_nvram_seed_if_blank(nvr->data, nvr->size);
-    core99_nvram_set_bootcmd(nvr->data, nvr->size,
-                             have_mac ? mac : NULL, CORE99_L2CLOCK);
+    /* L2CR 0xb9000000 is divide-by-2: half the core clock, per model */
+    core99_nvram_set_bootcmd(nvr->data, nvr->size, have_mac ? mac : NULL,
+                             l2clock);
 }
 
 
@@ -812,7 +838,8 @@ static void ppc_core99_init(MachineState *machine)
     I2CBus *unin_i2c;
     MacIOHwBaseNotifier *macio_notifier;
     hwaddr nvram_addr = 0xFFF04000;
-    uint64_t tbfreq = kvm_enabled() ? kvmppc_get_tbfreq() : TBFREQ;
+    uint64_t tbfreq = kvm_enabled() ? kvmppc_get_tbfreq()
+                                    : core99_tbfreq(core99_machine);
 
     /* init CPUs */
     cpus = g_new0(PowerPCCPU *, machine->smp.cpus);
@@ -820,10 +847,10 @@ static void ppc_core99_init(MachineState *machine)
         cpus[i] = POWERPC_CPU(cpu_create(machine->cpu_type));
         
         /* Each CPU needs its own tb_env for decrementer (per-CPU timer) */
-        cpu_ppc_tb_init(&cpus[i]->env, TBFREQ);
+        cpu_ppc_tb_init(&cpus[i]->env, core99_tbfreq(core99_machine));
 
         if (PPC_INPUT(&cpus[i]->env) != PPC_FLAGS_INPUT_970) {
-            core99_cpu_defaults(cpus[i]);
+            core99_cpu_defaults(core99_machine, cpus[i]);
         }
         
         /*
@@ -1037,7 +1064,7 @@ static void ppc_core99_init(MachineState *machine)
     unin_i2c = UNI_NORTH(s)->i2c.bus;
     at24c_eeprom_init_rom(unin_i2c, 0x56, 256, NULL, 0);
 
-    core99_add_spd_dimms(unin_i2c, machine->ram_size);
+    core99_add_spd_dimms(core99_machine, unin_i2c, machine->ram_size);
 
     if (PPC_INPUT(env) == PPC_FLAGS_INPUT_970) {
         machine_arch = ARCH_MAC99_U3;
@@ -1327,7 +1354,7 @@ static void ppc_core99_init(MachineState *machine)
      * data); both patch the in-RAM image only, as the source branch does.
      */
     if (rom_is_flash) {
-        core99_nvram_graft(nvr);
+        core99_nvram_graft(nvr, core99_clockfreq(core99_machine) / 2);
     }
     core99_report_boot_device(nvr);
     /* No PCI init: the BIOS will do it */
@@ -1376,8 +1403,10 @@ static void ppc_core99_init(MachineState *machine)
     }
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_TBFREQ, tbfreq);
     /* Mac OS X requires a "known good" clock-frequency value; pass it one. */
-    fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_CLOCKFREQ, CLOCKFREQ);
-    fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_BUSFREQ, BUSFREQ);
+    fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_CLOCKFREQ,
+                   core99_clockfreq(core99_machine));
+    fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_BUSFREQ,
+                   core99_busfreq(core99_machine));
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_NVRAM_ADDR, nvram_addr);
 
     /* MacOS NDRV VGA driver */
@@ -1498,6 +1527,7 @@ static void core99_instance_init(Object *obj)
 
     /* Default via_config is CORE99_VIA_CONFIG_CUDA */
     cms->via_config = CORE99_VIA_CONFIG_CUDA;
+    cms->model = CORE99_DEFAULT_MODEL;
     object_property_add_str(obj, "via", core99_get_via_config,
                             core99_set_via_config);
     object_property_set_description(obj, "via",
