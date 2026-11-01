@@ -341,8 +341,25 @@ target_ulong helper_load_sr(CPUPPCState *env, target_ulong sr_num)
 {
 #if defined(TARGET_PPC64)
     if (mmu_is_64bit(env->mmu_model)) {
-        /* XXX */
-        return 0;
+        /*
+         * 64-bit bridge: mfsr/mfsrin move the 32-bit segment descriptor
+         * back out of the SLB entry that mtsr/mtsrin created.  PEM (64-bit)
+         * Table 7-19 defines that descriptor as VSID[0-24] = 0,
+         * VSID[25-51] = rS[37-63] and Ks/Kp/N from rS[33-36], so this is
+         * the inverse of the packing helper_store_sr() does.  Returning 0
+         * here instead makes a guest that reads a segment back (the
+         * PowerMac7,3 BootROM does, before it builds its page tables)
+         * compute VSID 0 while the translation path uses the SLB's real
+         * VSID, so every PTE it writes is unusable.
+         */
+        const ppc_slb_t *slb = &env->slb[sr_num & 0xf];
+        uint64_t value = 0;
+
+        if (slb->esid & SLB_ESID_V) {
+            value  = (slb->vsid >> 12) & 0x0fffffff;    /* VSID[28-51] */
+            value |= ((slb->vsid >> 8) & 0xf) << 27;    /* Ks/Kp/N     */
+        }
+        return value;
     }
 #endif
     return env->sr[sr_num];
