@@ -146,6 +146,12 @@ config ATI_RAGE128
     select EDID
     select BITBANG_I2C
 
+config ATI_R350
+    bool
+    default y if PCI_DEVICES
+    depends on PCI
+    select EDID
+
 config S3_VGA
     bool
     default y if PCI_DEVICES
