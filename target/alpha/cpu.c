@@ -470,10 +470,12 @@ static void alpha_cpu_init_clock(AlphaCPU *cpu)
     }
 
     /*
-     * Trial and error have suggested that the PCC actually increments every
-     * 32 processor cycles.
+     * Cycle counter clock.  The consoles recover the CPU clock by dividing
+     * the cycle counter by the PCC increment interval: 16 cycles on the
+     * 21164 (EV5), 32 on the 21164A/21264.  Keep the counter clock in step
+     * with that so RPCC-based speed detection reports the board's clock.
      */
-    clock_set_mul_div(cpu->sysclk_div, 32, 1);
+    clock_set_mul_div(cpu->sysclk_div, cpu->proc_id == PROCID_EV5 ? 16 : 32, 1);
     clock_set_source(cpu->sysclk_div, cpu->refclk);
     clock_set_source(cpu->sysclk, cpu->sysclk_div);
 }

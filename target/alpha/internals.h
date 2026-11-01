@@ -299,9 +299,14 @@ static inline uint32_t alpha_get_eien_from_ipl(CPUAlphaState *env)
     int ipl = alpha_get_ipl(env);
     int bit;
 
-    for (bit = IPL_EIRQ_MIN;
-         bit < CLAMP(ipl, IPL_EIRQ_MIN, IPL_EIRQ_MAX + 1);
-         bit++) {
+    /*
+     * An interrupt is recognized only when its INTID/level is strictly
+     * greater than IPL (HRM interrupt-priority rules; the SRM PAL
+     * irq handler also dispatches only when INTID > IPL).  The loop
+     * does not run at all for IPL < IPL_EIRQ_MIN, so all hardware
+     * interrupt levels stay enabled there.
+     */
+    for (bit = IPL_EIRQ_MIN; bit <= MIN(ipl, IPL_EIRQ_MAX); bit++) {
         eien &= ~BIT(bit - IPL_EIRQ_MIN);
     }
     return eien;
@@ -687,6 +692,7 @@ uint64_t alpha_read_cyclecounter(CPUAlphaState *env);
 static inline uint16_t altmode_tlbmask(void)
 {
     return AlphaMMUIdxBit_AltMode |
+           AlphaMMUIdxBit_AltModeVPTE |
            AlphaMMUIdxBit_AltModeWChk;
 }
 
