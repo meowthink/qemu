@@ -86,9 +86,21 @@
 
 #define MAX_IDE_BUS 2
 #define CFG_ADDR 0xf0000510
-#define TBFREQ (25UL * 1000UL * 1000UL)
-#define CLOCKFREQ (900UL * 1000UL * 1000UL)
-#define BUSFREQ (100UL * 1000UL * 1000UL)
+/*
+ * The frequencies a real PowerMac3,4 (Digital Audio) publishes in its own
+ * device tree, taken verbatim from an lsprop dump of /cpus/PowerPC,G4@0:
+ *
+ *   timebase-frequency  0x01fbf711    33,290,001 Hz
+ *   clock-frequency     0x1bd0c4a9   466,666,665 Hz
+ *   bus-frequency       0x07efdc44   133,160,004 Hz
+ *
+ * The real firmware measured these on real silicon, so they are not round
+ * numbers -- but the timebase = bus/4 relationship holds, as on every 60x-bus
+ * PowerPC, and guests derive one frequency from the other.
+ */
+#define TBFREQ    33290001UL
+#define CLOCKFREQ 466666665UL
+#define BUSFREQ   133160004UL
 
 #define NDRV_VGA_FILENAME "qemu_vga.ndrv"
 
