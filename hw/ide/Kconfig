@@ -65,3 +65,7 @@ config IDE_SII3112
 config IDE_CF
     bool
     default y if IDE_BUS
+
+config IDE_K2_SATA
+    bool
+    select IDE_PCI
