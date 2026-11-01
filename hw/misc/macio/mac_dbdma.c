@@ -94,7 +94,7 @@ static void dbdma_cmdptr_load(DBDMA_channel *ch)
 {
     DBDMA_DPRINTFCH(ch, "dbdma_cmdptr_load 0x%08x\n",
                     ch->regs[DBDMA_CMDPTR_LO]);
-    dma_memory_read(&address_space_memory, ch->regs[DBDMA_CMDPTR_LO],
+    dma_memory_read(ch->io.as, ch->regs[DBDMA_CMDPTR_LO],
                     &ch->current, sizeof(dbdma_cmd), MEMTXATTRS_UNSPECIFIED);
 }
 
@@ -104,7 +104,7 @@ static void dbdma_cmdptr_save(DBDMA_channel *ch)
                     ch->regs[DBDMA_CMDPTR_LO],
                     le16_to_cpu(ch->current.xfer_status),
                     le16_to_cpu(ch->current.res_count));
-    dma_memory_write(&address_space_memory, ch->regs[DBDMA_CMDPTR_LO],
+    dma_memory_write(ch->io.as, ch->regs[DBDMA_CMDPTR_LO],
                      &ch->current, sizeof(dbdma_cmd), MEMTXATTRS_UNSPECIFIED);
 }
 
@@ -493,7 +493,7 @@ static void load_word(DBDMA_channel *ch, int key, uint32_t addr,
         return;
     }
 
-    dma_memory_read(&address_space_memory, addr, &current->cmd_dep, len,
+    dma_memory_read(ch->io.as, addr, &current->cmd_dep, len,
                     MEMTXATTRS_UNSPECIFIED);
     trace_dbdma_load_word(ch->channel, addr, len, le32_to_cpu(current->cmd_dep));
 
@@ -556,7 +556,7 @@ static void store_word(DBDMA_channel *ch, int key, uint32_t addr,
     }
 
     trace_dbdma_store_word(ch->channel, addr, len, le32_to_cpu(current->cmd_dep));
-    dma_memory_write(&address_space_memory, addr, &current->cmd_dep, len,
+    dma_memory_write(ch->io.as, addr, &current->cmd_dep, len,
                      MEMTXATTRS_UNSPECIFIED);
 
     /* Unmet wait parks the channel -- see the comment above nop(). */
@@ -1472,6 +1472,7 @@ static void mac_dbdma_init(Object *obj)
         ch->flush = dbdma_unassigned_flush;
         ch->channel = i;
         ch->io.channel = ch;
+        ch->io.as = &address_space_memory;
         ch->unassigned_completion_timer =
             timer_new_ms(QEMU_CLOCK_VIRTUAL, dbdma_unassigned_complete, ch);
         ch->wait_poll_timer =

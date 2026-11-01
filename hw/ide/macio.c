@@ -156,7 +156,7 @@ static void pmac_ide_atapi_transfer_cb(void *opaque, int ret)
     if (s->lba == -1) {
         /* Non-block ATAPI transfer - just copy to RAM */
         s->io_buffer_size = MIN(s->io_buffer_size, io->len);
-        dma_memory_write(&address_space_memory, io->addr, s->io_buffer,
+        dma_memory_write(io->as, io->addr, s->io_buffer,
                          s->io_buffer_size, MEMTXATTRS_UNSPECIFIED);
         io->len = 0;
         ide_atapi_cmd_ok(s);
@@ -168,7 +168,7 @@ static void pmac_ide_atapi_transfer_cb(void *opaque, int ret)
     offset = ((int64_t)s->lba << 11) + s->io_buffer_index;
 
     qemu_sglist_init(&s->sg, DEVICE(m), io->len / MACIO_PAGE_SIZE + 1,
-                     &address_space_memory);
+                     io->as);
     qemu_sglist_add(&s->sg, io->addr, io->len);
     s->io_buffer_size -= io->len;
     s->io_buffer_index += io->len;
@@ -231,7 +231,7 @@ static void pmac_ide_transfer_cb(void *opaque, int ret)
     offset = (ide_get_sector(s) << 9) + s->io_buffer_index;
 
     qemu_sglist_init(&s->sg, DEVICE(m), io->len / MACIO_PAGE_SIZE + 1,
-                     &address_space_memory);
+                     io->as);
     qemu_sglist_add(&s->sg, io->addr, io->len);
     s->io_buffer_size -= io->len;
     s->io_buffer_index += io->len;
