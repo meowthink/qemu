@@ -87,6 +87,7 @@
 
 #define MAX_IDE_BUS 2
 #define CFG_ADDR 0xf0000510
+#define U3_TBFREQ 33333333UL
 
 #define NDRV_VGA_FILENAME "qemu_vga.ndrv"
 
@@ -861,7 +862,9 @@ static void ppc_core99_init(MachineState *machine)
         cpus[i] = POWERPC_CPU(cpu_create(machine->cpu_type));
         
         /* Each CPU needs its own tb_env for decrementer (per-CPU timer) */
-        cpu_ppc_tb_init(&cpus[i]->env, core99_tbfreq(core99_machine));
+        cpu_ppc_tb_init(&cpus[i]->env,
+                        PPC_INPUT(&cpus[i]->env) == PPC_FLAGS_INPUT_970
+                            ? U3_TBFREQ : core99_tbfreq(core99_machine));
 
         if (PPC_INPUT(&cpus[i]->env) != PPC_FLAGS_INPUT_970) {
             core99_cpu_defaults(core99_machine, cpus[i]);
