@@ -17,3 +17,7 @@ config KEYWEST_I2C
 config TAS3004
     bool
     select I2C
+
+config MACIO_PULSAR
+    bool
+    select I2C

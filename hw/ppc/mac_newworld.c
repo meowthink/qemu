@@ -69,6 +69,7 @@
 #include "hw/nvram/fw_cfg.h"
 #include "hw/char/escc.h"
 #include "hw/misc/macio/macio.h"
+#include "hw/misc/macio/pulsar.h"
 #include "hw/nvram/eeprom_at24c.h"
 #include "hw/nvram/mac_spd.h"
 
@@ -1152,8 +1153,11 @@ static void ppc_core99_init(MachineState *machine)
         memory_region_add_subregion(get_system_memory(), 0xf0000000,
                                     sysbus_mmio_get_region(s, 3));
 
-        /* U3 I2C is mapped above (our stage3 window).  TODO(stage6): the Pulsar
-         * clock chip (TYPE_PULSAR_CLOCK, cat7's keywest_i2c.c) is not wired yet. */
+        /* U3 I2C is mapped above (our stage3 window), with the Pulsar clock
+         * chip at 0xd2 -- Mac OS X writes it to freeze the timebase while
+         * starting a second CPU. */
+        i2c_slave_create_simple(UNI_NORTH(unin_dev)->i2c.bus,
+                                TYPE_PULSAR_CLOCK, 0xd2 >> 1);
 
         /* HyperTransport */
         ht_dev = qdev_new(TYPE_U3_HT_HOST_BRIDGE);

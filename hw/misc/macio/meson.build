@@ -7,5 +7,6 @@ macio_ss.add(when: 'CONFIG_MAC_DBDMA', if_true: files('mac_dbdma.c'))
 macio_ss.add(when: 'CONFIG_MAC_PMU', if_true: files('pmu.c'))
 
 macio_ss.add(when: 'CONFIG_TAS3004', if_true: files('tas3004.c', 'cs8420.c', 'k2_sound.c'))
+macio_ss.add(when: 'CONFIG_MACIO_PULSAR', if_true: files('pulsar.c'))
 
 system_ss.add_all(when: 'CONFIG_MACIO', if_true: macio_ss)

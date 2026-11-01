@@ -156,6 +156,7 @@ config MAC_NEWWORLD
     select IDE_K2_SATA
     select KEYWEST_I2C
     select TAS3004
+    select MACIO_PULSAR
     select MAC_PMU
     select UNIN_PCI
     select FW_CFG_PPC
