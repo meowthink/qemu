@@ -43,6 +43,25 @@ static void *pcnet_create(void *pci_bus, QGuestAllocator *alloc, void *addr)
     return &pcnet->obj;
 }
 
+static void pcnet_dwio_narrow_reads(void *obj, void *data,
+                                    QGuestAllocator *alloc)
+{
+    QPCNet *pcnet = obj;
+    QPCIDevice *dev = &pcnet->dev;
+    QPCIBar bar;
+
+    (void)alloc;
+    qpci_device_enable(dev);
+    bar = qpci_iomap(dev, 0, NULL);
+
+    /* Select CSR1 and switch to DWIO with a DWord RDP write. */
+    qpci_io_writew(dev, bar, 2, 1);
+    qpci_io_writel(dev, bar, 0, 0x5678);
+
+    g_assert_cmphex(qpci_io_readw(dev, bar, 0), ==, 0x5678);
+    g_assert_cmphex(qpci_io_readb(dev, bar, 1), ==, 0x56);
+}
+
 static void pcnet_register_nodes(void)
 {
     QOSGraphEdgeOptions opts = {
@@ -53,6 +72,9 @@ static void pcnet_register_nodes(void)
     qos_node_create_driver("pcnet", pcnet_create);
     qos_node_consumes("pcnet", "pci-bus", &opts);
     qos_node_produces("pcnet", "pci-device");
+
+    qos_add_test("dwio_narrow_reads", "pcnet",
+                 pcnet_dwio_narrow_reads, NULL);
 }
 
 libqos_init(pcnet_register_nodes);
