@@ -62,7 +62,7 @@ system_ss.add(when: 'CONFIG_ARTIST', if_true: files('artist.c'))
 
 system_ss.add(when: 'CONFIG_ATI_MACH64', if_true: files('ati_mach64.c', 'ati_mach64_2d.c', 'ati_mach64_dbg.c'))
 system_ss.add(when: 'CONFIG_ATI_RAGE128', if_true: files('ati_rage128.c', 'ati_rage128_2d.c', 'ati_rage128_dbg.c'))
-system_ss.add(when: 'CONFIG_ATI_VGA', if_true: [files('ati.c', 'ati_2d.c', 'ati_dbg.c'), pixman])
+system_ss.add(when: 'CONFIG_ATI_VGA', if_true: [files('ati.c', 'ati_2d.c', 'ati_3d.c', 'ati_dbg.c'), pixman])
 
 system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_PCI'],     if_true: [files('apple-gfx.m', 'apple-gfx-pci.m')])
 system_ss.add(when: [pvg, 'CONFIG_MAC_PVG_MMIO'],    if_true: [files('apple-gfx.m', 'apple-gfx-mmio.m')])
