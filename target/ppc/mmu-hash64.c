@@ -342,8 +342,20 @@ static int ppc_find_slb_vsid(PowerPCCPU *cpu, target_ulong rb,
 void helper_SLBMTE(CPUPPCState *env, target_ulong rb, target_ulong rs)
 {
     PowerPCCPU *cpu = env_archcpu(env);
+    target_ulong slot = rb & 0xfff;
+    target_ulong esid = rb & ~0xfffULL;
 
-    if (ppc_store_slb(cpu, rb & 0xfff, rb & ~0xfffULL, rs) < 0) {
+    /*
+     * Mac OS X, which runs on real 970s, leaves the faulting address's
+     * low bits in RB, so on the 970 decode only the ESID, the valid bit
+     * and the index bits of its 64-entry SLB.
+     */
+    if (env->mmu_model == POWERPC_MMU_64B) {
+        slot &= cpu->hash64_opts->slb_size - 1;
+        esid &= SLB_ESID_ESID | SLB_ESID_V;
+    }
+
+    if (ppc_store_slb(cpu, slot, esid, rs) < 0) {
         raise_exception_err_ra(env, POWERPC_EXCP_PROGRAM,
                                POWERPC_EXCP_INVAL, GETPC());
     }
@@ -1093,6 +1105,14 @@ bool ppc_hash64_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
             cs->exception_index = POWERPC_EXCP_DSEG;
             env->error_code = 0;
             env->spr[SPR_DAR] = eaddr;
+            /*
+             * Mac OS X reads DSISR on a 970 data segment interrupt and
+             * takes a stale "no PTE" bit to mean the segment is already
+             * mapped, so do not leave the previous fault's value there.
+             */
+            if (env->excp_model == POWERPC_EXCP_970) {
+                env->spr[SPR_DSISR] = 0;
+            }
             break;
         default:
             g_assert_not_reached();

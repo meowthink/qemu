@@ -1554,7 +1554,8 @@ static void powerpc_excp_books(PowerPCCPU *cpu, int excp)
             /* ISAv3.1 puts LEV into SRR1 */
             msr |= lev << 20;
         }
-        if (lev == 1) {
+        /* sc 1 enters the hypervisor only where there is one (not a 970) */
+        if (lev == 1 && (env->msr_mask & MSR_HVB)) {
             new_msr |= (target_ulong)MSR_HVB;
         }
         break;
@@ -2309,6 +2310,10 @@ void ppc_maybe_interrupt(CPUPPCState *env)
         cpu_interrupt(cs, CPU_INTERRUPT_HARD);
     } else {
         cpu_reset_interrupt(cs, CPU_INTERRUPT_HARD);
+        /* a napping 970 wakes on a masked event too, see ppc_cpu_has_work */
+        if (ppc_970_nap_wakeup(env)) {
+            qemu_cpu_kick(cs);
+        }
     }
 }
 
