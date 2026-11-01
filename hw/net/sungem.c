@@ -1,5 +1,15 @@
 /*
  * QEMU model of SUN GEM ethernet controller
+ * 
+ * 
+ *  Extended to support Apple GMAC Gigabit PHY emulation:
+ *   - BCM5201 (10/100) - Original implementation  
+ *   - BCM5400/5401 (Gigabit) - PowerMac3,3 and later
+ *
+ * The phy_type property controls which PHY is emulated:
+ *   0 = BCM5201 (10/100, legacy default)
+ *   1 = BCM5400 (Gigabit)
+ *
  *
  * As found in Apple ASICs among others
  *
@@ -203,6 +213,18 @@ struct gem_rxd {
 #define RXDCTRL_ALTMAC    0x2000000000000000ULL  /* Matched ALT MAC */
 
 
+/*
+ * PHY types supported by GMAC variants
+ */
+typedef enum {
+    PHY_TYPE_BCM5201 = 0,   /* 10/100 PHY - ID 0x00406210 */
+    PHY_TYPE_BCM5400 = 1,   /* Gigabit PHY - ID 0x00206040 - PowerMac3,3 */
+    PHY_TYPE_BCM5401 = 2,   /* Gigabit PHY - ID 0x00206050 */
+    PHY_TYPE_BCM5411 = 3,   /* Gigabit PHY - ID 0x00206070 - K2 */
+    PHY_TYPE_MARVELL = 4,   /* Gigabit PHY - ID 0x01410CC0 - Shasta */
+} PhyType;
+
+
 struct SunGEMState {
     PCIDevice pdev;
 
@@ -217,6 +239,7 @@ struct SunGEMState {
     NICState *nic;
     NICConf conf;
     uint32_t phy_addr;
+    uint32_t phy_type;
 
     uint32_t gregs[SUNGEM_MMIO_GREG_SIZE >> 2];
     uint32_t txdmaregs[SUNGEM_MMIO_TXDMA_SIZE >> 2];
@@ -760,29 +783,80 @@ static void sungem_mii_write(SunGEMState *s, uint8_t phy_addr,
     /* XXX TODO */
 }
 
+
+/*
+ * PHY emulation for GMAC variants
+ *
+ * BCM5201: 10/100 PHY (ID 0x00406210) - original implementation
+ * BCM5400: Gigabit PHY (ID 0x00206040) - PowerMac3,3 Gigabit Ethernet
+ * BCM5401: Gigabit PHY (ID 0x00206050) - common variant
+*/
+
 static uint16_t __sungem_mii_read(SunGEMState *s, uint8_t phy_addr,
                                   uint8_t reg_addr)
 {
     if (phy_addr != s->phy_addr) {
         return 0xffff;
     }
-    /* Primitive emulation of a BCM5201 to please the driver,
-     * ID is 0x00406210. TODO: Do a gigabit PHY like BCM5400
-     */
+    /* Gigabit PHY emulation (BCM5400/5401) for PowerMac3,3 and later */
+    if (s->phy_type >= PHY_TYPE_BCM5400) {
+        switch (reg_addr) {
+        case MII_BMCR:
+            return 0x1140;  /* Auto-neg enable, 1000Mbps, Full duplex */
+        case MII_BMSR:
+            if (qemu_get_queue(s->nic)->link_down) {
+                return MII_BMSR_100TX_FD | MII_BMSR_AUTONEG |
+                       MII_BMSR_EXTCAP | MII_BMSR_EXTSTAT;
+            } else {
+                return MII_BMSR_100TX_FD | MII_BMSR_AN_COMP |
+                       MII_BMSR_AUTONEG | MII_BMSR_LINK_ST |
+                       MII_BMSR_EXTCAP | MII_BMSR_EXTSTAT;
+            }
+        case MII_PHYID1:
+            return 0x0020;  /* Broadcom */
+        case MII_PHYID2:
+            if (s->phy_type == PHY_TYPE_BCM5401) {
+                return 0x6050;
+            } else if (s->phy_type == PHY_TYPE_BCM5411) {
+                return 0x6070;
+            }
+            return 0x6040;  /* BCM5400 */
+        case MII_ANAR:
+            return MII_ANAR_TXFD | MII_ANAR_TX | MII_ANAR_10FD | MII_ANAR_10 |
+                   MII_ANAR_CSMACD;
+        case MII_ANLPAR:
+            return MII_ANLPAR_ACK | MII_ANLPAR_TXFD | MII_ANLPAR_TX |
+                   MII_ANLPAR_10FD | MII_ANLPAR_10;
+        case MII_ANER:
+            return 0x0004;  /* Link partner supports next page */
+        case MII_CTRL1000:
+            return 0x0300;  /* Advertise 1000BASE-T full & half */
+        case MII_STAT1000:
+            return 0x7c00;  /* Partner capable of 1000BASE-T full & half */
+        case MII_EXTSTAT:
+            return 0x3000;  /* 1000BASE-T full & half capable */
+        case 0x18: /* BCM54xx Auxiliary Control/Status */
+            return 0x000a;  /* 1000BASE-T Full Duplex */
+        default:
+            return 0;
+        }
+    }
+
+    /* Original BCM5201 10/100 PHY emulation */
     switch (reg_addr) {
     case MII_BMCR:
         return 0;
+    case MII_BMSR:
+        if (qemu_get_queue(s->nic)->link_down) {
+            return MII_BMSR_100TX_FD | MII_BMSR_AUTONEG;
+        } else {
+            return MII_BMSR_100TX_FD | MII_BMSR_AN_COMP |
+                   MII_BMSR_AUTONEG | MII_BMSR_LINK_ST;
+        }
     case MII_PHYID1:
         return 0x0040;
     case MII_PHYID2:
         return 0x6210;
-    case MII_BMSR:
-        if (qemu_get_queue(s->nic)->link_down) {
-            return MII_BMSR_100TX_FD  | MII_BMSR_AUTONEG;
-        } else {
-            return MII_BMSR_100TX_FD | MII_BMSR_AN_COMP |
-                    MII_BMSR_AUTONEG | MII_BMSR_LINK_ST;
-        }
     case MII_ANLPAR:
     case MII_ANAR:
         return MII_ANLPAR_TXFD;
@@ -790,7 +864,7 @@ static uint16_t __sungem_mii_read(SunGEMState *s, uint8_t phy_addr,
         return 3; /* 100FD */
     default:
         return 0;
-    };
+    }
 }
 static uint16_t sungem_mii_read(SunGEMState *s, uint8_t phy_addr,
                                 uint8_t reg_addr)
@@ -1422,11 +1496,17 @@ static void sungem_instance_init(Object *obj)
 
 static const Property sungem_properties[] = {
     DEFINE_NIC_PROPERTIES(SunGEMState, conf),
-    /* Phy address should be 0 for most Apple machines except
-     * for K2 in which case it's 1. Will be set by a machine
-     * override.
-     */
+    /*
+     * PHY address: 0 for most Apple machines, 1 for K2.
+     * PHY type: selects which PHY to emulate:
+     *   0 = BCM5201 (10/100)
+     *   1 = BCM5400 (Gigabit) - default, for PowerMac3,3
+     *   2 = BCM5401 (Gigabit)
+     *   3 = BCM5411 (Gigabit) - K2
+     *   4 = Marvell 88E1111 (Gigabit) - Shasta
+      */
     DEFINE_PROP_UINT32("phy_addr", SunGEMState, phy_addr, 0),
+    DEFINE_PROP_UINT32("phy_type", SunGEMState, phy_type, PHY_TYPE_BCM5400)
 };
 
 static const VMStateDescription vmstate_sungem = {

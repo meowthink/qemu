@@ -190,7 +190,13 @@
 #define PCI_VENDOR_ID_APPLE              0x106b
 #define PCI_DEVICE_ID_APPLE_UNI_N_AGP    0x0020
 #define PCI_DEVICE_ID_APPLE_U3_AGP       0x004b
-#define PCI_DEVICE_ID_APPLE_UNI_N_GMAC   0x0021
+/* Apple GMAC (Gigabit Ethernet) controllers - all based on Sun GEM */
+#define PCI_DEVICE_ID_APPLE_UNI_N_GMAC   0x0021  /* UniNorth GMAC - PowerMac3,1/3,3 (Sawtooth/Gigabit) */
+#define PCI_DEVICE_ID_APPLE_UNI_N_GMACP  0x0024  /* UniNorth/Pangea GMAC - iMac G3, PowerMac G4 (Quicksilver) */
+#define PCI_DEVICE_ID_APPLE_UNI_N2_GMAC  0x0032  /* UniNorth 2 GMAC - Later PowerMac G4 models */
+#define PCI_DEVICE_ID_APPLE_K2_GMAC      0x004c  /* K2 GMAC - PowerMac G5 */
+#define PCI_DEVICE_ID_APPLE_SHASTA_GMAC  0x0051  /* Shasta GMAC - Late PowerMac G5 */
+#define PCI_DEVICE_ID_APPLE_INTREPID2_GMAC 0x006b /* Intrepid2 GMAC - iBook G4, PowerBook G4 */
 #define PCI_DEVICE_ID_APPLE_VIRTIO_BLK   0x1a00
 
 #define PCI_VENDOR_ID_SUN                0x108e
