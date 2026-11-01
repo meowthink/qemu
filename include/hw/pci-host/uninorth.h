@@ -26,16 +26,19 @@
 #define UNINORTH_H
 
 #include "hw/pci/pci_host.h"
-#include "hw/misc/macio/keylargo.h"
+#include "hw/pci/pci_bridge.h"
+#include "hw/misc/macio/keywest_i2c.h"
 #include "qom/object.h"
 
 /* UniNorth version */
 #define UNINORTH_VERSION_10A    0x7
+#define U3_VERSION_23           0x33
 
 #define TYPE_UNI_NORTH_PCI_HOST_BRIDGE "uni-north-pci-pcihost"
 #define TYPE_UNI_NORTH_AGP_HOST_BRIDGE "uni-north-agp-pcihost"
 #define TYPE_UNI_NORTH_INTERNAL_PCI_HOST_BRIDGE "uni-north-internal-pci-pcihost"
 #define TYPE_U3_AGP_HOST_BRIDGE "u3-agp-pcihost"
+#define TYPE_U3_HT_HOST_BRIDGE "u3-ht-pcihost"
 
 typedef struct UNINHostState UNINHostState;
 DECLARE_INSTANCE_CHECKER(UNINHostState, UNI_NORTH_PCI_HOST_BRIDGE,
@@ -51,37 +54,85 @@ struct UNINHostState {
     PCIHostState parent_obj;
 
     uint32_t ofw_addr;
-    bool real_irq_map;
-    bool no_self_func;
+    bool real_irq_map;          /* ours: Apple-ROM interrupt maps */
+    bool no_self_func;          /* ours: PowerMac3,6 has no self function */
     qemu_irq irqs[8];
     MemoryRegion pci_mmio;
     MemoryRegion pci_hole;
     MemoryRegion pci_io;
 
-    /*
-     * UniNorth's AGP GART, programmed through three registers that sit
-     * in the AGP host bridge's own config space right after its AGP
-     * capability (see unin_agp_pci_host_config_write()). Only the AGP
-     * bridge uses these.
-     */
-    uint32_t gart_base;          /* table address | aperture size code */
-    uint32_t agp_base;           /* aperture base on the AGP bus */
+    /* U3 AGP GART */
+    uint32_t gart_base;
+    uint32_t agp_base;
     uint32_t gart_ctrl;
+    uint32_t gart_dummy;
     IOMMUMemoryRegion agp_iommu;
-    AddressSpace agp_dma_as;
+    AddressSpace *agp_dma_down;   /* U3 */
+    AddressSpace agp_dma_as;      /* ours: mac99 AGP GART */
 };
+
+/* U3 AGP transactions outside the GART aperture go to @as */
+void u3_agp_set_dma_as(UNINHostState *s, AddressSpace *as);
+
+/* Everything the firmware touches lives well inside the first 64KB. */
+#define UNIN_REGS_SIZE 0x10000
 
 struct UNINState {
     SysBusDevice parent_obj;
 
     MemoryRegion mem;
-/* Everything the firmware touches lives well inside the first 64KB. */
-#define UNIN_REGS_SIZE 0x10000
+    uint32_t version;
     uint8_t regs[UNIN_REGS_SIZE];
-    KeyLargoI2CState i2c;
+    KeyWestI2CState i2c;        /* at +0x1000 on the U3 */
 };
+
+#define UNINORTH_I2C_BASE           0xf8001000
+#define UNINORTH_I2C_SIZE           0x1000
 
 #define TYPE_UNI_NORTH "uni-north"
 OBJECT_DECLARE_SIMPLE_TYPE(UNINState, UNI_NORTH)
+
+/* U3 AGP: lines 0-3 swizzle, line 4 is the AGP slot's own on MPIC 0x30 */
+#define U3_AGP_SLOT             0x10
+#define U3_AGP_SLOT_IRQ_LINE    4
+#define U3_AGP_SLOT_IRQ         0x30
+#define U3_AGP_NUM_IRQS         5
+
+/* U3 HyperTransport host */
+#define U3_HT_CFG_BASE      0xf2000000
+#define U3_HT_CFG_SIZE      0x02000000
+#define U3_HT_IO_BASE       0xf4000000
+#define U3_HT_IO_SIZE       0x00400000
+#define U3_HT_SELF_BASE     0xf8070000
+
+/* U3 MPIC and its input on the K2 MPIC */
+#define U3_MPIC_BASE        0xf8040000
+#define U3_MPIC_CASCADE_IRQ 0x38
+#define U3_HT_SELF_SIZE     0x1000
+#define U3_HT_NUM_IRQS      64
+
+/* AMD-8131 PCI-X bridges at HT devices 1-2, K2 HT-PCI bridges at 3-7 */
+#define AMD8131_FIRST_SLOT  1
+#define AMD8131_NUM         2
+#define K2_HT_PCI_FIRST_SLOT 3
+#define K2_HT_PCI_NUM       5
+#define TYPE_U3_HT_PCI_BRIDGE "u3-ht-pci-bridge"
+
+OBJECT_DECLARE_SIMPLE_TYPE(U3HTHostState, U3_HT_HOST_BRIDGE)
+
+struct U3HTHostState {
+    PCIHostState parent_obj;
+
+    qemu_irq irqs[U3_HT_NUM_IRQS];
+    MemoryRegion cfg;
+    MemoryRegion self;
+    MemoryRegion pci_mmio;
+    MemoryRegion pci_io;
+    MemoryRegion mem_win[3];
+    PCIBridge *pcix[AMD8131_NUM];
+    PCIBridge *k2[K2_HT_PCI_NUM];
+};
+
+void u3_ht_map(SysBusDevice *sbd);
 
 #endif /* UNINORTH_H */

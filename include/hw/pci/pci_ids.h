@@ -175,6 +175,7 @@
 
 #define PCI_VENDOR_ID_IBM                0x1014
 
+#define PCI_DEVICE_ID_AMD_8131_BRIDGE    0x7450
 #define PCI_VENDOR_ID_AMD                0x1022
 #define PCI_DEVICE_ID_AMD_LANCE          0x2000
 #define PCI_DEVICE_ID_AMD_SCSI           0x2020
@@ -190,6 +191,9 @@
 #define PCI_VENDOR_ID_APPLE              0x106b
 #define PCI_DEVICE_ID_APPLE_UNI_N_AGP    0x0020
 #define PCI_DEVICE_ID_APPLE_U3_AGP       0x004b
+#define PCI_DEVICE_ID_APPLE_U3_HT        0x0057
+#define PCI_DEVICE_ID_APPLE_K2_USB       0x0040
+#define PCI_DEVICE_ID_APPLE_K2_HT_PCI_1  0x0045
 /* Apple GMAC (Gigabit Ethernet) controllers - all based on Sun GEM */
 #define PCI_DEVICE_ID_APPLE_UNI_N_GMAC   0x0021  /* UniNorth GMAC - PowerMac3,1/3,3 (Sawtooth/Gigabit) */
 #define PCI_DEVICE_ID_APPLE_UNI_N_GMACP  0x0024  /* UniNorth/Pangea GMAC - iMac G3, PowerMac G4 (Quicksilver) */
@@ -287,7 +291,11 @@
 #define PCI_VENDOR_ID_XEN                0x5853
 #define PCI_DEVICE_ID_XEN_PLATFORM       0x0001
 
+#define PCI_VENDOR_ID_SERVERWORKS      0x1166
+#define PCI_DEVICE_ID_SERVERWORKS_K2_SATA 0x0240
+
 #define PCI_VENDOR_ID_NEC                0x1033
+#define PCI_DEVICE_ID_NEC_UPD720101_OHCI 0x0035
 #define PCI_DEVICE_ID_NEC_UPD720200      0x0194
 
 #define PCI_VENDOR_ID_TEWS               0x1498
