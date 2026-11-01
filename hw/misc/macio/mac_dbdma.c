@@ -45,6 +45,7 @@
 #include "qemu/module.h"
 #include "qemu/log.h"
 #include "system/dma.h"
+#include "trace.h"
 
 /* debug DBDMA */
 #define DEBUG_DBDMA 0
@@ -117,6 +118,36 @@ static void kill_channel(DBDMA_channel *ch)
     qemu_irq_raise(ch->irq);
 }
 
+/*
+ * How many bits of ChannelStatus a Wait/Branch/Int condition may be
+ * compared against on this channel.
+ *
+ * The low nibble is the channel's own status (ACTIVE/DEAD/WAKE/FLUSH);
+ * bits 7:4 ("s7..s4") are driven by the attached device. A device that
+ * models those lines publishes them with DBDMA_set_devstat() and gets
+ * the full 8-bit comparison the hardware performs -- Mac OS X's
+ * AppleMesh steers its whole SCSI transaction on s5/s6/s7, so nothing
+ * less will do for that channel.
+ *
+ * A device that does NOT model them is a different matter. Its
+ * ChannelStatus[7:4] read back as zero, which is not what real silicon
+ * would present, so an 8-bit comparison answers the driver's question
+ * with a confident lie rather than declining to answer it. Mac OS X's
+ * BMac Ethernet driver is the case that matters: it programs its
+ * transmit channel's BranchSelect on those upper bits, and answering
+ * "condition false" sends its command list round its own loop forever
+ * -- each pass re-entering the device callback from dbdma_end(), so the
+ * main loop recurses with the BQL held until the process is wedged at
+ * 100% CPU (found by sampling a hung QEMU: thousands of nested
+ * bmac_tx_dma_rw frames under DBDMA_run_bh, vCPU blocked on the BQL in
+ * an MMIO read). Keeping the historical low-nibble mask there restores
+ * the always-true answer those drivers have always been given.
+ */
+static uint16_t devstat_sel_mask(DBDMA_channel *ch)
+{
+    return ch->devstat_driven ? DEVSTAT : 0x0f;
+}
+
 static void conditional_interrupt(DBDMA_channel *ch)
 {
     dbdma_cmd *current = &ch->current;
@@ -140,8 +171,8 @@ static void conditional_interrupt(DBDMA_channel *ch)
 
     status = ch->regs[DBDMA_STATUS] & DEVSTAT;
 
-    sel_mask = (ch->regs[DBDMA_INTR_SEL] >> 16) & 0x0f;
-    sel_value = ch->regs[DBDMA_INTR_SEL] & 0x0f;
+    sel_mask = (ch->regs[DBDMA_INTR_SEL] >> 16) & devstat_sel_mask(ch);
+    sel_value = ch->regs[DBDMA_INTR_SEL] & devstat_sel_mask(ch);
 
     cond = (status & sel_mask) == (sel_value & sel_mask);
 
@@ -181,8 +212,8 @@ static int conditional_wait(DBDMA_channel *ch)
 
     status = ch->regs[DBDMA_STATUS] & DEVSTAT;
 
-    sel_mask = (ch->regs[DBDMA_WAIT_SEL] >> 16) & 0x0f;
-    sel_value = ch->regs[DBDMA_WAIT_SEL] & 0x0f;
+    sel_mask = (ch->regs[DBDMA_WAIT_SEL] >> 16) & devstat_sel_mask(ch);
+    sel_value = ch->regs[DBDMA_WAIT_SEL] & devstat_sel_mask(ch);
 
     cond = (status & sel_mask) == (sel_value & sel_mask);
 
@@ -247,8 +278,8 @@ static void conditional_branch(DBDMA_channel *ch)
 
     status = ch->regs[DBDMA_STATUS] & DEVSTAT;
 
-    sel_mask = (ch->regs[DBDMA_BRANCH_SEL] >> 16) & 0x0f;
-    sel_value = ch->regs[DBDMA_BRANCH_SEL] & 0x0f;
+    sel_mask = (ch->regs[DBDMA_BRANCH_SEL] >> 16) & devstat_sel_mask(ch);
+    sel_value = ch->regs[DBDMA_BRANCH_SEL] & devstat_sel_mask(ch);
 
     cond = (status & sel_mask) == (sel_value & sel_mask);
 
@@ -276,12 +307,82 @@ static void conditional_branch(DBDMA_channel *ch)
 
 static void channel_run(DBDMA_channel *ch);
 
+/*
+ * Bounds a single synchronous burst (see dbdma_should_continue_sync()
+ * below) to roughly a millisecond or two of real wall-clock time, not
+ * the ~1.1-1.4 SECONDS a burst of 1000000 measured at live -- each
+ * iteration does at least one 16-byte guest-memory read/write plus
+ * register bookkeeping, and this whole burst runs with the BQL held,
+ * blocking every other device (including audio timers) for its full
+ * duration. Confirmed live: an OS X guest probing the unimplemented
+ * built-in modem's serial DMA channel (see dbdma_unassigned_rw() --
+ * real Beige G3 hardware has one, this model doesn't) armed a
+ * self-looping descriptor ring on that unassigned channel, which hit
+ * this limit and fell back to the paced timer, only to have the timer
+ * callback reset the counter and immediately re-arm a fresh
+ * million-iteration burst -- repeating for as long as the guest kept
+ * the ring running (tens of seconds observed), each cycle pegging the
+ * host CPU and stalling audio by over a second. Still comfortably
+ * larger than any real device's legitimate descriptor chain in this
+ * codebase's own history (bmac/IDE/awacs chains run to at most a few
+ * hundred descriptors), so this shouldn't change normal-path behavior
+ * for real, registered devices -- it only shortens how long a
+ * pathological unbounded ring can hog the main loop before yielding.
+ */
+#define DBDMA_SYNC_CONTINUE_BURST_LIMIT 4096
+
+/*
+ * Command processing normally continues by scheduling the channel's
+ * bottom-half (DBDMA_kick()) or, for I/O commands, by a device's own
+ * completion callback -- both of which need the main-loop thread to
+ * take the BQL to actually run. A guest that polls this channel's
+ * status register in a tight, read-only loop (confirmed happening: a
+ * probe for a DMA-capable device that isn't modeled) can hold the BQL
+ * busy nearly continuously, starving that out for long stretches even
+ * though the relevant timer/BH is already due to run. Continuing the
+ * command list synchronously, within the same call chain as whatever
+ * triggered this step, sidesteps that dependency entirely.
+ *
+ * Bounded by a per-channel counter shared across every synchronous
+ * continuation point (dbdma_end(), load_word(), store_word(), nop())
+ * so a command list that branches back on itself forever (e.g. a
+ * continuous-capture style circular buffer) can't spin the host in a
+ * true infinite C loop -- once the limit is hit this returns false and
+ * the caller falls back to the original deferred (bh/timer) mechanism.
+ */
+static bool dbdma_should_continue_sync(DBDMA_channel *ch)
+{
+    if (ch->stopping) {
+        return false;
+    }
+    if (!((ch->regs[DBDMA_STATUS] & RUN) && (ch->regs[DBDMA_STATUS] & ACTIVE))) {
+        return false;
+    }
+
+    return ch->sync_continue_count++ < DBDMA_SYNC_CONTINUE_BURST_LIMIT;
+}
+
 static void dbdma_end(DBDMA_io *io)
 {
     DBDMA_channel *ch = io->channel;
     dbdma_cmd *current = &ch->current;
 
     DBDMA_DPRINTFCH(ch, "%s\n", __func__);
+
+    /*
+     * End-to-end completion latency as the guest experiences it, from
+     * the transfer being handed to the device to this completion. On
+     * hosts whose main loop services aio/BH/timer work late (win32),
+     * transfers whose completion rides those paths stretch from
+     * microseconds to milliseconds -- the leading suspect for classic
+     * Mac OS VM-on instability (a paging I/O completing grossly late or
+     * out of order versus what the guest's paging discipline can
+     * tolerate). Trace every completion; the analysis side buckets and
+     * correlates with crash timing.
+     */
+    trace_dbdma_io_latency(ch->channel,
+                           g_get_monotonic_time() * 1000 - io->start_ns,
+                           io->is_last);
 
     if (conditional_wait(ch))
         goto wait;
@@ -299,9 +400,24 @@ wait:
     /* Indicate that we're ready for a new DMA round */
     ch->io.processing = false;
 
-    if ((ch->regs[DBDMA_STATUS] & RUN) &&
-        (ch->regs[DBDMA_STATUS] & ACTIVE))
+    if (dbdma_should_continue_sync(ch)) {
         channel_run(ch);
+    } else {
+        /*
+         * Not continuing inline -- burst limit reached, channel being
+         * stopped, or no longer RUN|ACTIVE. Hand the channel back to the
+         * bottom-half as the original code always did: DBDMA_run() only
+         * runs channels that are still RUN|ACTIVE, so a stopped one is
+         * left alone, but a running one that merely hit the burst limit
+         * MUST be resumed from here. Without this kick it sat dead until
+         * an unrelated CONTROL write on any channel happened to run the
+         * bottom-half -- measured on Mac OS X 10.2's audio ring (725 us
+         * descriptors): the 4096-command burst limit stalled the ring
+         * every 2.97 s for 17-43 ms until the next IDE write, heard as a
+         * glitch at 3 s, 6 s, ... and, once the cushion was gone, garbling.
+         */
+        DBDMA_kick(dbdma_from_ch(ch));
+    }
 }
 
 static void start_output(DBDMA_channel *ch, int key, uint32_t addr,
@@ -325,6 +441,8 @@ static void start_output(DBDMA_channel *ch, int key, uint32_t addr,
     ch->io.dma_end = dbdma_end;
     ch->io.is_dma_out = 1;
     ch->io.processing = true;
+    ch->io.device_busy = false;
+    ch->io.start_ns = g_get_monotonic_time() * 1000;
     if (ch->rw) {
         ch->rw(&ch->io);
     }
@@ -351,10 +469,14 @@ static void start_input(DBDMA_channel *ch, int key, uint32_t addr,
     ch->io.dma_end = dbdma_end;
     ch->io.is_dma_out = 0;
     ch->io.processing = true;
+    ch->io.device_busy = false;
+    ch->io.start_ns = g_get_monotonic_time() * 1000;
     if (ch->rw) {
         ch->rw(&ch->io);
     }
 }
+
+static void dbdma_park_wait(DBDMA_channel *ch);
 
 static void load_word(DBDMA_channel *ch, int key, uint32_t addr,
                      uint16_t len)
@@ -373,9 +495,13 @@ static void load_word(DBDMA_channel *ch, int key, uint32_t addr,
 
     dma_memory_read(&address_space_memory, addr, &current->cmd_dep, len,
                     MEMTXATTRS_UNSPECIFIED);
+    trace_dbdma_load_word(ch->channel, addr, len, le32_to_cpu(current->cmd_dep));
 
-    if (conditional_wait(ch))
-        goto wait;
+    /* Unmet wait parks the channel -- see the comment above nop(). */
+    if (conditional_wait(ch)) {
+        dbdma_park_wait(ch);
+        return;
+    }
 
     current->xfer_status = cpu_to_le16(ch->regs[DBDMA_STATUS]);
     dbdma_cmdptr_save(ch);
@@ -384,8 +510,33 @@ static void load_word(DBDMA_channel *ch, int key, uint32_t addr,
     conditional_interrupt(ch);
     next(ch);
 
-wait:
     DBDMA_kick(dbdma_from_ch(ch));
+
+    /*
+     * LOAD_WORD/STORE_WORD/NOP advance the command pointer synchronously
+     * (via next()/conditional_branch() above) but historically only
+     * relied on DBDMA_kick()'s bottom-half to actually process whatever
+     * comes next -- see the comment on dbdma_should_continue_sync() for
+     * why that isn't reliable under a tight guest polling loop.
+     */
+    if (dbdma_should_continue_sync(ch)) {
+        channel_run(ch);
+    } else {
+        /*
+         * Not continuing inline -- burst limit reached, channel being
+         * stopped, or no longer RUN|ACTIVE. Hand the channel back to the
+         * bottom-half as the original code always did: DBDMA_run() only
+         * runs channels that are still RUN|ACTIVE, so a stopped one is
+         * left alone, but a running one that merely hit the burst limit
+         * MUST be resumed from here. Without this kick it sat dead until
+         * an unrelated CONTROL write on any channel happened to run the
+         * bottom-half -- measured on Mac OS X 10.2's audio ring (725 us
+         * descriptors): the 4096-command burst limit stalled the ring
+         * every 2.97 s for 17-43 ms until the next IDE write, heard as a
+         * glitch at 3 s, 6 s, ... and, once the cushion was gone, garbling.
+         */
+        DBDMA_kick(dbdma_from_ch(ch));
+    }
 }
 
 static void store_word(DBDMA_channel *ch, int key, uint32_t addr,
@@ -404,11 +555,15 @@ static void store_word(DBDMA_channel *ch, int key, uint32_t addr,
         return;
     }
 
+    trace_dbdma_store_word(ch->channel, addr, len, le32_to_cpu(current->cmd_dep));
     dma_memory_write(&address_space_memory, addr, &current->cmd_dep, len,
                      MEMTXATTRS_UNSPECIFIED);
 
-    if (conditional_wait(ch))
-        goto wait;
+    /* Unmet wait parks the channel -- see the comment above nop(). */
+    if (conditional_wait(ch)) {
+        dbdma_park_wait(ch);
+        return;
+    }
 
     current->xfer_status = cpu_to_le16(ch->regs[DBDMA_STATUS]);
     dbdma_cmdptr_save(ch);
@@ -417,16 +572,73 @@ static void store_word(DBDMA_channel *ch, int key, uint32_t addr,
     conditional_interrupt(ch);
     next(ch);
 
-wait:
     DBDMA_kick(dbdma_from_ch(ch));
+
+    /* See the matching comment in load_word(). */
+    if (dbdma_should_continue_sync(ch)) {
+        channel_run(ch);
+    } else {
+        /*
+         * Not continuing inline -- burst limit reached, channel being
+         * stopped, or no longer RUN|ACTIVE. Hand the channel back to the
+         * bottom-half as the original code always did: DBDMA_run() only
+         * runs channels that are still RUN|ACTIVE, so a stopped one is
+         * left alone, but a running one that merely hit the burst limit
+         * MUST be resumed from here. Without this kick it sat dead until
+         * an unrelated CONTROL write on any channel happened to run the
+         * bottom-half -- measured on Mac OS X 10.2's audio ring (725 us
+         * descriptors): the 4096-command burst limit stalled the ring
+         * every 2.97 s for 17-43 ms until the next IDE write, heard as a
+         * glitch at 3 s, 6 s, ... and, once the cushion was gone, garbling.
+         */
+        DBDMA_kick(dbdma_from_ch(ch));
+    }
+}
+
+/*
+ * An unmet wait condition parks the channel: real hardware leaves it
+ * ACTIVE, command pointer unadvanced, quiescent until the device's
+ * status lines (DEVSTAT) or a channel register write change the
+ * situation. Re-kicking the bottom-half immediately here (as this
+ * used to) makes a waiting NOP spin forever at host speed: Mac OS X
+ * 10.2's AppleSCCSerial parks exactly such a NOP+wait program on the
+ * SCC-A DBDMA channel (waiting on an SCC status line nothing ever
+ * raises), which starved the whole boot.
+ *
+ * Device models change DEVSTAT by poking ch->regs directly with no
+ * event we can hook (and Mac OS 8.5's boot genuinely depends on a
+ * wait being released that way -- parking with no re-evaluation hangs
+ * it in the ROM), so a parked channel re-evaluates on a slow timer:
+ * ~1000 evaluations/s instead of millions, cheap enough to run
+ * indefinitely yet prompt enough that a released wait proceeds within
+ * a millisecond.
+ */
+#define DBDMA_WAIT_POLL_MS 1
+
+static void dbdma_wait_poll(void *opaque)
+{
+    DBDMA_channel *ch = opaque;
+
+    if ((ch->regs[DBDMA_STATUS] & RUN) && (ch->regs[DBDMA_STATUS] & ACTIVE)) {
+        DBDMA_kick(dbdma_from_ch(ch));
+    }
+}
+
+static void dbdma_park_wait(DBDMA_channel *ch)
+{
+    timer_mod(ch->wait_poll_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + DBDMA_WAIT_POLL_MS);
 }
 
 static void nop(DBDMA_channel *ch)
 {
     dbdma_cmd *current = &ch->current;
 
-    if (conditional_wait(ch))
-        goto wait;
+    /* Unmet wait parks the channel -- see the comment above. */
+    if (conditional_wait(ch)) {
+        dbdma_park_wait(ch);
+        return;
+    }
 
     current->xfer_status = cpu_to_le16(ch->regs[DBDMA_STATUS]);
     dbdma_cmdptr_save(ch);
@@ -434,8 +646,27 @@ static void nop(DBDMA_channel *ch)
     conditional_interrupt(ch);
     conditional_branch(ch);
 
-wait:
     DBDMA_kick(dbdma_from_ch(ch));
+
+    /* See the matching comment in load_word(). */
+    if (dbdma_should_continue_sync(ch)) {
+        channel_run(ch);
+    } else {
+        /*
+         * Not continuing inline -- burst limit reached, channel being
+         * stopped, or no longer RUN|ACTIVE. Hand the channel back to the
+         * bottom-half as the original code always did: DBDMA_run() only
+         * runs channels that are still RUN|ACTIVE, so a stopped one is
+         * left alone, but a running one that merely hit the burst limit
+         * MUST be resumed from here. Without this kick it sat dead until
+         * an unrelated CONTROL write on any channel happened to run the
+         * bottom-half -- measured on Mac OS X 10.2's audio ring (725 us
+         * descriptors): the 4096-command burst limit stalled the ring
+         * every 2.97 s for 17-43 ms until the next IDE write, heard as a
+         * glitch at 3 s, 6 s, ... and, once the cushion was gone, garbling.
+         */
+        DBDMA_kick(dbdma_from_ch(ch));
+    }
 }
 
 static void stop(DBDMA_channel *ch)
@@ -460,6 +691,7 @@ static void channel_run(DBDMA_channel *ch)
     ch->regs[DBDMA_STATUS] &= ~WAKE;
 
     cmd = le16_to_cpu(current->command) & COMMAND_MASK;
+    trace_dbdma_channel_run(ch->channel, le16_to_cpu(current->command));
 
     switch (cmd) {
     case DBDMA_NOP:
@@ -476,7 +708,8 @@ static void channel_run(DBDMA_channel *ch)
     phy_addr = le32_to_cpu(current->phy_addr);
 
     if (key == KEY_STREAM4) {
-        printf("command %x, invalid key 4\n", cmd);
+        qemu_log_mask(LOG_GUEST_ERROR, "DBDMA: command %x, invalid key 4\n",
+                      cmd);
         kill_channel(ch);
         return;
     }
@@ -503,8 +736,15 @@ static void channel_run(DBDMA_channel *ch)
         return;
     }
 
+    /*
+     * Mac OS's own drivers routinely issue LOAD_WORD/STORE_WORD
+     * descriptors with a stream key (0); treating it as KEY_SYSTEM is
+     * what they expect, so log only under -d guest_errors instead of
+     * printf-spamming every boot ("command 5000, invalid key 0").
+     */
     if (key < KEY_REGS) {
-        printf("command %x, invalid key %x\n", cmd, key);
+        qemu_log_mask(LOG_GUEST_ERROR, "DBDMA: command %x, invalid key %x\n",
+                      cmd, key);
         key = KEY_SYSTEM;
     }
 
@@ -543,6 +783,18 @@ static void DBDMA_run(DBDMAState *s)
         DBDMA_channel *ch = &s->channels[channel];
         uint32_t status = ch->regs[DBDMA_STATUS];
         if (!ch->io.processing && (status & RUN) && (status & ACTIVE)) {
+            /*
+             * Give this run of the bottom-half a fresh synchronous-
+             * continuation budget rather than letting sync_continue_count
+             * only ever get reset by a deferred completion (see
+             * dbdma_should_continue_sync()) -- that reset path can itself
+             * be the one starved of the BQL, in which case the budget,
+             * once spent, would otherwise never come back. The BH is
+             * scheduled unconditionally "ready" (no clock-deadline
+             * computation needed), so it is serviced far more reliably
+             * than a QEMU_CLOCK_VIRTUAL timer under the same contention.
+             */
+            ch->sync_continue_count = 0;
             channel_run(ch);
         }
     }
@@ -555,6 +807,41 @@ static void DBDMA_run_bh(void *opaque)
     DBDMA_DPRINTF("-> DBDMA_run_bh\n");
     DBDMA_run(s);
     DBDMA_DPRINTF("<- DBDMA_run_bh\n");
+}
+
+/*
+ * Publish a device's status lines (ChannelStatus[7:0], "s7..s0") for the
+ * channel it owns. A DBDMA command list steers itself on these through
+ * the WaitSelect / BranchSelect / IntSelect registers, so a device that
+ * never drives them can only ever be driven by a command list that does
+ * not test them.
+ *
+ * Mac OS X's AppleMesh is exactly such a driver: its whole SCSI
+ * transaction is one DBDMA command list that stores sequencer commands
+ * into the MESH and parks on `NOP + WAIT_IFSET` until the chip answers
+ * on these lines. Without them the list stalls on the first wait after
+ * the SELECT and the bus scan finds nothing.
+ */
+void DBDMA_set_devstat(void *dbdma, int nchan, uint8_t devstat)
+{
+    DBDMAState *s = dbdma;
+    DBDMA_channel *ch = &s->channels[nchan];
+    uint32_t old = ch->regs[DBDMA_STATUS];
+
+    ch->devstat_driven = true;
+    ch->regs[DBDMA_STATUS] = (old & ~(uint32_t)DEVSTAT) | devstat;
+
+    /*
+     * A channel parked on an unmet wait re-evaluates on its own slow
+     * timer, but the device knowing the lines just moved lets the list
+     * continue at once instead of up to a millisecond later -- with a
+     * wait between every SCSI phase that is the difference between a
+     * usable disk and a crawling one.
+     */
+    if (ch->regs[DBDMA_STATUS] != old &&
+        (ch->regs[DBDMA_STATUS] & RUN) && (ch->regs[DBDMA_STATUS] & ACTIVE)) {
+        DBDMA_kick(s);
+    }
 }
 
 void DBDMA_kick(DBDMAState *dbdma)
@@ -585,6 +872,7 @@ static void dbdma_control_write(DBDMA_channel *ch)
     uint16_t mask, value;
     uint32_t status;
     bool do_flush = false;
+    bool flush_cmd = false;
 
     mask = (ch->regs[DBDMA_CONTROL] >> 16) & 0xffff;
     value = ch->regs[DBDMA_CONTROL] & 0xffff;
@@ -641,6 +929,22 @@ static void dbdma_control_write(DBDMA_channel *ch)
                         (value & PAUSE) ? "sett" : "clear");
     }
 
+    /* The general-purpose device status bits (s0-s7) are software
+     * writable through the same mask/value protocol as the control
+     * bits. Mac OS X's audio HAL depends on this: its I2S DBDMA
+     * program is a circular ring of OUTPUT_MORE commands carrying a
+     * branch-if-s0-set abort hook, and the driver stops playback by
+     * setting s0 so the ring branches to its stop/interrupt block.
+     * If the write is dropped the ring cycles (and the last buffer
+     * of audio repeats) forever after the guest has moved on.
+     */
+    if (mask & DEVSTAT) {
+        status = (status & ~(uint32_t)(mask & DEVSTAT)) |
+                 (value & mask & DEVSTAT);
+        DBDMA_DPRINTFCH(ch, " Setting DEVSTAT to 0x%x !\n",
+                        status & DEVSTAT);
+    }
+
     /* FLUSH is its own thing */
     if ((mask & FLUSH) && (value & FLUSH))  {
         DBDMA_DPRINTFCH(ch, " Setting FLUSH !\n");
@@ -652,6 +956,7 @@ static void dbdma_control_write(DBDMA_channel *ch)
          */
         ch->regs[DBDMA_STATUS] |= FLUSH;
         do_flush = true;
+        flush_cmd = true;
     }
 
     /* If either RUN or PAUSE is clear, so should ACTIVE be,
@@ -684,14 +989,104 @@ static void dbdma_control_write(DBDMA_channel *ch)
      * both on FLUSH commands and when stopping the channel for safety.
      */
     if (do_flush && ch->flush) {
+        /*
+         * While the channel is being taken out of ACTIVE, a completion
+         * the device delivers from inside its flush callback must end
+         * with that command: the status image is only updated below,
+         * so dbdma_end() would otherwise see RUN|ACTIVE and run the
+         * next command synchronously, starting a device transfer the
+         * guest never gets to see stop (observed with Mac OS X's audio
+         * engine on g3beige: the extra transfer's samples played after
+         * the stop and the ring restarted out of phase).
+         */
+        ch->stopping = !(status & ACTIVE);
         ch->flush(&ch->io);
+        ch->stopping = false;
+    }
+
+    /*
+     * A flush is not just "push the FIFO out": the DBDMA channel also
+     * updates the current command's resCount and xferStatus in memory
+     * before it clears the Flush bit, and it is that write-back the
+     * driver is really asking for. Apple's own idiom is
+     *
+     *     set Flush; while (ChannelStatus & Flush) ;
+     *     while (!(cmd->xferStatus & kdbdmaStatusActive)) { set Flush; ... }
+     *
+     * -- poll the *descriptor*, not the channel, because a channel that
+     * is still legitimately running tells you nothing about how far the
+     * current command got.
+     *
+     * Every other path here writes the descriptor back when the device
+     * completes (dbdma_end()). A command whose device has taken the
+     * transfer and parked -- an armed receive descriptor on a port with
+     * nothing arriving, which is the normal idle state of a serial or
+     * network receive channel -- never reaches that path, so without
+     * this the status word stays 0 forever and the loop above never
+     * terminates. Measured on g3beige: Mac OS 9.2 hangs on "Starting
+     * Up..." spinning on exactly this loop against the ESCC channel B
+     * receive channel (mac-io 0x8700), which the system arms while
+     * enumerating the built-in serial ports.
+     *
+     * Only an explicit Flush request writes back, and only while a
+     * device transfer is genuinely outstanding: if the device completed
+     * inside ch->flush() above, dbdma_end() has already done this and
+     * has advanced the command pointer, and re-writing here would stamp
+     * the current status over the *next* descriptor.
+     */
+    if (flush_cmd && ch->io.processing) {
+        ch->current.xfer_status = cpu_to_le16(ch->regs[DBDMA_STATUS]);
+        ch->current.res_count = cpu_to_le16(ch->io.len);
+        dbdma_cmdptr_save(ch);
+    }
+
+    /*
+     * A channel the driver has STOPPED (RUN 1->0) has no outstanding
+     * device transfer any more: ch->flush() above has just told the
+     * device to drop it, and the descriptor's residual has been written
+     * back. Leaving `processing` set outlives the stop and permanently
+     * blocks this channel -- only dma_end() ever clears it, and the
+     * transfer that would have called dma_end() is the one just
+     * abandoned. The re-activation path below then skips
+     * dbdma_cmdptr_load(), so the channel resumes on the STALE cached
+     * command instead of the new command pointer the driver has just
+     * written.
+     *
+     * Mac OS X's AppleMesh does exactly this on every short SCSI
+     * transfer: its interrupt handler stops the channel with a
+     * descriptor still half-consumed (a 96-byte INQUIRY that the target
+     * answered in 36), then points the channel at a fresh command list.
+     * Without this the SCSI bus scan died after its second command --
+     * arbitration and selection still ran from the CPU, but the channel
+     * program that issues everything after them never fetched again.
+     * (Same failure mode, and same fix, as the reset path below.)
+     */
+    if ((mask & RUN) && !(value & RUN)) {
+        ch->io.processing = false;
     }
 
     /* Finally update the status register image */
     ch->regs[DBDMA_STATUS] = status;
+    trace_dbdma_control_write_done(ch->channel, status);
 
     /* If active, make sure the BH gets to run */
     if (status & ACTIVE) {
+        /*
+         * Re-fetch the current command descriptor from guest memory
+         * before (re)starting execution. Real DBDMA fetches the
+         * descriptor anew on every RUN start and WAKE re-examination;
+         * the Mac OS ethernet driver relies on this by keeping a STOP
+         * in its persistent TX ring, overwriting it in place with a
+         * real OUTPUT command and then just re-kicking the channel --
+         * without the re-fetch, the stale cached STOP is executed
+         * forever and no frame ever leaves the NIC. Don't reload while
+         * a device I/O for the current command is still in flight.
+         */
+        if (!ch->io.processing) {
+            dbdma_cmdptr_load(ch);
+        }
+        /* Fresh guest-triggered kick: see the comment in DBDMA_run(). */
+        ch->sync_continue_count = 0;
         DBDMA_kick(dbdma_from_ch(ch));
     }
 }
@@ -704,6 +1099,7 @@ static void dbdma_write(void *opaque, hwaddr addr,
     DBDMA_channel *ch = &s->channels[channel];
     int reg = (addr - (channel << DBDMA_CHANNEL_SHIFT)) >> 2;
 
+    trace_dbdma_write(channel, reg, value);
     DBDMA_DPRINTFCH(ch, "writel 0x" HWADDR_FMT_plx " <= 0x%08"PRIx64"\n",
                     addr, value);
     DBDMA_DPRINTFCH(ch, "channel 0x%x reg 0x%x\n",
@@ -761,8 +1157,28 @@ static uint64_t dbdma_read(void *opaque, hwaddr addr,
     switch(reg) {
     case DBDMA_CONTROL:
         value = ch->regs[DBDMA_STATUS];
-        break;
+        goto mask_active_if_processing;
     case DBDMA_STATUS:
+mask_active_if_processing:
+        /*
+         * While the channel is waiting on a device to complete an I/O
+         * transfer (ch->io.processing, e.g. an armed RX descriptor with
+         * no packet arrived yet), report ACTIVE as clear rather than the
+         * raw stored bit. On real DBDMA hardware, a channel stalled
+         * waiting for its device is not "active" from the status
+         * register's perspective -- ACTIVE means actively executing/
+         * completing commands. Real Darwin BMacEnet-family drivers poll
+         * this via a watchdog that checks !(status & kdbdmaActive) to
+         * decide "channel has stopped, time to feed it more work" --
+         * with ACTIVE permanently reported set while we're internally
+         * waiting, that check never fires, so the driver never considers
+         * the channel free for a new descriptor and never attempts a
+         * real send.
+         */
+        if (ch->io.processing && !ch->io.device_busy) {
+            value &= ~ACTIVE;
+        }
+        break;
     case DBDMA_CMDPTR_LO:
     case DBDMA_INTR_SEL:
     case DBDMA_BRANCH_SEL:
@@ -790,6 +1206,11 @@ static uint64_t dbdma_read(void *opaque, hwaddr addr,
     DBDMA_DPRINTFCH(ch, "channel 0x%x reg 0x%x\n",
                     (uint32_t)addr >> DBDMA_CHANNEL_SHIFT, reg);
 
+    if (reg != ch->last_read_reg || value != ch->last_read_value) {
+        trace_dbdma_read(channel, reg, value);
+        ch->last_read_reg = reg;
+        ch->last_read_value = value;
+    }
     return value;
 }
 
@@ -862,26 +1283,128 @@ static void mac_dbdma_reset(DeviceState *d)
     int i;
 
     for (i = 0; i < DBDMA_CHANNELS; i++) {
-        memset(s->channels[i].regs, 0, DBDMA_SIZE);
+        DBDMA_channel *ch = &s->channels[i];
+
+        /*
+         * Tell the owning device to drop anything armed-and-parked
+         * BEFORE the channel state under it is cleared. Clearing only
+         * the channel's own fields (below) leaves the device's copy of
+         * the arm dangling: bmac, mesh and escc all save the DMA target
+         * (address/length/io pointer) at arm time and complete it later
+         * from an unrelated event -- a network packet, SCSI data, a
+         * chardev byte. After a warm restart that stale arm points into
+         * the PREVIOUS session's memory layout, so the first packet
+         * slirp delivers to the new session was DMA-written through the
+         * old address: silent guest memory corruption that surfaced as
+         * wandering "bus error"/hang crashes early in OS 9 boot
+         * (field-debugged on the Windows port, 2026-09-01: fresh
+         * installs crashed on first boot -- always a warm restart out
+         * of the installer -- while -nic none boots were clean). The
+         * flush callback is the existing contract for exactly this
+         * "drop your parked transfer" request, and is called while the
+         * registers are still intact, same as the CONTROL-write path.
+         */
+        if (ch->flush) {
+            ch->flush(&ch->io);
+        }
+
+        memset(ch->regs, 0, DBDMA_SIZE);
+        ch->sync_continue_count = 0;
+
+        /*
+         * A channel can be reset while genuinely mid-transfer -- e.g. an
+         * armed-but-unfed RX ring (bmac/mesh/escc's "waiting" pattern:
+         * processing=true, dma_end never yet called because no real
+         * data has arrived). Without this, that stale `processing=true`
+         * outlives the reset and permanently blocks DBDMA_run()'s
+         * per-channel gate (`!ch->io.processing && RUN && ACTIVE`) for
+         * this channel, since only dma_end() ever clears it -- no
+         * future CONTROL-register kick can make channel_run() run for
+         * it again, no matter how many times the new session's driver
+         * legitimately re-arms it. Confirmed live: a guest OS "Restart"
+         * (a warm reset that doesn't necessarily reach every device's
+         * own registers the way a real hardware power-on would) left
+         * bmac's RX channel exactly this stuck -- 100+ real CONTROL
+         * kicks from the new session's driver afterward, zero of which
+         * ever reached bmac_rx_dma_rw() -- so the RX ring could never
+         * be re-established and every DHCP reply landed on a
+         * permanently unarmed buffer regardless of retries.
+         * opaque/channel are identity fields set once at
+         * DBDMA_register_channel() time and must NOT be cleared here.
+         */
+        ch->io.processing = false;
+        ch->io.addr = 0;
+        ch->io.len = 0;
+        ch->io.is_last = 0;
+        ch->io.is_dma_out = 0;
+        ch->io.dma_end = NULL;
+
+        timer_del(ch->unassigned_completion_timer);
+        timer_del(ch->wait_poll_timer);
     }
+}
+
+#define DBDMA_UNASSIGNED_COMPLETION_DELAY_MS 1
+
+static void dbdma_unassigned_complete(void *opaque)
+{
+    DBDMA_channel *ch = opaque;
+
+    ch->sync_continue_count = 0;
+    ch->io.dma_end(&ch->io);
 }
 
 static void dbdma_unassigned_rw(DBDMA_io *io)
 {
     DBDMA_channel *ch = io->channel;
-    dbdma_cmd *current = &ch->current;
-    uint16_t cmd;
+
     qemu_log_mask(LOG_GUEST_ERROR, "%s: use of unassigned channel %d\n",
                   __func__, ch->channel);
-    ch->io.processing = false;
 
-    cmd = le16_to_cpu(current->command) & COMMAND_MASK;
-    if (cmd == OUTPUT_MORE || cmd == OUTPUT_LAST ||
-        cmd == INPUT_MORE || cmd == INPUT_LAST) {
-        current->xfer_status = cpu_to_le16(ch->regs[DBDMA_STATUS]);
-        current->res_count = cpu_to_le16(io->len);
-        dbdma_cmdptr_save(ch);
+    /*
+     * No device is attached to service this transfer, but the command
+     * list itself still has to be completed properly (status/residual
+     * written back, then the command pointer advanced via the normal
+     * interrupt/branch handling) exactly like a real device's completion
+     * would -- otherwise channel_run() just re-reads and re-attempts the
+     * same never-advancing command forever, which is guest-visible as a
+     * permanent hang (confirmed: a native "wait for ChannelStatus.active
+     * to clear" poll loop spun indefinitely on this before this fix).
+     * DingusPPC's equivalent generic DMA channel model has the same
+     * behavior: an absent device callback is simply skipped, and the
+     * command list's own completion bookkeeping proceeds unconditionally.
+     *
+     * Completed inline (bounded by a burst limit) rather than always
+     * deferred: a deferred QEMU_CLOCK_VIRTUAL timer only fires once the
+     * main-loop thread takes the BQL to service it, but a guest that
+     * only *polls* this channel's status register (never writing
+     * anything further) can hold the BQL open almost continuously --
+     * each MMIO read re-acquires it as fast as the previous one releases
+     * it -- starving the main-loop thread out of ever running the timer
+     * at all. Confirmed live: the timer's expire_time had already
+     * elapsed while dbdma_unassigned_complete() had never been entered,
+     * leaving the channel's ACTIVE bit permanently stuck even though the
+     * "completion" was only ever paced by 1ms, not blocked forever.
+     * Completing inline happens within the same call chain as whatever
+     * triggered it (the guest's own CONTROL-register kick, or
+     * channel_run()'s recursive re-invocation for the next descriptor),
+     * which needs no further BQL acquisition by anyone else.
+     *
+     * The burst limit exists only to bound the one case that must not
+     * run inline: a genuinely-unbounded descriptor ring (e.g. a
+     * continuous-capture style circular buffer that branches back to
+     * its own start forever) would otherwise spin the host in a true
+     * infinite C loop. Once the limit is hit, fall back to the paced
+     * timer as before to yield back to the host/guest.
+     */
+    if (ch->sync_continue_count++ < DBDMA_SYNC_CONTINUE_BURST_LIMIT) {
+        ch->io.dma_end(&ch->io);
+        return;
     }
+
+    timer_mod(ch->unassigned_completion_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+              DBDMA_UNASSIGNED_COMPLETION_DELAY_MS);
 }
 
 static void dbdma_unassigned_flush(DBDMA_io *io)
@@ -904,9 +1427,14 @@ static void mac_dbdma_init(Object *obj)
         ch->flush = dbdma_unassigned_flush;
         ch->channel = i;
         ch->io.channel = ch;
+        ch->unassigned_completion_timer =
+            timer_new_ms(QEMU_CLOCK_VIRTUAL, dbdma_unassigned_complete, ch);
+        ch->wait_poll_timer =
+            timer_new_ms(QEMU_CLOCK_VIRTUAL, dbdma_wait_poll, ch);
     }
 
-    memory_region_init_io(&s->mem, obj, &dbdma_ops, s, "dbdma", 0x1000);
+    memory_region_init_io(&s->mem, obj, &dbdma_ops, s, "dbdma",
+                          DBDMA_REGION_SIZE);
     sysbus_init_mmio(sbd, &s->mem);
 }
 

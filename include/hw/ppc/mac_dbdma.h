@@ -28,6 +28,7 @@
 #include "system/dma.h"
 #include "hw/core/sysbus.h"
 #include "qom/object.h"
+#include "qemu/timer.h"
 
 typedef struct DBDMA_io DBDMA_io;
 
@@ -44,6 +45,23 @@ struct DBDMA_io {
     DBDMA_end dma_end;
     /* DMA is in progress, don't start another one */
     bool processing;
+    /*
+     * Set by a device that is genuinely transferring the command it
+     * holds (a paced audio stream), as opposed to holding it parked
+     * until an external event arrives (a receive descriptor waiting
+     * for a packet). Decides whether STATUS reads report ACTIVE while
+     * io.processing is set -- see dbdma_read().
+     */
+    bool device_busy;
+    /*
+     * Host-monotonic time this transfer was handed to the device
+     * (start_output/start_input), for the dbdma_io_latency trace in
+     * dbdma_end(). Diagnostics only -- guest-visible completion latency
+     * as experienced end to end (device + aio + bottom-half + main
+     * loop) is the load-bearing number in the classic Mac OS VM-on
+     * stability investigation. Not migrated.
+     */
+    int64_t start_ns;
 };
 
 /*
@@ -70,10 +88,44 @@ struct DBDMA_io {
 #define DBDMA_REGS            16
 #define DBDMA_SIZE            (DBDMA_REGS * sizeof(uint32_t))
 
-#define DBDMA_CHANNEL_SHIFT   7
+/*
+ * Real Old World Mac hardware places each DBDMA channel's register
+ * block 0x100 bytes apart (confirmed against DingusPPC's independent,
+ * real-hardware-accurate GrandCentral/Heathrow implementation --
+ * devices/ioctrl/grandcentral.cpp computes `dma_channel = (offset >>
+ * 8) & 0x7F`, and its own channel-number table places AUDIO_OUT at
+ * channel 8, i.e. byte offset 0x800). The previous value of 7 here
+ * (0x80-byte stride, present in QEMU since Alexander Graf's original
+ * 2013 commit) silently doubles every real channel number for any
+ * guest write built from the real hardware address layout -- e.g. a
+ * real-address write to channel 8 (audio out) lands in this code's
+ * channel slot 16 instead, where nothing is registered. Confirmed
+ * live: with the old shift, a real ROM's AWACS DMA-out start command
+ * was observed setting RUN on internal channel 0x10 (16), never 8 --
+ * this is why the ROM's startup chime never reached awacs.c's
+ * registered DMA callback despite driving the AWACS codec registers
+ * correctly. This also retroactively explains an earlier empirical
+ * finding in awacs.c (the "REVERTED... channel 18, not 9" comment,
+ * see below): channel 18 "working" under the old shift was really
+ * channel 9 doubled, not a different real channel number -- masking
+ * this bug rather than fixing it.
+ */
+#define DBDMA_CHANNEL_SHIFT   8
 #define DBDMA_CHANNEL_SIZE    (1 << DBDMA_CHANNEL_SHIFT)
 
-#define DBDMA_CHANNELS        (0x1000 >> DBDMA_CHANNEL_SHIFT)
+/*
+ * The MMIO window must be big enough to keep addressing every real
+ * channel number actually used on real hardware (and thus by this
+ * codebase's own device models) at the corrected 0x100-byte stride --
+ * notably real Heathrow/Grand Central's IDE0/IDE1 DBDMA channels at
+ * 0x16 (22) and 0x18 (24) (hw/misc/macio/macio.c), well past the
+ * lower real-hardware-documented channels (SCSI/floppy/ethernet/SCC/
+ * audio/mesh, 0-10). 32 channels' worth of headroom (0x2000 bytes)
+ * matches this array's old channel *count* under the previous,
+ * incorrect 0x80-byte stride -- same headroom, correct addressing.
+ */
+#define DBDMA_REGION_SIZE     0x2000
+#define DBDMA_CHANNELS        (DBDMA_REGION_SIZE >> DBDMA_CHANNEL_SHIFT)
 
 /* Bits in control and status registers */
 
@@ -155,6 +207,57 @@ typedef struct DBDMA_channel {
     DBDMA_rw rw;
     DBDMA_flush flush;
     dbdma_cmd current;
+    /*
+     * True once the owning device has published its status lines through
+     * DBDMA_set_devstat(). Only then may a Wait/Branch/Int condition be
+     * evaluated against the full 8-bit ChannelStatus[7:0]; a device that
+     * does not model those lines reads as all-zero, which is NOT what the
+     * hardware would show, and comparing against it turns a driver's
+     * condition into a definite (usually wrong) answer instead of the
+     * historical always-true. See the comment in devstat_sel_mask().
+     */
+    bool devstat_driven;
+    /*
+     * Completing an unassigned channel's transfer synchronously let a
+     * guest that kicks it in a tight, continuously-repeating loop (e.g.
+     * probing for an audio-input device that isn't modeled) re-arm it
+     * as fast as it possibly could -- enough MMIO/BQL traffic to
+     * livelock QEMU's own CPU and main-loop threads fighting over the
+     * BQL (confirmed via repeated `lldb -p <pid> -o "thread backtrace
+     * all"` snapshots always showing the CPU thread blocked in
+     * qemu_mutex_lock_impl/do_ld_mmio_beN). Deferring completion by a
+     * small delay paces any such loop down to something sane without
+     * touching QEMU's own generic locking code. See
+     * dbdma_unassigned_rw().
+     */
+    QEMUTimer *unassigned_completion_timer;
+    /* Re-evaluation pacing for a channel parked on an unmet WAIT
+     * condition -- see the comment in nop(). */
+    QEMUTimer *wait_poll_timer;
+    /*
+     * Counts consecutive inline (synchronous) command-list continuations
+     * chained within one call stack -- shared by every synchronous
+     * continuation point (dbdma_end(), load_word(), store_word(), nop(),
+     * dbdma_unassigned_rw()). Once it crosses DBDMA_SYNC_CONTINUE_BURST_LIMIT,
+     * further continuations fall back to the original deferred (bh/timer)
+     * mechanism instead, so a descriptor list that branches back to
+     * itself forever can't spin the host in a true infinite C loop.
+     * Reset whenever a deferred completion actually runs, and at
+     * channel reset.
+     */
+    int sync_continue_count;
+    /*
+     * Set while a CONTROL write that takes the channel out of ACTIVE
+     * (RUN cleared or PAUSE set) is running the device flush callback.
+     * A completion delivered from inside that callback must not chain
+     * into the next command: the status image still shows RUN|ACTIVE
+     * at that point, so the synchronous-continuation path would start
+     * a fresh device transfer on a channel the guest is stopping.
+     */
+    bool stopping;
+    /* dbdma_read trace de-duplication: poll loops log once per change. */
+    int last_read_reg;
+    uint32_t last_read_value;
 } DBDMA_channel;
 
 struct DBDMAState {
@@ -174,5 +277,6 @@ void DBDMA_register_channel(void *dbdma, int nchan, qemu_irq irq,
                             DBDMA_rw rw, DBDMA_flush flush,
                             void *opaque);
 void DBDMA_kick(DBDMAState *dbdma);
+void DBDMA_set_devstat(void *dbdma, int nchan, uint8_t devstat);
 
 #endif
