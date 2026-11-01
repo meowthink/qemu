@@ -62,6 +62,19 @@ void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state)
 
     s->gpio_regs[gpio] = new_reg;
 
+    /*
+     * Reflect the line in the level registers as well: Apple's KeyLargo /
+     * K2 have two 32-bit level registers at 0x50/0x54 (KeyLargo.h
+     * kKeyLargoGPIOLevels0/1), line N in bit 31-(N%32) of word N/32.  The
+     * PowerMac7,2/7,3 BootROM reads them (lwbrx from 0x80000050) to test
+     * strap lines, and before this they always read back as 0.
+     */
+    if (state) {
+        s->gpio_levels[gpio >> 3] |= (0x80 >> (gpio & 7));
+    } else {
+        s->gpio_levels[gpio >> 3] &= ~(0x80 >> (gpio & 7));
+    }
+
     switch (gpio) {
     case 1:
         /* Level low - original GPIO 1 handling */
