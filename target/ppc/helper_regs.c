@@ -29,6 +29,7 @@
 #include "cpu-models.h"
 #include "spr_common.h"
 #include "internal.h"
+#include "mmu-hash64.h"
 #include "mmu-hash32.h"
 
 /* Swap temporary saved registers with GPRs */
@@ -394,41 +395,75 @@ void check_tlb_flush(CPUPPCState *env, bool global)
     uint32_t need = env->tlb_need_flush;
     bool pages = (need & TLB_NEED_PAGES_FLUSH) &&
                  env->tlbie_pages_nb <= TLBIE_PAGES_MAX;
+    uint32_t keep = (need & TLB_NEED_GLOBAL_FLUSH) ?
+                    (need & (TLB_NEED_GLOBAL_FLUSH | TLB_NEED_PAGES_FLUSH)) :
+                    0;
 
-    /* Handle global flushes first */
-    if (global && (need & TLB_NEED_GLOBAL_FLUSH)) {
-        if (pages) {
-            /* tlbie on the 32-bit hash MMU: only the pages it names */
+    /*
+     * A tlbie drops the pages it names, in the TLBs of the CPUs that may
+     * hold them; past TLBIE_PAGES_MAX -- a run of tlbie covering the
+     * congruence classes -- the whole TLB is cleared instead.
+     */
+    if (pages && env->mmu_model == POWERPC_MMU_32B) {
+        if (global && (need & TLB_NEED_GLOBAL_FLUSH)) {
             if (need & TLB_NEED_LOCAL_FLUSH) {
                 tlb_flush(cs);
                 ppc_hash32_tlb_flushed(env_archcpu(env));
             }
             ppc_hash32_tlbie_pages(env_archcpu(env),
                                    !(need & TLB_NEED_LOCAL_FLUSH), true);
+            keep = 0;
+        } else if (need & TLB_NEED_LOCAL_FLUSH) {
+            tlb_flush(cs);
+            ppc_hash32_tlb_flushed(env_archcpu(env));
         } else {
-            tlb_flush_all_cpus_synced(cs);
+            ppc_hash32_tlbie_pages(env_archcpu(env), true, false);
         }
-        env->tlb_need_flush = 0;
-        env->tlbie_pages_nb = 0;
+        /* A pending tlbie still completes on the other CPUs at the next sync */
+        env->tlb_need_flush = keep;
+        if (!keep) {
+            env->tlbie_pages_nb = 0;
+        }
         return;
     }
 
-    /* Then handle local ones */
-    if (need & TLB_NEED_LOCAL_FLUSH || ((need & TLB_NEED_PAGES_FLUSH) &&
-                                        !pages)) {
+#if defined(TARGET_PPC64)
+    if (pages) {
+        /* tlbie on the 970: only the translations of the pages it names */
+        if (global && (need & TLB_NEED_GLOBAL_FLUSH)) {
+            if (need & TLB_NEED_LOCAL_FLUSH) {
+                tlb_flush(cs);
+            }
+            ppc_hash64_tlbie_pages(env_archcpu(env), true);
+            keep = 0;
+        } else if (need & TLB_NEED_LOCAL_FLUSH) {
+            tlb_flush(cs);
+        } else {
+            ppc_hash64_tlbie_pages(env_archcpu(env), false);
+        }
+        /* A tlbie on another CPU reads the flags: clear them after */
+        qatomic_set(&env->tlb_need_flush, keep);
+        if (!keep) {
+            env->tlbie_pages_nb = 0;
+        }
+        return;
+    }
+#endif
+
+    /* Handle global flushes first */
+    if (global && (need & TLB_NEED_GLOBAL_FLUSH)) {
+        tlb_flush_all_cpus_synced(cs);
+        keep = 0;
+    } else if (need & (TLB_NEED_LOCAL_FLUSH | TLB_NEED_PAGES_FLUSH)) {
         tlb_flush(cs);
         if (env->mmu_model == POWERPC_MMU_32B) {
             ppc_hash32_tlb_flushed(env_archcpu(env));
         }
-    } else if (pages) {
-        ppc_hash32_tlbie_pages(env_archcpu(env), true, false);
     } else {
         return;
     }
-    /* A pending tlbie still completes on the other CPUs at the next sync */
-    env->tlb_need_flush &= TLB_NEED_GLOBAL_FLUSH | TLB_NEED_PAGES_FLUSH;
-    if (!(env->tlb_need_flush & TLB_NEED_GLOBAL_FLUSH)) {
-        env->tlb_need_flush = 0;
+    qatomic_set(&env->tlb_need_flush, keep);
+    if (!keep) {
         env->tlbie_pages_nb = 0;
     }
 }
