@@ -140,7 +140,7 @@ static inline uint8_t sr(VGACommonState *s, int idx)
     return vbe_enabled(s) ? s->sr_vbe[idx] : s->sr[idx];
 }
 
-static void vga_update_memory_access(VGACommonState *s)
+void vga_update_memory_access(VGACommonState *s)
 {
     hwaddr base, offset, size;
 
