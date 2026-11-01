@@ -641,10 +641,44 @@ static bool core99_nvram_flash_is_blank(const uint8_t *data, uint32_t size)
  * below always have a valid "common" partition to patch into, even on the
  * very first boot against a brand-new nvram-flash-*.img.
  */
-static void core99_nvram_seed_if_blank(uint8_t *data, uint32_t size)
+/*
+ * A part's own NVRAM, as the ROM image carries it: two 8 KB banks, each with
+ * the 0x5a "nvram" header and its outer Adler-32.
+ */
+static bool core99_nvram_banks_valid(const uint8_t *data, uint32_t size)
+{
+    uint32_t base;
+
+    if (size < 2 * CORE99_NVRAM_TEMPLATE_SIZE) {
+        return false;
+    }
+    for (base = 0; base + CORE99_NVRAM_TEMPLATE_SIZE <= size;
+         base += CORE99_NVRAM_TEMPLATE_SIZE) {
+        uint32_t sum = adler32(1, &data[base + 0x14],
+                               CORE99_NVRAM_TEMPLATE_SIZE - 0x14);
+
+        if (data[base] != 0x5a || memcmp(&data[base + 4], "nvram", 5) ||
+            sum != ldl_be_p(&data[base + 0x10])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void core99_nvram_seed_if_blank(uint8_t *data, uint32_t size,
+                                       const uint8_t *rom_banks)
 {
     if (size < 2 * CORE99_NVRAM_TEMPLATE_SIZE ||
         !core99_nvram_flash_is_blank(data, size)) {
+        return;
+    }
+    /*
+     * The banks the ROM was shipped with are this machine's real NVRAM, and
+     * they are what the ROM validates on its own model; the captured default
+     * below is only a fallback for a part whose banks are not there.
+     */
+    if (rom_banks && core99_nvram_banks_valid(rom_banks, size)) {
+        memcpy(data, rom_banks, size);
         return;
     }
     memcpy(&data[CORE99_NVRAM_TEMPLATE_SIZE], core99_nvram_flash_template,
@@ -803,7 +837,8 @@ static void core99_nvram_set_bootcmd(uint8_t *data, uint32_t size,
  * the firewire stub and the AGP work); the cache and gmac grafts are the two
  * that apply to any mac99.
  */
-static void core99_nvram_graft(MacIONVRAMState *nvr, uint32_t l2clock)
+static void core99_nvram_graft(MacIONVRAMState *nvr, uint32_t l2clock,
+                               const uint8_t *rom_banks)
 {
     Object *o = object_resolve_path_type("", "sungem", NULL);
     g_autofree char *macstr = o ? object_property_get_str(o, "mac", NULL)
@@ -819,7 +854,7 @@ static void core99_nvram_graft(MacIONVRAMState *nvr, uint32_t l2clock)
                          &mac[5]) == 6) {
         have_mac = true;
     }
-    core99_nvram_seed_if_blank(nvr->data, nvr->size);
+    core99_nvram_seed_if_blank(nvr->data, nvr->size, rom_banks);
     /* L2CR 0xb9000000 is divide-by-2: half the core clock, per model */
     core99_nvram_set_bootcmd(nvr->data, nvr->size, have_mac ? mac : NULL,
                              l2clock);
@@ -1779,6 +1814,7 @@ static void ppc_core99_init(MachineState *machine)
             pmac_format_nvram_core99(nvr);
         }
         pmac_nvram_core99_set_prom_env(nvr);
+    }
     /*
      * The Apple ROM lays out and validates its own partitions; only the
      * OpenBIOS-style NVRAM wants the CHRP ones seeded, and even then only
@@ -1797,10 +1833,29 @@ static void ppc_core99_init(MachineState *machine)
      * data); both patch the in-RAM image only, as the source branch does.
      */
     if (rom_is_flash) {
-        core99_nvram_graft(nvr, core99_clockfreq(core99_machine) / 2);
+        /*
+         * The part carries the machine's own NVRAM banks where the window
+         * is overlaid, and the ROM validates them against its own model, so
+         * a fresh image is seeded from them rather than from a capture of
+         * another model's part.  Read from the file: the ROM blobs are not
+         * in the chip's memory yet at this point.
+         */
+        g_autofree uint8_t *rom_image = NULL;
+        const uint8_t *rom_banks = NULL;
+        g_autofree char *rom_path =
+            qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
+        gsize rom_len = 0;
+
+        if (nvram_addr == PROM_BASE + NVRAM_FLASH_SIZE && rom_path &&
+            g_file_get_contents(rom_path, (char **)&rom_image, &rom_len,
+                                NULL) &&
+            rom_len >= (gsize)nvram_addr - PROM_BASE + NVRAM_FLASH_SIZE) {
+            rom_banks = rom_image + (nvram_addr - PROM_BASE);
+        }
+        core99_nvram_graft(nvr, core99_clockfreq(core99_machine) / 2,
+                           rom_banks);
     }
     core99_report_boot_device(nvr);
-    }
     /* No PCI init: the BIOS will do it */
 
     /*
