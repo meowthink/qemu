@@ -329,6 +329,8 @@ static void core99_dimm_spd(uint8_t spd[MAC_SPD_SIZE],
         spd[13] = 0x08;     /* x8 devices */
         spd[17] = 0x04;     /* 4 banks per device */
         spd[18] = 0x1c;     /* CL 2 / 2.5 / 3 */
+        spd[21] = 0x20;     /* on-board FET switches (the PM7,3 ROM's DIMM
+                             * parser rejects any module without this bit) */
         spd[27] = 0x3c;     /* tRP  60ns */
         spd[29] = 0x3c;     /* tRAS 60ns */
         spd[30] = 0x50;     /* tRC  80ns */
