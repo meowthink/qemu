@@ -151,6 +151,7 @@ typedef enum {
  */
 typedef struct Core99ModelInfo {
     const char *name;
+    const char *cpu_type;
     uint32_t tbfreq;
     uint32_t clockfreq;
     uint32_t busfreq;
@@ -159,11 +160,18 @@ typedef struct Core99ModelInfo {
 } Core99ModelInfo;
 
 static const Core99ModelInfo core99_models[] = {
+    /* PowerMac3,1 "Sawtooth", 100MHz bus */
+    { "pm31", POWERPC_CPU_TYPE_NAME("7400_v2.9"),
+      25000000, 500000000, 100000000, 0xB0000000, 3 },
     /* PowerMac3,4 "Digital Audio", 933MHz (the Quicksilver ratio) */
-    { "pm34", 33290001, 933333331, 133160004, 0x20000000, 3 },
+    { "pm34", POWERPC_CPU_TYPE_NAME("7400_v2.9"),
+      33290001, 933333331, 133160004, 0x20000000, 3 },
+    /* PowerMac3,6 "Mirrored Drive Doors", dual 867MHz, 4 DIMM slots */
+    { "pm36", POWERPC_CPU_TYPE_NAME("7455_v2.1"),
+      33306279, 866666664, 133225119, 0x0000A000, 4 },
 };
 
-#define CORE99_DEFAULT_MODEL 0  /* pm34 */
+#define CORE99_DEFAULT_MODEL 1  /* pm34 */
 
 struct Core99MachineState {
     /*< private >*/
@@ -1464,6 +1472,19 @@ static int core99_kvm_type(MachineState *machine, const char *arg)
     return 2;
 }
 
+/*
+ * PowerMac3,6's CPU is a 7455, not the 7400 the other models default to.
+ * Hooking get_default_cpu_type means an explicit -cpu still wins.
+ */
+#ifndef TARGET_PPC64
+static const char *core99_get_default_cpu_type(const MachineState *ms)
+{
+    Core99MachineState *cms = CORE99_MACHINE((MachineState *)ms);
+
+    return core99_model_info(cms)->cpu_type;
+}
+#endif
+
 static void core99_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -1482,10 +1503,41 @@ static void core99_machine_class_init(ObjectClass *oc, const void *data)
     mc->default_cpu_type = POWERPC_CPU_TYPE_NAME("970fx_v3.1");
 #else
     mc->default_cpu_type = POWERPC_CPU_TYPE_NAME("7400_v2.9");
+    mc->get_default_cpu_type = core99_get_default_cpu_type;
 #endif
     mc->default_ram_id = "ppc_core99.ram";
     mc->ignore_boot_device_suffixes = true;
     fwc->get_dev_path = core99_fw_dev_path;
+}
+
+static char *core99_get_model(Object *obj, Error **errp)
+{
+    Core99MachineState *cms = CORE99_MACHINE(obj);
+
+    return g_strdup(core99_model_info(cms)->name);
+}
+
+/*
+ * "pm34", not "3,4": -M's option string is comma-separated, so a literal
+ * comma in a property value has to be doubled to parse at all.
+ */
+static void core99_set_model(Object *obj, const char *value, Error **errp)
+{
+    Core99MachineState *cms = CORE99_MACHINE(obj);
+    unsigned i;
+
+    for (i = 0; i < ARRAY_SIZE(core99_models); i++) {
+        if (!strcmp(value, core99_models[i].name)) {
+            cms->model = i;
+            return;
+        }
+    }
+    error_setg(errp, "Invalid model value");
+    error_append_hint(errp, "Valid values are");
+    for (i = 0; i < ARRAY_SIZE(core99_models); i++) {
+        error_append_hint(errp, "%s %s", i ? "," : "", core99_models[i].name);
+    }
+    error_append_hint(errp, ".\n");
 }
 
 static char *core99_get_via_config(Object *obj, Error **errp)
@@ -1533,6 +1585,13 @@ static void core99_instance_init(Object *obj)
     object_property_set_description(obj, "via",
                                     "Set VIA configuration. "
                                     "Valid values are cuda, pmu and pmu-adb");
+
+    cms->model = CORE99_DEFAULT_MODEL;
+    object_property_add_str(obj, "model", core99_get_model,
+                            core99_set_model);
+    object_property_set_description(obj, "model",
+                                    "Set the machine model to emulate. "
+                                    "Valid values are pm31, pm34 and pm36");
 }
 
 static const TypeInfo core99_machine_info = {
