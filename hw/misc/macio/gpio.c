@@ -33,11 +33,6 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "trace.h"
-#define KEYLARGO_GPIO_EXTINT_0        0x58
-#define KL_GPIO_RESET_CPU1            (KEYLARGO_GPIO_EXTINT_0 + 0x04)
-#define KL_GPIO_RESET_CPU2            (KEYLARGO_GPIO_EXTINT_0 + 0x0f)
-#define KL_GPIO_RESET_CPU3            (KEYLARGO_GPIO_EXTINT_0 + 0x10)
-
 
 enum MacioGPIORegisterBits {
     OUT_DATA   = 1,
@@ -49,7 +44,6 @@ void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state)
 {
     uint8_t new_reg;
 
-    trace_macio_set_gpio(gpio, state);
 
     if (s->gpio_regs[gpio] & OUT_ENABLE) {
         qemu_log_mask(LOG_GUEST_ERROR,
@@ -61,22 +55,28 @@ void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state)
         new_reg |= IN_DATA;
     }
 
-    /* For GPIOs 4, 5, and 6 (reset lines), always update so we can assert/deassert */
-    if ((gpio != 4) && (gpio != 5) && (gpio != 6) && (new_reg == s->gpio_regs[gpio])) {
+    /* For CPU reset lines (GPIO 4, 15, 16), always update so we can assert/deassert */
+    if ((gpio != 4) && (gpio != 15) && (gpio != 16) && (new_reg == s->gpio_regs[gpio])) {
         return;
     }
-
 
     s->gpio_regs[gpio] = new_reg;
 
     switch (gpio) {
     case 1:
-        /* Level low */
+        /* Level low - original GPIO 1 handling */
         if (!state) {
-            trace_macio_gpio_irq_assert(gpio);
             qemu_irq_raise(s->gpio_extirqs[gpio]);
         } else {
-            trace_macio_gpio_irq_deassert(gpio);
+            qemu_irq_lower(s->gpio_extirqs[gpio]);
+        }
+        break;
+
+    case 3:
+        /* Level low */
+        if (!state) {
+            qemu_irq_raise(s->gpio_extirqs[gpio]);
+        } else {
             qemu_irq_lower(s->gpio_extirqs[gpio]);
         }
         break;
@@ -84,32 +84,26 @@ void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state)
     case 4:
         /* Active low, CPU1 reset */
         if (!state) {
-            trace_macio_gpio_irq_assert(gpio);
             qemu_irq_raise(s->gpio_extirqs[gpio]);
         } else {
-            trace_macio_gpio_irq_deassert(gpio);
             qemu_irq_lower(s->gpio_extirqs[gpio]);
         }
         break;
 
-    case 5:
+    case 15:
         /* Active low, CPU2 reset */
         if (!state) {
-            trace_macio_gpio_irq_assert(gpio);
             qemu_irq_raise(s->gpio_extirqs[gpio]);
         } else {
-            trace_macio_gpio_irq_deassert(gpio);
             qemu_irq_lower(s->gpio_extirqs[gpio]);
         }
         break;
 
-    case 6:
+    case 16:
         /* Active low, CPU3 reset */
         if (!state) {
-            trace_macio_gpio_irq_assert(gpio);
             qemu_irq_raise(s->gpio_extirqs[gpio]);
         } else {
-            trace_macio_gpio_irq_deassert(gpio);
             qemu_irq_lower(s->gpio_extirqs[gpio]);
         }
         break;
@@ -117,10 +111,8 @@ void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state)
     case 9:
         /* Edge, triggered by NMI below */
         if (state) {
-            trace_macio_gpio_irq_assert(gpio);
             qemu_irq_raise(s->gpio_extirqs[gpio]);
         } else {
-            trace_macio_gpio_irq_deassert(gpio);
             qemu_irq_lower(s->gpio_extirqs[gpio]);
         }
         break;
@@ -130,15 +122,11 @@ void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state)
     }
 }
 
-
-
 static void macio_gpio_write(void *opaque, hwaddr addr, uint64_t value,
                              unsigned size)
 {
     MacIOGPIOState *s = opaque;
     uint8_t ibit;
-
-    trace_macio_gpio_write(addr, value);
 
     /* Level registers are read-only */
     if (addr < 8) {
@@ -164,10 +152,16 @@ static void macio_gpio_write(void *opaque, hwaddr addr, uint64_t value,
             macio_set_gpio(s, 4, ibit);
         } else if (addr == (KL_GPIO_RESET_CPU2 - KEYLARGO_GPIO_EXTINT_0)) {
             /* For CPU2 reset: (0x58+0x0f) - 0x58 = 0x0F */
-            macio_set_gpio(s, 5, ibit);
+            if (!(value & OUT_ENABLE)) {
+                ibit = 1; /* Ensure pulled high unless driven low */
+            }
+            macio_set_gpio(s, 15, ibit);
         } else if (addr == (KL_GPIO_RESET_CPU3 - KEYLARGO_GPIO_EXTINT_0)) {
             /* For CPU3 reset: (0x58+0x10) - 0x58 = 0x10 */
-            macio_set_gpio(s, 6, ibit);
+            if (!(value & OUT_ENABLE)) {
+                ibit = 1; /* Ensure pulled high unless driven low */
+            }
+            macio_set_gpio(s, 16, ibit);
         } else {
             s->gpio_regs[addr] = value | ibit;
         }
@@ -189,8 +183,7 @@ static uint64_t macio_gpio_read(void *opaque, hwaddr addr, unsigned size)
             val = s->gpio_regs[addr];
         }
     }
-
-    trace_macio_gpio_read(addr, val);
+    
     return val;
 }
 
@@ -210,7 +203,7 @@ static void macio_gpio_init(Object *obj)
     MacIOGPIOState *s = MACIO_GPIO(obj);
     int i;
 
-    for (i = 0; i < 10; i++) {
+    for (i = 0; i < KEYLARGO_GPIO_EXTINT_CNT; i++) {
         sysbus_init_irq(sbd, &s->gpio_extirqs[i]);
     }
 
@@ -234,11 +227,16 @@ static void macio_gpio_reset(DeviceState *dev)
 {
     MacIOGPIOState *s = MACIO_GPIO(dev);
 
-    /* GPIO 1 is up by default */
+    /* GPIO 1 is up by default (original behavior) */
     macio_set_gpio(s, 1, true);
-    macio_set_gpio(s, 4, true);
-    macio_set_gpio(s, 5, true);
-    macio_set_gpio(s, 6, true);
+    /* GPIO 3 is up by default */
+    macio_set_gpio(s, 3, true);
+    
+    /* 
+     * CPU reset GPIOs (4, 15, 16) are NOT initialized here.
+     * They start low (CPUs held in reset).
+     * The OS will explicitly deassert them to start secondary CPUs.
+     */
 }
 
 static void macio_gpio_nmi(NMIState *n, int cpu_index, Error **errp)
