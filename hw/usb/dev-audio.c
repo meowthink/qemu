@@ -224,7 +224,7 @@ static const USBDescIface desc_iface[] = {
         .eps = (USBDescEndpoint[]) {
             {
                 .bEndpointAddress      = USB_DIR_OUT | 0x01,
-                .bmAttributes          = 0x0d,
+                .bmAttributes          = 0x09,
                 .wMaxPacketSize        = USBAUDIO_PACKET_SIZE(2),
                 .bInterval             = 1,
                 .is_audio              = 1,
@@ -244,7 +244,7 @@ static const USBDescIface desc_iface[] = {
 };
 
 static const USBDescDevice desc_device = {
-    .bcdUSB                        = 0x0100,
+    .bcdUSB                        = 0x0110,
     .bMaxPacketSize0               = 64,
     .bNumConfigurations            = 1,
     .confs = (USBDescConfig[]) {
@@ -387,7 +387,7 @@ static const USBDescIface desc_iface_multi[] = {
         .eps = (USBDescEndpoint[]) {
             {
                 .bEndpointAddress      = USB_DIR_OUT | 0x01,
-                .bmAttributes          = 0x0d,
+                .bmAttributes          = 0x09,
                 .wMaxPacketSize        = USBAUDIO_PACKET_SIZE(2),
                 .bInterval             = 1,
                 .is_audio              = 1,
@@ -440,7 +440,7 @@ static const USBDescIface desc_iface_multi[] = {
         .eps = (USBDescEndpoint[]) {
             {
                 .bEndpointAddress      = USB_DIR_OUT | 0x01,
-                .bmAttributes          = 0x0d,
+                .bmAttributes          = 0x09,
                 .wMaxPacketSize        = USBAUDIO_PACKET_SIZE(6),
                 .bInterval             = 1,
                 .is_audio              = 1,
@@ -493,7 +493,7 @@ static const USBDescIface desc_iface_multi[] = {
         .eps = (USBDescEndpoint[]) {
             {
                 .bEndpointAddress      = USB_DIR_OUT | 0x01,
-                .bmAttributes          = 0x0d,
+                .bmAttributes          = 0x09,
                 .wMaxPacketSize        = USBAUDIO_PACKET_SIZE(8),
                 .bInterval             = 1,
                 .is_audio              = 1,
@@ -513,7 +513,7 @@ static const USBDescIface desc_iface_multi[] = {
 };
 
 static const USBDescDevice desc_device_multi = {
-    .bcdUSB                        = 0x0100,
+    .bcdUSB                        = 0x0110,
     .bMaxPacketSize0               = 64,
     .bNumConfigurations            = 1,
     .confs = (USBDescConfig[]) {
@@ -585,8 +585,10 @@ struct streambuf {
 static void streambuf_init(struct streambuf *buf, uint32_t size,
                            uint32_t channels)
 {
+    uint32_t frame_size = channels * 2; /* 16-bit samples */
+
     g_free(buf->data);
-    buf->size = size - (size % USBAUDIO_PACKET_SIZE(channels));
+    buf->size = size - (size % frame_size);
     buf->data = g_malloc(buf->size);
     buf->prod = 0;
     buf->cons = 0;
@@ -600,21 +602,33 @@ static void streambuf_fini(struct streambuf *buf)
 
 static int streambuf_put(struct streambuf *buf, USBPacket *p, uint32_t channels)
 {
+    uint32_t frame_size = channels * 2; /* 16-bit samples */
+    size_t pkt_size = p->iov.size;
     int64_t free = buf->size - (buf->prod - buf->cons);
 
-    if (free < USBAUDIO_PACKET_SIZE(channels)) {
+    if (pkt_size == 0 || pkt_size % frame_size != 0) {
         return 0;
     }
-    if (p->iov.size != USBAUDIO_PACKET_SIZE(channels)) {
+    if (pkt_size > buf->size) {
         return 0;
     }
 
-    /* can happen if prod overflows */
-    assert(buf->prod % USBAUDIO_PACKET_SIZE(channels) == 0);
-    usb_packet_copy(p, buf->data + (buf->prod % buf->size),
-                    USBAUDIO_PACKET_SIZE(channels));
-    buf->prod += USBAUDIO_PACKET_SIZE(channels);
-    return USBAUDIO_PACKET_SIZE(channels);
+    /* If buffer is full, drop oldest data to make room */
+    if ((int64_t)pkt_size > free) {
+        buf->cons = buf->prod - (buf->size - pkt_size);
+    }
+
+    /* Handle ring buffer wraparound */
+    size_t offset = buf->prod % buf->size;
+    if (offset + pkt_size <= buf->size) {
+        usb_packet_copy(p, buf->data + offset, pkt_size);
+    } else {
+        size_t first = buf->size - offset;
+        usb_packet_copy(p, buf->data + offset, first);
+        usb_packet_copy(p, buf->data, pkt_size - first);
+    }
+    buf->prod += pkt_size;
+    return pkt_size;
 }
 
 static uint8_t *streambuf_get(struct streambuf *buf, size_t *len)
@@ -660,6 +674,7 @@ static void output_callback(void *opaque, int avail)
 {
     USBAudioState *s = opaque;
     uint8_t *data;
+    uint32_t frame_size = s->out.channels * 2; /* 16-bit samples */
 
     while (avail) {
         size_t written, len;
@@ -669,7 +684,14 @@ static void output_callback(void *opaque, int avail)
             return;
         }
 
+        /* Ensure we only write whole audio frames */
+        len = len - (len % frame_size);
+        if (len == 0) {
+            return;
+        }
+
         written = audio_be_write(s->audio_be, s->out.voice, data, len);
+        written = written - (written % frame_size);
         avail -= written;
         s->out.buf.cons += written;
 
@@ -690,8 +712,9 @@ static int usb_audio_set_output_altset(USBAudioState *s, int altset)
     case ALTSET_71:
         if (s->out.channels != altset_channels[altset]) {
             usb_audio_reinit(USB_DEVICE(s), altset_channels[altset]);
+        } else if (s->out.altset == ALTSET_OFF) {
+            streambuf_init(&s->out.buf, s->buffer, s->out.channels);
         }
-        streambuf_init(&s->out.buf, s->buffer, s->out.channels);
         audio_be_set_active_out(s->audio_be, s->out.voice, true);
         break;
     default:
@@ -898,10 +921,8 @@ static void usb_audio_handle_dataout(USBAudioState *s, USBPacket *p)
         return;
     }
 
-    streambuf_put(&s->out.buf, p, s->out.channels);
-    if (p->actual_length < p->iov.size && s->debug > 1) {
-        fprintf(stderr, "usb-audio: output overrun (%zd bytes)\n",
-                p->iov.size - p->actual_length);
+    if (!streambuf_put(&s->out.buf, p, s->out.channels)) {
+        usb_packet_skip(p, p->iov.size);
     }
 }
 
@@ -966,7 +987,7 @@ static void usb_audio_reinit(USBDevice *dev, unsigned channels)
 
     s->out.channels      = channels;
     if (!s->buffer_user) {
-        s->buffer = 32 * USBAUDIO_PACKET_SIZE(s->out.channels);
+        s->buffer = 64 * USBAUDIO_PACKET_SIZE(s->out.channels);
     } else {
         s->buffer = s->buffer_user;
     }
