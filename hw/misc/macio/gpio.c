@@ -181,6 +181,14 @@ static void macio_gpio_write(void *opaque, hwaddr addr, uint64_t value,
             macio_set_gpio(s, 16, ibit);
             qemu_set_irq(s->cpu_reset[3],
                          (value & OUT_ENABLE) && !(value & OUT_DATA));
+        } else if (addr == (KL_GPIO_TB_ENABLE - KEYLARGO_GPIO_EXTINT_0)) {
+            /*
+             * Freeze every 6xx CPU's time base while the guest copies CPU0's
+             * counter into a secondary CPU.
+             */
+            s->gpio_regs[addr] = value | ibit;
+            qemu_set_irq(s->tb_enable, !(value & OUT_ENABLE) ||
+                                        (value & OUT_DATA));
         } else if (addr == (KL_GPIO_SMU_DOORBELL -
                             KEYLARGO_GPIO_EXTINT_0) ||
                    addr == (KL_GPIO_SMU_DOORBELL2 -
@@ -236,6 +244,7 @@ static void macio_gpio_init(Object *obj)
     }
     qdev_init_gpio_out_named(DEVICE(obj), s->cpu_reset, "cpu-reset",
                              MACIO_GPIO_MAX_CPUS);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->tb_enable, "tb-enable", 1);
 
     memory_region_init_io(&s->gpiomem, OBJECT(s), &macio_gpio_ops, obj,
                           "gpio", 0x30);
@@ -261,6 +270,9 @@ static void macio_gpio_reset(DeviceState *dev)
     macio_set_gpio(s, 1, true);
     /* GPIO 3 is up by default */
     macio_set_gpio(s, 3, true);
+
+    /* A reset while the time bases were frozen releases them */
+    qemu_irq_raise(s->tb_enable);
 
     /*
      * The K2 (G5) pulls GPIO 9 up.  The PowerMac7,2/7,3 BootROM reads its

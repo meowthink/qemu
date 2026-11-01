@@ -46,6 +46,9 @@
 
 #define MACIO_GPIO_MAX_CPUS 4
 
+/* Timebase enable, wired to the TBEN pin of every 6xx CPU */
+#define KL_GPIO_TB_ENABLE             (KEYLARGO_GPIO_EXTINT_0 + 0x1b)
+
 /* G5 SMU doorbell ("os-req-gpio"): GPIO line 31 */
 #define KL_GPIO_SMU_DOORBELL          (KEYLARGO_GPIO_EXTINT_0 + 0x1f)
 /* The PM7,3/Quad generation rings the same doorbell at cell offset 0x12 */
@@ -66,6 +69,7 @@ struct MacIOGPIOState {
     uint32_t nb_cpus;
     bool k2;
     qemu_irq cpu_reset[MACIO_GPIO_MAX_CPUS];
+    qemu_irq tb_enable;                       /* low = time bases frozen */
 };
 
 void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state);
