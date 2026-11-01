@@ -1308,10 +1308,10 @@ struct CPUArchState {
     /* PReP has a dedicated byte lane swapper on board, but it is optimal
      * to implement such function in CPU, as address munging + byte lane
      * swapping + alignment access = litten endian
-     * _latch is the instruction counts until the swapper takes effect
+     * _latch is the instruction counts until the switch takes effect
      */
     bool bytelaneswap;
-    int bytelaneswap_latch;
+    int le_latch;
 
     target_ulong nip;      /* next instruction pointer */
 

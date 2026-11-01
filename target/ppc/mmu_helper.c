@@ -377,7 +377,8 @@ void helper_store_sr(CPUPPCState *env, target_ulong srnum, target_ulong value)
             }
         }
 #else
-        env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
+#define PPC_MMUIDX_VIRTUAL_MASK 0x3
+        tlb_flush_by_mmuidx(env_cpu(env), PPC_MMUIDX_VIRTUAL_MASK);
 #endif
     }
 }

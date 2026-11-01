@@ -689,6 +689,26 @@ static const VMStateDescription vmstate_reservation = {
     }
 };
 
+static bool bytelaneswap_needed(void *opaque)
+{
+    PowerPCCPU *cpu = opaque;
+    CPUPPCState *env = &cpu->env;
+
+    return env->bytelaneswap || env->le_latch;
+}
+
+static const VMStateDescription vmstate_bytelaneswap = {
+    .name = "cpu/bytelaneswap",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = bytelaneswap_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(env.bytelaneswap, PowerPCCPU),
+        VMSTATE_INT32(env.le_latch, PowerPCCPU),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static bool rtas_stopped_needed(void *opaque)
 {
     PowerPCCPU *cpu = opaque;
@@ -777,6 +797,7 @@ const VMStateDescription vmstate_ppc_cpu = {
         &vmstate_tlbmas,
         &vmstate_compat,
         &vmstate_reservation,
+        &vmstate_bytelaneswap,
         &vmstate_rtas_stopped,
         NULL
     }

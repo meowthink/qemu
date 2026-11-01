@@ -31,6 +31,7 @@
 
 #include "exec/translator.h"
 #include "exec/translation-block.h"
+#include "exec/tb-flush.h"
 #include "exec/log.h"
 #include "qemu/atomic128.h"
 #include "spr_common.h"
@@ -225,12 +226,13 @@ static inline bool is_ppe(const DisasContext *ctx)
 /**
  * ppc_code_endian_dc:
  * @dc: the disassembly context
+ * @env: the CPU state
  *
- * Return the MemOp endianness of the CODE path.
+ * Return the cached endian mode of the CODE path
  */
-static inline MemOp ppc_code_endian_dc(const DisasContext *ctx)
+static inline int ppc_code_endian_dc(const DisasContext *dc, CPUPPCState *env)
 {
-    return (ctx->le_mode == 2) ? MO_LE : MO_BE;
+    return dc->le_mode ^ (env->le_latch > 0 ? 2 : 0);
 }
 
 /* True when active word size < size of target_long.  */
@@ -2644,7 +2646,8 @@ static void gen_align_check_le(DisasContext *ctx, TCGv ea, TCGv aoff)
 static inline bool align_check_le(DisasContext *ctx, MemOp memop)
 {
     return (memop_size(memop) > 1) && ((memop & MO_ALIGN) ?
-        (ctx->le_mode && !(ctx->insns_flags & PPC_64B)) : ctx->le_align_6xx);
+        ((ctx->le_mode & 1) && !(ctx->insns_flags & PPC_64B)) :
+        ctx->le_align_6xx);
 }
 
 #if defined(TARGET_PPC64)
@@ -2673,14 +2676,13 @@ static void gen_ld_tl(DisasContext *ctx, TCGv val, TCGv addr, TCGArg idx,
     TCGv ea = addr;
     TCGv aoff = NULL, taddr = NULL;
 
-    switch (ctx->le_mode) {
-    case 1:
-        taddr = tcg_temp_new();
-        aoff = tcg_temp_new();
-        gen_addr_swizzle_le(taddr, addr, memop, aoff);
-        ea = taddr;
-        /* fall through */
-    case 2:
+    if (ctx->le_mode & 1) {
+        if (!(ctx->le_mode & 2)) {
+            taddr = tcg_temp_new();
+            aoff = tcg_temp_new();
+            gen_addr_swizzle_le(taddr, addr, memop, aoff);
+            ea = taddr;
+        }
         if (unlikely(align_check_le(ctx, memop))) {
             if (aoff == NULL) {
                 aoff = tcg_temp_new();
@@ -2688,11 +2690,8 @@ static void gen_ld_tl(DisasContext *ctx, TCGv val, TCGv addr, TCGArg idx,
             }
             gen_align_check_le(ctx, addr, aoff);
         }
-        /* fall through */
-    default:
-        tcg_gen_qemu_ld_tl(val, ea, idx, memop);
-        break;
     }
+    tcg_gen_qemu_ld_tl(val, ea, idx, memop);
 }
 
 #define GEN_QEMU_LOAD_TL(ldop, op)                                      \
@@ -2718,14 +2717,13 @@ static void gen_ld_i64(DisasContext *ctx, TCGv_i64 val, TCGv addr,
     TCGv ea = addr;
     TCGv aoff = NULL, taddr = NULL;
 
-    switch (ctx->le_mode) {
-    case 1:
-        taddr = tcg_temp_new();
-        aoff = tcg_temp_new();
-        gen_addr_swizzle_le(taddr, addr, memop, aoff);
-        ea = taddr;
-        /* fall through */
-    case 2:
+    if (ctx->le_mode & 1) {
+        if (!(ctx->le_mode & 2)) {
+            taddr = tcg_temp_new();
+            aoff = tcg_temp_new();
+            gen_addr_swizzle_le(taddr, addr, memop, aoff);
+            ea = taddr;
+        }
         if (unlikely(align_check_le(ctx, memop))) {
             if (aoff == NULL) {
                 aoff = tcg_temp_new();
@@ -2733,11 +2731,8 @@ static void gen_ld_i64(DisasContext *ctx, TCGv_i64 val, TCGv addr,
             }
             gen_align_check_le(ctx, addr, aoff);
         }
-        /* fall through */
-    default:
-        tcg_gen_qemu_ld_i64(val, ea, idx, memop);
-        break;
     }
+    tcg_gen_qemu_ld_i64(val, ea, idx, memop);
 }
 
 #define GEN_QEMU_LOAD_64(ldop, op)                                  \
@@ -2764,14 +2759,13 @@ static void gen_st_tl(DisasContext *ctx, TCGv val, TCGv addr, TCGArg idx,
     TCGv ea = addr;
     TCGv aoff = NULL, taddr = NULL;
 
-    switch (ctx->le_mode) {
-    case 1:
-        taddr = tcg_temp_new();
-        aoff = tcg_temp_new();
-        gen_addr_swizzle_le(taddr, addr, memop, aoff);
-        ea = taddr;
-        /* fall through */
-    case 2:
+    if (ctx->le_mode & 1) {
+        if (!(ctx->le_mode & 2)) {
+            taddr = tcg_temp_new();
+            aoff = tcg_temp_new();
+            gen_addr_swizzle_le(taddr, addr, memop, aoff);
+            ea = taddr;
+        }
         if (unlikely(align_check_le(ctx, memop))) {
             if (aoff == NULL) {
                 aoff = tcg_temp_new();
@@ -2779,11 +2773,8 @@ static void gen_st_tl(DisasContext *ctx, TCGv val, TCGv addr, TCGArg idx,
             }
             gen_align_check_le(ctx, addr, aoff);
         }
-        /* fall through */
-    default:
-        tcg_gen_qemu_st_tl(val, ea, idx, memop);
-        break;
     }
+    tcg_gen_qemu_st_tl(val, ea, idx, memop);
 }
 
 #define GEN_QEMU_STORE_TL(stop, op)                                     \
@@ -2809,14 +2800,13 @@ static void gen_st_i64(DisasContext *ctx, TCGv_i64 val, TCGv addr,
     TCGv ea = addr;
     TCGv aoff = NULL, taddr = NULL;
 
-    switch (ctx->le_mode) {
-    case 1:
-        taddr = tcg_temp_new();
-        aoff = tcg_temp_new();
-        gen_addr_swizzle_le(taddr, addr, memop, aoff);
-        ea = taddr;
-        /* fall through */
-    case 2:
+    if (ctx->le_mode & 1) {
+        if (!(ctx->le_mode & 2)) {
+            taddr = tcg_temp_new();
+            aoff = tcg_temp_new();
+            gen_addr_swizzle_le(taddr, addr, memop, aoff);
+            ea = taddr;
+        }
         if (unlikely(align_check_le(ctx, memop))) {
             if (aoff == NULL) {
                 aoff = tcg_temp_new();
@@ -2824,11 +2814,8 @@ static void gen_st_i64(DisasContext *ctx, TCGv_i64 val, TCGv addr,
             }
             gen_align_check_le(ctx, addr, aoff);
         }
-        /* fall through */
-    default:
-        tcg_gen_qemu_st_i64(val, ea, idx, memop);
-        break;
     }
+    tcg_gen_qemu_st_i64(val, ea, idx, memop);
 }
 
 #define GEN_QEMU_STORE_64(stop, op)                               \
@@ -2961,7 +2948,7 @@ static void gen_lmw(DisasContext *ctx)
     TCGv t0;
     TCGv_i32 t1;
 
-    if (ctx->le_mode) {
+    if (ctx->le_mode & 1) {
         gen_align_no_le(ctx);
         return;
     }
@@ -2978,7 +2965,7 @@ static void gen_stmw(DisasContext *ctx)
     TCGv t0;
     TCGv_i32 t1;
 
-    if (ctx->le_mode) {
+    if (ctx->le_mode & 1) {
         gen_align_no_le(ctx);
         return;
     }
@@ -3007,7 +2994,7 @@ static void gen_lswi(DisasContext *ctx)
     int ra = rA(ctx->opcode);
     int nr;
 
-    if (ctx->le_mode) {
+    if (ctx->le_mode & 1) {
         gen_align_no_le(ctx);
         return;
     }
@@ -3033,7 +3020,7 @@ static void gen_lswx(DisasContext *ctx)
     TCGv t0;
     TCGv_i32 t1, t2, t3;
 
-    if (ctx->le_mode) {
+    if (ctx->le_mode & 1) {
         gen_align_no_le(ctx);
         return;
     }
@@ -3053,7 +3040,7 @@ static void gen_stswi(DisasContext *ctx)
     TCGv_i32 t1, t2;
     int nb = NB(ctx->opcode);
 
-    if (ctx->le_mode) {
+    if (ctx->le_mode & 1) {
         gen_align_no_le(ctx);
         return;
     }
@@ -3074,7 +3061,7 @@ static void gen_stswx(DisasContext *ctx)
     TCGv t0;
     TCGv_i32 t1, t2;
 
-    if (ctx->le_mode) {
+    if (ctx->le_mode & 1) {
         gen_align_no_le(ctx);
         return;
     }
@@ -3122,6 +3109,18 @@ static inline void gen_check_tlb_flush(DisasContext *ctx, bool global) { }
 /* isync */
 static void gen_isync(DisasContext *ctx)
 {
+#if !defined(CONFIG_USER_ONLY)
+    /* isync should sync when @le_latch > 0 */
+    {
+        TCGv_i32 latch = tcg_temp_new_i32();
+        TCGLabel *l = gen_new_label();
+
+        tcg_gen_ld_i32(latch, tcg_env, offsetof(CPUPPCState, le_latch));
+        tcg_gen_brcondi_i32(TCG_COND_EQ, latch, 0, l);
+        gen_helper_le_sync(tcg_env);
+        gen_set_label(l);
+    }
+#endif
     /*
      * We need to check for a pending TLB flush. This can only happen in
      * kernel mode however so check MSR_PR
@@ -3388,17 +3387,13 @@ static void gen_conditional_store(DisasContext *ctx, MemOp memop)
     tcg_gen_brcond_tl(TCG_COND_NE, EA, cpu_reserve, lfail);
     tcg_gen_brcondi_tl(TCG_COND_NE, cpu_reserve_length, memop_size(memop), lfail);
 
-    switch (ctx->le_mode) {
-    case 1:
+    if ((ctx->le_mode & 1) && !(ctx->le_mode & 2)) {
         taddr = tcg_temp_new();
         gen_addr_swizzle_le(taddr, cpu_reserve, memop, NULL);
-        /* fall through */
-    default:
-        tcg_gen_atomic_cmpxchg_tl(t0, taddr, cpu_reserve_val,
-                                  cpu_gpr[rs], ctx->mem_idx,
-                                  DEF_MEMOP(memop) | MO_ALIGN);
-        break;
     }
+    tcg_gen_atomic_cmpxchg_tl(t0, taddr, cpu_reserve_val,
+                              cpu_gpr[rs], ctx->mem_idx,
+                              DEF_MEMOP(memop) | MO_ALIGN);
     tcg_gen_setcond_tl(TCG_COND_EQ, t0, t0, cpu_reserve_val);
     tcg_gen_shli_tl(t0, t0, CRF_EQ_BIT);
     tcg_gen_or_tl(cr0, cr0, t0);
@@ -6713,19 +6708,21 @@ static void ppc_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     bool true_le = (env->excp_model == POWERPC_EXCP_6xx && (env->spr[SPR_HID2] & (1u << 27)));
     /* Otherwise 6xx should obey a more strict misalign exception model */
     ctx->le_align_6xx = (env->excp_model == POWERPC_EXCP_6xx && !true_le);
-    /* Keep bytelaneswap until the latch counted down */
-    if (env->bytelaneswap_latch > 0) {
+    /*
+     * Cached insns should be translated as the pre-switched state
+     * Keep translate one insn once until the @le_latch counted down
+     */
+    if (env->le_latch > 0) {
         ctx->base.max_insns = 1;
-        env->bytelaneswap_latch --;
-        if (env->bytelaneswap_latch == 0) {
-            env->bytelaneswap = !env->bytelaneswap;
-        }
     }
     ctx->le_mode = 0;
     if ((hflags >> HFLAGS_LE) & 1) {
-        ctx->le_mode = (env->bytelaneswap || true_le || (env->insns_flags & PPC_64B)) ? 2 : 1;
+        ctx->le_mode = 1;
+        if (env->bytelaneswap || true_le || (env->insns_flags & PPC_64B)) {
+            ctx->le_mode |= 2;
+        }
     }
-    ctx->default_tcg_memop_mask = (ctx->le_mode == 2) ? MO_LE : MO_BE;
+    ctx->default_tcg_memop_mask = (ctx->le_mode & 2) ? MO_LE : MO_BE;
     ctx->flags = env->flags;
 #if defined(TARGET_PPC64)
     ctx->excp_model = env->excp_model;
@@ -6780,7 +6777,8 @@ static void ppc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     DisasContext *ctx = container_of(dcbase, DisasContext, base);
     PowerPCCPU *cpu = POWERPC_CPU(cs);
     CPUPPCState *env = cpu_env(cs);
-    MemOp mo_endian = ppc_code_endian_dc(ctx);
+    int code_mode = ppc_code_endian_dc(ctx, env);
+    MemOp mo_endian = (code_mode == 3) ? MO_LE : MO_BE;
     target_ulong pc;
     uint32_t insn;
     bool ok;
@@ -6790,7 +6788,7 @@ static void ppc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
               ctx->base.pc_next, ctx->mem_idx, (int)msr_ir);
 
     ctx->cia = pc = ctx->base.pc_next;
-    if (ctx->le_mode == 1) {
+    if (code_mode == 1) {
         insn = translator_ldl_end(env, dcbase, pc ^ 4, MO_BE);
     } else {
         insn = translator_ldl_end(env, dcbase, pc, mo_endian);
@@ -6824,6 +6822,11 @@ static void ppc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
         ctx->base.is_jmp = DISAS_TOO_MANY;
     }
 
+    /* Drain the latch window and drop the blocks when it is end. */
+    if (env->le_latch > 0 && --env->le_latch == 0) {
+        queue_tb_flush(cs);
+        cpu_exit(cs);
+    }
 }
 
 static void ppc_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
