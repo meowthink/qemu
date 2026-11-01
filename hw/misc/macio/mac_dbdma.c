@@ -825,6 +825,16 @@ static void DBDMA_run_bh(void *opaque)
  * on these lines. Without them the list stalls on the first wait after
  * the SELECT and the bus scan finds nothing.
  */
+void DBDMA_set_address_space(void *opaque, AddressSpace *as)
+{
+    DBDMAState *s = opaque;
+    int i;
+
+    for (i = 0; i < DBDMA_CHANNELS; i++) {
+        s->channels[i].io.as = as;
+    }
+}
+
 void DBDMA_set_devstat(void *dbdma, int nchan, uint8_t devstat)
 {
     DBDMAState *s = dbdma;

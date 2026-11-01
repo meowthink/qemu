@@ -282,4 +282,7 @@ void DBDMA_park_writeback(DBDMA_io *io);
 void DBDMA_kick(DBDMAState *dbdma);
 void DBDMA_set_devstat(void *dbdma, int nchan, uint8_t devstat);
 
+/* Route every channel's DMA through @as (the owning PCI function's space) */
+void DBDMA_set_address_space(void *dbdma, AddressSpace *as);
+
 #endif

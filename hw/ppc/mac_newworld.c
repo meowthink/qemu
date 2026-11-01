@@ -1457,8 +1457,14 @@ static void ppc_core99_init(MachineState *machine)
             }
         }
 
-        /* TODO(stage6): K2 UATA (ATA-100) -- needs cat7's hw/ide/macio.c K2 device,
-         * which is on a newer IDE API than this tree; SATA carries the disks for now. */
+        uata = pci_new(PCI_DEVFN(13, 0), TYPE_K2_UATA);
+        pci_realize_and_unref(uata, pci_bridge_get_sec_bus(
+                              U3_HT_HOST_BRIDGE(ht_dev)->k2[2]),
+                              &error_fatal);
+        qdev_connect_gpio_out_named(DEVICE(uata), "dma", 0,
+                                    qdev_get_gpio_in(pic_dev, K2_UATA_DMA_IRQ));
+        k2_uata_init_drives(K2_UATA(uata), uata_hd);
+
         sata = pci_new(PCI_DEVFN(12, 0), TYPE_K2_SATA);
         pci_realize_and_unref(sata, pci_bridge_get_sec_bus(
                               U3_HT_HOST_BRIDGE(ht_dev)->k2[4]),

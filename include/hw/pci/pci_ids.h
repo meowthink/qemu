@@ -192,6 +192,7 @@
 #define PCI_DEVICE_ID_APPLE_UNI_N_AGP    0x0020
 #define PCI_DEVICE_ID_APPLE_U3_AGP       0x004b
 #define PCI_DEVICE_ID_APPLE_U3_HT        0x0057
+#define PCI_DEVICE_ID_APPLE_K2_ATA100    0x0043
 #define PCI_DEVICE_ID_APPLE_K2_USB       0x0040
 #define PCI_DEVICE_ID_APPLE_K2_HT_PCI_1  0x0045
 /* Apple GMAC (Gigabit Ethernet) controllers - all based on Sun GEM */

@@ -567,4 +567,149 @@ void macio_ide_register_dma(MACIOIDEState *s)
                            pmac_ide_transfer, pmac_ide_flush, s);
 }
 
+
+/*
+ * K2 ATA-100 ("k2-uata"): the U3/K2 south bridge's PATA controller as a PCI
+ * function.  BAR: feature control at 0, DBDMA at 0x1000, taskfile at 0x2000.
+ * Ported from cat7's powermac73 hw/ide/macio.c onto this tree's IDE/DBDMA
+ * API (ide_bus_reset() takes one argument here; no DBDMA_set_address_space
+ * existed, one was added).
+ */
+static uint64_t k2_uata_fcr_read(void *opaque, hwaddr addr, unsigned size)
+{
+    K2UATAState *s = opaque;
+
+    return addr ? 0 : s->fcr;
+}
+
+static void k2_uata_fcr_write(void *opaque, hwaddr addr, uint64_t val,
+                              unsigned size)
+{
+    K2UATAState *s = opaque;
+
+    if (!addr) {
+        s->fcr = val;
+    }
+}
+
+static const MemoryRegionOps k2_uata_fcr_ops = {
+    .read = k2_uata_fcr_read,
+    .write = k2_uata_fcr_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 1, .max_access_size = 4 },
+};
+
+/*
+ * The drive interrupts on INTA, and its line is also the channel's s7, which
+ * Apple's driver waits on before a transfer ends.  The DMA interrupt has an
+ * MPIC input of its own.
+ */
+static void k2_uata_set_irq(void *opaque, int n, int level)
+{
+    K2UATAState *s = opaque;
+
+    s->irq_level[n] = level;
+    if (n == MACIO_IDE_PMAC_IDE_IRQ) {
+        DBDMA_set_devstat(&s->dbdma, 0, level ? 0x80 : 0);
+        pci_set_irq(PCI_DEVICE(s), level);
+    } else {
+        qemu_set_irq(s->dma_irq, level);
+    }
+}
+
+static void k2_uata_realize(PCIDevice *d, Error **errp)
+{
+    K2UATAState *s = K2_UATA(d);
+    SysBusDevice *sbd;
+
+    pci_config_set_interrupt_pin(d->config, 1);
+
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->dbdma), errp)) {
+        return;
+    }
+    DBDMA_set_address_space(&s->dbdma, pci_device_iommu_address_space(d));
+
+    qdev_prop_set_uint32(DEVICE(&s->ide), "channel", 0);
+    object_property_set_link(OBJECT(&s->ide), "dbdma", OBJECT(&s->dbdma),
+                             &error_abort);
+    macio_ide_register_dma(&s->ide);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->ide), errp)) {
+        return;
+    }
+    sbd = SYS_BUS_DEVICE(&s->ide);
+    sysbus_connect_irq(sbd, 0, qemu_allocate_irq(k2_uata_set_irq, s,
+                                                 MACIO_IDE_PMAC_IDE_IRQ));
+    sysbus_connect_irq(sbd, 1, qemu_allocate_irq(k2_uata_set_irq, s,
+                                                 MACIO_IDE_PMAC_DMA_IRQ));
+    DBDMA_set_devstat(&s->dbdma, 0, 0);
+
+    memory_region_init(&s->bar, OBJECT(s), "k2-uata", 0x4000);
+    memory_region_init_io(&s->fcr_mem, OBJECT(s), &k2_uata_fcr_ops, s,
+                          "k2-uata-fcr", 0x1000);
+    memory_region_add_subregion(&s->bar, 0x0000, &s->fcr_mem);
+    memory_region_add_subregion(&s->bar, 0x1000,
+                                sysbus_mmio_get_region(
+                                    SYS_BUS_DEVICE(&s->dbdma), 0));
+    memory_region_add_subregion(&s->bar, 0x2000, &s->ide.mem);
+    pci_register_bar(d, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->bar);
+}
+
+static void k2_uata_init(Object *obj)
+{
+    K2UATAState *s = K2_UATA(obj);
+
+    object_initialize_child(obj, "dbdma", &s->dbdma, TYPE_MAC_DBDMA);
+    object_initialize_child(obj, "ide", &s->ide, TYPE_MACIO_IDE);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->dma_irq, "dma", 1);
+}
+
+void k2_uata_init_drives(K2UATAState *s, DriveInfo **hd_table)
+{
+    macio_ide_init_drives(&s->ide, hd_table);
+}
+
+static const VMStateDescription vmstate_k2_uata = {
+    .name = "k2-uata",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_PCI_DEVICE(parent_obj, K2UATAState),
+        VMSTATE_UINT32(fcr, K2UATAState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static void k2_uata_class_init(ObjectClass *oc, const void *data)
+{
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(oc);
+    DeviceClass *dc = DEVICE_CLASS(oc);
+
+    k->realize = k2_uata_realize;
+    k->vendor_id = PCI_VENDOR_ID_APPLE;
+    k->device_id = PCI_DEVICE_ID_APPLE_K2_ATA100;
+    k->class_id = PCI_CLASS_OTHERS << 8;
+    dc->vmsd = &vmstate_k2_uata;
+    dc->user_creatable = false;
+    set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
+}
+
+static const TypeInfo k2_uata_type_info = {
+    .name = TYPE_K2_UATA,
+    .parent = TYPE_PCI_DEVICE,
+    .instance_size = sizeof(K2UATAState),
+    .instance_init = k2_uata_init,
+    .class_init = k2_uata_class_init,
+    .interfaces = (const InterfaceInfo[]) {
+        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+        { },
+    },
+};
+
 type_init(macio_ide_register_types)
+
+static void k2_uata_register_types(void)
+{
+    type_register_static(&k2_uata_type_info);
+}
+
+type_init(k2_uata_register_types)

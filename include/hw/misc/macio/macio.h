@@ -147,6 +147,20 @@ OBJECT_DECLARE_SIMPLE_TYPE(K2UATAState, K2_UATA)
 void macio_ide_init_drives(MACIOIDEState *ide, DriveInfo **hd_table);
 void macio_ide_register_dma(MACIOIDEState *ide);
 
+struct K2UATAState {
+    PCIDevice parent_obj;
+
+    MemoryRegion bar;
+    MemoryRegion fcr_mem;
+    uint32_t fcr;
+    bool irq_level[2];          /* DMA, IDE */
+    qemu_irq dma_irq;           /* separate MPIC source for the DMA interrupt */
+    DBDMAState dbdma;
+    MACIOIDEState ide;
+};
+
+void k2_uata_init_drives(K2UATAState *s, DriveInfo **hd_table);
+
 #define TYPE_MACIO "macio"
 OBJECT_DECLARE_SIMPLE_TYPE(MacIOState, MACIO)
 
