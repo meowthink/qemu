@@ -171,7 +171,16 @@ struct DisasContext {
     target_ulong cia;  /* current instruction address */
     uint32_t opcode;
     /* Routine used to access memory */
-    bool pr, hv, dr, le_mode, bytelaneswap;
+    bool pr, hv, dr;
+    /*
+     * le_align_6xx: 6xx dedicated misaligned exception model
+     * le_mode: triple state flag
+     *   0 = big endian
+     *   1 = address munged
+     *   2 = little endian
+     */
+    bool le_align_6xx;
+    int le_mode;
     bool lazy_tlb_flush;
     bool need_access_type;
     int mem_idx;
@@ -203,23 +212,10 @@ struct DisasContext {
     uint64_t insns_flags;
     uint64_t insns_flags2;
 };
-
 #define DISAS_EXIT         DISAS_TARGET_0  /* exit to main loop, pc updated */
 #define DISAS_EXIT_UPDATE  DISAS_TARGET_1  /* exit to main loop, pc stale */
 #define DISAS_CHAIN        DISAS_TARGET_2  /* lookup next tb, pc updated */
 #define DISAS_CHAIN_UPDATE DISAS_TARGET_3  /* lookup next tb, pc stale */
-
-/* Return true if address swizzling required */
-static inline bool need_addrswizzle_le(const DisasContext *ctx)
-{
-    /* Here is the hack for everything before PPC_64B:
-     * since le_mode is set by MSR[LE], judge by bytelaneswap
-     *     true: pure le_mode
-     *     false: be_mode with address swizzled
-     */
-    return ctx->le_mode && !ctx->bytelaneswap &&
-           !(ctx->insns_flags & PPC_64B);
-}
 
 static inline bool is_ppe(const DisasContext *ctx)
 {
@@ -234,7 +230,7 @@ static inline bool is_ppe(const DisasContext *ctx)
  */
 static inline MemOp ppc_code_endian_dc(const DisasContext *ctx)
 {
-    return MO_BE ^ (ctx->le_mode * MO_BSWAP);
+    return (ctx->le_mode == 2) ? MO_LE : MO_BE;
 }
 
 /* True when active word size < size of target_long.  */
@@ -2615,14 +2611,40 @@ static TCGv do_ea_calc(DisasContext *ctx, int ra, TCGv displ)
  * generate the correct address for a little endian access. For more
  * information see https://wiki.preterhuman.net/images/f/fc/Endian.pdf
  */
-static inline void gen_addr_swizzle_le(TCGv ret, TCGv addr, MemOp op)
+static inline void gen_addr_swizzle_le(TCGv ret, TCGv addr, MemOp op,
+                                       TCGv aoff)
 {
-    TCGv aoff = tcg_temp_new();
+    TCGv a = aoff ? aoff : tcg_temp_new();
 
-    tcg_gen_andi_tl(aoff, addr, memop_size(op) - 1);
+    tcg_gen_andi_tl(a, addr, memop_size(op) - 1);
     tcg_gen_andi_tl(ret, addr, ~(memop_size(op) - 1));
     tcg_gen_xori_tl(ret, ret, 8 - memop_size(op));
-    tcg_gen_sub_tl(ret, ret, aoff);
+    tcg_gen_sub_tl(ret, ret, a);
+}
+
+/*
+ * Helper to raise an alignment exception for any access that is not
+ * naturally aligned on 6xx only. Put EA-> DAR when rasied.
+ */
+static void gen_align_check_le(DisasContext *ctx, TCGv ea, TCGv aoff)
+{
+    DisasJumpType old_is_jmp = ctx->base.is_jmp;
+    TCGLabel *l = gen_new_label();
+
+    tcg_gen_brcondi_tl(TCG_COND_EQ, aoff, 0, l);
+    tcg_gen_st_tl(ea, tcg_env, offsetof(CPUPPCState, spr[SPR_DAR]));
+    gen_align_no_le(ctx);
+    ctx->base.is_jmp = old_is_jmp;
+    gen_set_label(l);
+}
+
+/*
+ * Helper to judge if we should call the above helper.
+ */
+static inline bool align_check_le(DisasContext *ctx, MemOp memop)
+{
+    return (memop_size(memop) > 1) && ((memop & MO_ALIGN) ?
+        (ctx->le_mode && !(ctx->insns_flags & PPC_64B)) : ctx->le_align_6xx);
 }
 
 #if defined(TARGET_PPC64)
@@ -2648,12 +2670,28 @@ static TCGv do_ea_calc_ra(DisasContext *ctx, int ra)
 static void gen_ld_tl(DisasContext *ctx, TCGv val, TCGv addr, TCGArg idx,
                       MemOp memop)
 {
-    if (!need_addrswizzle_le(ctx)) {
-        tcg_gen_qemu_ld_tl(val, addr, idx, memop);
-    } else {
-        TCGv taddr = tcg_temp_new();
-        gen_addr_swizzle_le(taddr, addr, memop);
-        tcg_gen_qemu_ld_tl(val, taddr, idx, memop);
+    TCGv ea = addr;
+    TCGv aoff = NULL, taddr = NULL;
+
+    switch (ctx->le_mode) {
+    case 1:
+        taddr = tcg_temp_new();
+        aoff = tcg_temp_new();
+        gen_addr_swizzle_le(taddr, addr, memop, aoff);
+        ea = taddr;
+        /* fall through */
+    case 2:
+        if (unlikely(align_check_le(ctx, memop))) {
+            if (aoff == NULL) {
+                aoff = tcg_temp_new();
+                tcg_gen_andi_tl(aoff, addr, memop_size(memop) - 1);
+            }
+            gen_align_check_le(ctx, addr, aoff);
+        }
+        /* fall through */
+    default:
+        tcg_gen_qemu_ld_tl(val, ea, idx, memop);
+        break;
     }
 }
 
@@ -2677,12 +2715,28 @@ GEN_QEMU_LOAD_TL(ld32ur, BSWAP_MEMOP(MO_UL))
 static void gen_ld_i64(DisasContext *ctx, TCGv_i64 val, TCGv addr,
                       TCGArg idx, MemOp memop)
 {
-    if (!need_addrswizzle_le(ctx)) {
-        tcg_gen_qemu_ld_i64(val, addr, idx, memop);
-    } else {
-        TCGv taddr = tcg_temp_new();
-        gen_addr_swizzle_le(taddr, addr, memop);
-        tcg_gen_qemu_ld_i64(val, taddr, idx, memop);
+    TCGv ea = addr;
+    TCGv aoff = NULL, taddr = NULL;
+
+    switch (ctx->le_mode) {
+    case 1:
+        taddr = tcg_temp_new();
+        aoff = tcg_temp_new();
+        gen_addr_swizzle_le(taddr, addr, memop, aoff);
+        ea = taddr;
+        /* fall through */
+    case 2:
+        if (unlikely(align_check_le(ctx, memop))) {
+            if (aoff == NULL) {
+                aoff = tcg_temp_new();
+                tcg_gen_andi_tl(aoff, addr, memop_size(memop) - 1);
+            }
+            gen_align_check_le(ctx, addr, aoff);
+        }
+        /* fall through */
+    default:
+        tcg_gen_qemu_ld_i64(val, ea, idx, memop);
+        break;
     }
 }
 
@@ -2707,12 +2761,28 @@ GEN_QEMU_LOAD_64(ld64ur, BSWAP_MEMOP(MO_UQ))
 static void gen_st_tl(DisasContext *ctx, TCGv val, TCGv addr, TCGArg idx,
                       MemOp memop)
 {
-    if (!need_addrswizzle_le(ctx)) {
-        tcg_gen_qemu_st_tl(val, addr, idx, memop);
-    } else {
-        TCGv taddr = tcg_temp_new();
-        gen_addr_swizzle_le(taddr, addr, memop);
-        tcg_gen_qemu_st_tl(val, taddr, idx, memop);
+    TCGv ea = addr;
+    TCGv aoff = NULL, taddr = NULL;
+
+    switch (ctx->le_mode) {
+    case 1:
+        taddr = tcg_temp_new();
+        aoff = tcg_temp_new();
+        gen_addr_swizzle_le(taddr, addr, memop, aoff);
+        ea = taddr;
+        /* fall through */
+    case 2:
+        if (unlikely(align_check_le(ctx, memop))) {
+            if (aoff == NULL) {
+                aoff = tcg_temp_new();
+                tcg_gen_andi_tl(aoff, addr, memop_size(memop) - 1);
+            }
+            gen_align_check_le(ctx, addr, aoff);
+        }
+        /* fall through */
+    default:
+        tcg_gen_qemu_st_tl(val, ea, idx, memop);
+        break;
     }
 }
 
@@ -2736,12 +2806,28 @@ GEN_QEMU_STORE_TL(st32r, BSWAP_MEMOP(MO_UL))
 static void gen_st_i64(DisasContext *ctx, TCGv_i64 val, TCGv addr,
                       TCGArg idx, MemOp memop)
 {
-    if (!need_addrswizzle_le(ctx)) {
-        tcg_gen_qemu_st_i64(val, addr, idx, memop);
-    } else {
-        TCGv taddr = tcg_temp_new();
-        gen_addr_swizzle_le(taddr, addr, memop);
-        tcg_gen_qemu_st_i64(val, taddr, idx, memop);
+    TCGv ea = addr;
+    TCGv aoff = NULL, taddr = NULL;
+
+    switch (ctx->le_mode) {
+    case 1:
+        taddr = tcg_temp_new();
+        aoff = tcg_temp_new();
+        gen_addr_swizzle_le(taddr, addr, memop, aoff);
+        ea = taddr;
+        /* fall through */
+    case 2:
+        if (unlikely(align_check_le(ctx, memop))) {
+            if (aoff == NULL) {
+                aoff = tcg_temp_new();
+                tcg_gen_andi_tl(aoff, addr, memop_size(memop) - 1);
+            }
+            gen_align_check_le(ctx, addr, aoff);
+        }
+        /* fall through */
+    default:
+        tcg_gen_qemu_st_i64(val, ea, idx, memop);
+        break;
     }
 }
 
@@ -3284,6 +3370,7 @@ static void gen_conditional_store(DisasContext *ctx, MemOp memop)
     TCGv cr0;
     TCGv t0;
     int rs = rS(ctx->opcode);
+    TCGv taddr = cpu_reserve;
 
     lfail = gen_new_label();
     EA = tcg_temp_new();
@@ -3293,20 +3380,24 @@ static void gen_conditional_store(DisasContext *ctx, MemOp memop)
     tcg_gen_mov_tl(cr0, cpu_so);
     gen_set_access_type(ctx, ACCESS_RES);
     gen_addr_reg_index(ctx, EA);
+    if (unlikely(align_check_le(ctx, memop | MO_ALIGN))) {
+        TCGv aoff = tcg_temp_new();
+        tcg_gen_andi_tl(aoff, EA, memop_size(memop) - 1);
+        gen_align_check_le(ctx, EA, aoff);
+    }
     tcg_gen_brcond_tl(TCG_COND_NE, EA, cpu_reserve, lfail);
     tcg_gen_brcondi_tl(TCG_COND_NE, cpu_reserve_length, memop_size(memop), lfail);
 
-    if (!need_addrswizzle_le(ctx)) {
-        tcg_gen_atomic_cmpxchg_tl(t0, cpu_reserve, cpu_reserve_val,
-                                  cpu_gpr[rs], ctx->mem_idx,
-                                  DEF_MEMOP(memop) | MO_ALIGN);
-    } else {
-        TCGv taddr = tcg_temp_new();
-
-        gen_addr_swizzle_le(taddr, cpu_reserve, memop);
+    switch (ctx->le_mode) {
+    case 1:
+        taddr = tcg_temp_new();
+        gen_addr_swizzle_le(taddr, cpu_reserve, memop, NULL);
+        /* fall through */
+    default:
         tcg_gen_atomic_cmpxchg_tl(t0, taddr, cpu_reserve_val,
                                   cpu_gpr[rs], ctx->mem_idx,
                                   DEF_MEMOP(memop) | MO_ALIGN);
+        break;
     }
     tcg_gen_setcond_tl(TCG_COND_EQ, t0, t0, cpu_reserve_val);
     tcg_gen_shli_tl(t0, t0, CRF_EQ_BIT);
@@ -6618,10 +6709,23 @@ static void ppc_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->insns_flags2 = env->insns_flags2;
     ctx->access_type = -1;
     ctx->need_access_type = !mmu_is_64bit(env->mmu_model);
-    ctx->le_mode = (hflags >> HFLAGS_LE) & 1;
-    ctx->bytelaneswap = env->bytelaneswap;
-    ctx->default_tcg_memop_mask = (!need_addrswizzle_le(ctx) &&
-                                   ctx->le_mode) ? MO_LE : MO_BE;
+    /* Exclude e300 true little endian mode (HID2[LET]) */
+    bool true_le = (env->excp_model == POWERPC_EXCP_6xx && (env->spr[SPR_HID2] & (1u << 27)));
+    /* Otherwise 6xx should obey a more strict misalign exception model */
+    ctx->le_align_6xx = (env->excp_model == POWERPC_EXCP_6xx && !true_le);
+    /* Keep bytelaneswap until the latch counted down */
+    if (env->bytelaneswap_latch > 0) {
+        ctx->base.max_insns = 1;
+        env->bytelaneswap_latch --;
+        if (env->bytelaneswap_latch == 0) {
+            env->bytelaneswap = !env->bytelaneswap;
+        }
+    }
+    ctx->le_mode = 0;
+    if ((hflags >> HFLAGS_LE) & 1) {
+        ctx->le_mode = (env->bytelaneswap || true_le || (env->insns_flags & PPC_64B)) ? 2 : 1;
+    }
+    ctx->default_tcg_memop_mask = (ctx->le_mode == 2) ? MO_LE : MO_BE;
     ctx->flags = env->flags;
 #if defined(TARGET_PPC64)
     ctx->excp_model = env->excp_model;
@@ -6686,10 +6790,10 @@ static void ppc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
               ctx->base.pc_next, ctx->mem_idx, (int)msr_ir);
 
     ctx->cia = pc = ctx->base.pc_next;
-    if (!need_addrswizzle_le(ctx)) {
-        insn = translator_ldl_end(env, dcbase, pc, mo_endian);
-    } else {
+    if (ctx->le_mode == 1) {
         insn = translator_ldl_end(env, dcbase, pc ^ 4, MO_BE);
+    } else {
+        insn = translator_ldl_end(env, dcbase, pc, mo_endian);
     }
     ctx->base.pc_next = pc += 4;
 
@@ -6719,6 +6823,7 @@ static void ppc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     if (ctx->base.is_jmp == DISAS_NEXT && !(pc & ~TARGET_PAGE_MASK)) {
         ctx->base.is_jmp = DISAS_TOO_MANY;
     }
+
 }
 
 static void ppc_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)

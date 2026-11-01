@@ -645,9 +645,11 @@ static void gen_mtfsfi(DisasContext *ctx)
 
 static void gen_qemu_ld32fs(DisasContext *ctx, TCGv_i64 dest, TCGv addr)
 {
-    TCGv_i32 tmp = tcg_temp_new_i32();
-    tcg_gen_qemu_ld_i32(tmp, addr, ctx->mem_idx, DEF_MEMOP(MO_UL));
-    gen_helper_todouble(dest, tmp);
+    TCGv tmp = tcg_temp_new();
+    TCGv_i32 tmp32 = tcg_temp_new_i32();
+    gen_ld_tl(ctx, tmp, addr, ctx->mem_idx, DEF_MEMOP(MO_UL));
+    tcg_gen_trunc_tl_i32(tmp32, tmp);
+    gen_helper_todouble(dest, tmp32);
 }
 
 /* lfdepx (external PID lfdx) */
@@ -789,8 +791,10 @@ static void glue(gen_, name##x)(DisasContext *ctx)                            \
 static void gen_qemu_st32fs(DisasContext *ctx, TCGv_i64 src, TCGv addr)
 {
     TCGv_i32 tmp = tcg_temp_new_i32();
+    TCGv t = tcg_temp_new();
     gen_helper_tosingle(tmp, src);
-    tcg_gen_qemu_st_i32(tmp, addr, ctx->mem_idx, DEF_MEMOP(MO_UL));
+    tcg_gen_extu_i32_tl(t, tmp);
+    gen_st_tl(ctx, t, addr, ctx->mem_idx, DEF_MEMOP(MO_UL));
 }
 
 /* stfdepx (external PID lfdx) */
@@ -900,6 +904,11 @@ static bool do_lsfpsd(DisasContext *ctx, int rt, int ra, TCGv displ,
     gen_set_access_type(ctx, ACCESS_FLOAT);
     t0 = tcg_temp_new_i64();
     ea = do_ea_calc(ctx, ra, displ);
+    if (!(ctx->insns_flags & PPC_64B)) {
+        TCGv aoff = tcg_temp_new();
+        tcg_gen_andi_tl(aoff, ea, 3);
+        gen_align_check_le(ctx, ea, aoff);
+    }
     if (store) {
         get_fpr(t0, rt);
         if (single) {
