@@ -74,6 +74,7 @@
 #include "kvm_ppc.h"
 #include "hw/usb/usb.h"
 #include "hw/core/sysbus.h"
+#include "hw/irq.h"
 #include "trace.h"
 
 #define MAX_IDE_BUS 2
@@ -129,12 +130,26 @@ static void ppc_core99_reset(void *opaque)
     cpu->env.nip = PROM_BASE + 0x100;
 }
 
+static void cpu_kick(void *opaque, int n, int level)
+{
+    PowerPCCPU *cpu = opaque;
+    CPUState *cs = CPU(cpu);
+    
+    
+    if (level) {
+        cpu->env.excp_prefix = 0;
+        cpu_reset(cs);
+        ppc_cpu_do_system_reset(cs);
+    }
+}
+
 /* PowerPC Mac99 hardware initialisation */
 static void ppc_core99_init(MachineState *machine)
 {
     Core99MachineState *core99_machine = CORE99_MACHINE(machine);
     MachineClass *mc = MACHINE_GET_CLASS(machine);
-    PowerPCCPU *cpu = NULL;
+    qemu_irq kick;
+    PowerPCCPU **cpus = NULL;
     CPUPPCState *env = NULL;
     char *filename;
     IrqLines *openpic_irqs;
@@ -158,14 +173,17 @@ static void ppc_core99_init(MachineState *machine)
     uint64_t tbfreq = kvm_enabled() ? kvmppc_get_tbfreq() : TBFREQ;
 
     /* init CPUs */
+    cpus = g_new0(PowerPCCPU *, machine->smp.cpus);
     for (i = 0; i < machine->smp.cpus; i++) {
-        cpu = POWERPC_CPU(cpu_create(machine->cpu_type));
-        env = &cpu->env;
-
+        cpus[i] = POWERPC_CPU(cpu_create(machine->cpu_type));
+        /* Secondary CPUs start halted */
+        object_property_set_bool(OBJECT(cpus[i]), "start-powered-off", i != 0,
+                                 &error_abort);
         /* Set time-base frequency to 100 Mhz */
-        cpu_ppc_tb_init(env, TBFREQ);
-        qemu_register_reset(ppc_core99_reset, cpu);
+        cpu_ppc_tb_init(&cpus[i]->env, TBFREQ);
+        qemu_register_reset(ppc_core99_reset, cpus[i]);
     }
+    env = &cpus[0]->env;
 
     /* allocate RAM */
     if (machine->ram_size > 2 * GiB) {
@@ -228,9 +246,6 @@ static void ppc_core99_init(MachineState *machine)
         ppc_boot_device = 'm';
     } else {
         ppc_boot_device = '\0';
-        /* We consider that NewWorld PowerMac never have any floppy drive
-         * For now, OHW cannot boot from the network.
-         */
         for (i = 0; machine->boot_config.order[i] != '\0'; i++) {
             if (machine->boot_config.order[i] >= 'c' &&
                 machine->boot_config.order[i] <= 'f') {
@@ -245,22 +260,18 @@ static void ppc_core99_init(MachineState *machine)
     }
 
     openpic_irqs = g_new0(IrqLines, machine->smp.cpus);
-    dev = DEVICE(cpu);
     for (i = 0; i < machine->smp.cpus; i++) {
-        /* Mac99 IRQ connection between OpenPIC outputs pins
-         * and PowerPC input pins
-         */
+        dev = DEVICE(cpus[i]);
+        /* Mac99 IRQ connection between OpenPIC outputs pins and PowerPC input pins */
         switch (PPC_INPUT(env)) {
         case PPC_FLAGS_INPUT_6xx:
             openpic_irqs[i].irq[OPENPIC_OUTPUT_INT] =
                 qdev_get_gpio_in(dev, PPC6xx_INPUT_INT);
             openpic_irqs[i].irq[OPENPIC_OUTPUT_CINT] =
-                 qdev_get_gpio_in(dev, PPC6xx_INPUT_INT);
+                qdev_get_gpio_in(dev, PPC6xx_INPUT_INT);
             openpic_irqs[i].irq[OPENPIC_OUTPUT_MCK] =
                 qdev_get_gpio_in(dev, PPC6xx_INPUT_MCP);
-            /* Not connected ? */
             openpic_irqs[i].irq[OPENPIC_OUTPUT_DEBUG] = NULL;
-            /* Check this */
             openpic_irqs[i].irq[OPENPIC_OUTPUT_RESET] =
                 qdev_get_gpio_in(dev, PPC6xx_INPUT_HRESET);
             break;
@@ -272,13 +283,11 @@ static void ppc_core99_init(MachineState *machine)
                 qdev_get_gpio_in(dev, PPC970_INPUT_INT);
             openpic_irqs[i].irq[OPENPIC_OUTPUT_MCK] =
                 qdev_get_gpio_in(dev, PPC970_INPUT_MCP);
-            /* Not connected ? */
             openpic_irqs[i].irq[OPENPIC_OUTPUT_DEBUG] = NULL;
-            /* Check this */
             openpic_irqs[i].irq[OPENPIC_OUTPUT_RESET] =
                 qdev_get_gpio_in(dev, PPC970_INPUT_HRESET);
             break;
-#endif /* defined(TARGET_PPC64) */
+#endif
         default:
             error_report("Bus model not supported on mac99 machine");
             exit(1);
@@ -294,47 +303,37 @@ static void ppc_core99_init(MachineState *machine)
     if (PPC_INPUT(env) == PPC_FLAGS_INPUT_970) {
         machine_arch = ARCH_MAC99_U3;
         /* 970 gets a U3 bus */
-        /* Uninorth AGP bus */
         uninorth_pci_dev = qdev_new(TYPE_U3_AGP_HOST_BRIDGE);
         s = SYS_BUS_DEVICE(uninorth_pci_dev);
         sysbus_realize_and_unref(s, &error_fatal);
         sysbus_mmio_map(s, 0, 0xf0800000);
         sysbus_mmio_map(s, 1, 0xf0c00000);
-        /* PCI hole */
         memory_region_add_subregion(get_system_memory(), 0x80000000,
                                     sysbus_mmio_get_region(s, 2));
-        /* Register 8 MB of ISA IO space */
         memory_region_add_subregion(get_system_memory(), 0xf2000000,
                                     sysbus_mmio_get_region(s, 3));
     } else {
         machine_arch = ARCH_MAC99;
-        /* Use values found on a real PowerMac */
-        /* Uninorth AGP bus */
         uninorth_agp_dev = qdev_new(TYPE_UNI_NORTH_AGP_HOST_BRIDGE);
         s = SYS_BUS_DEVICE(uninorth_agp_dev);
         sysbus_realize_and_unref(s, &error_fatal);
         sysbus_mmio_map(s, 0, 0xf0800000);
         sysbus_mmio_map(s, 1, 0xf0c00000);
 
-        /* Uninorth internal bus */
-        uninorth_internal_dev = qdev_new(
-                                TYPE_UNI_NORTH_INTERNAL_PCI_HOST_BRIDGE);
+        uninorth_internal_dev = qdev_new(TYPE_UNI_NORTH_INTERNAL_PCI_HOST_BRIDGE);
         s = SYS_BUS_DEVICE(uninorth_internal_dev);
         sysbus_realize_and_unref(s, &error_fatal);
         sysbus_mmio_map(s, 0, 0xf4800000);
         sysbus_mmio_map(s, 1, 0xf4c00000);
 
-        /* Uninorth main bus - this must be last to make it the default */
         uninorth_pci_dev = qdev_new(TYPE_UNI_NORTH_PCI_HOST_BRIDGE);
         qdev_prop_set_uint32(uninorth_pci_dev, "ofw-addr", 0xf2000000);
         s = SYS_BUS_DEVICE(uninorth_pci_dev);
         sysbus_realize_and_unref(s, &error_fatal);
         sysbus_mmio_map(s, 0, 0xf2800000);
         sysbus_mmio_map(s, 1, 0xf2c00000);
-        /* PCI hole */
         memory_region_add_subregion(get_system_memory(), 0x80000000,
                                     sysbus_mmio_get_region(s, 2));
-        /* Register 8 MB of ISA IO space */
         memory_region_add_subregion(get_system_memory(), 0xf2000000,
                                     sysbus_mmio_get_region(s, 3));
     }
@@ -344,7 +343,6 @@ static void ppc_core99_init(MachineState *machine)
     has_adb = (core99_machine->via_config == CORE99_VIA_CONFIG_CUDA ||
                core99_machine->via_config == CORE99_VIA_CONFIG_PMU_ADB);
 
-    /* init basic PC hardware */
     pci_bus = PCI_HOST_BRIDGE(uninorth_pci_dev)->bus;
 
     /* MacIO */
@@ -358,13 +356,30 @@ static void ppc_core99_init(MachineState *machine)
     qdev_prop_set_chr(dev, "chrA", serial_hd(0));
     qdev_prop_set_chr(dev, "chrB", serial_hd(1));
 
+    pic_dev = DEVICE(object_resolve_path_component(macio, "pic"));
+    qdev_prop_set_uint32(pic_dev, "nb_cpus", machine->smp.cpus);
+
     pci_realize_and_unref(PCI_DEVICE(macio), pci_bus, &error_fatal);
 
-    pic_dev = DEVICE(object_resolve_path_component(macio, "pic"));
-    for (i = 0; i < 4; i++) {
-        qdev_connect_gpio_out(uninorth_pci_dev, i,
-                              qdev_get_gpio_in(pic_dev, 0x1b + i));
+    /* --- Connect GPIO reset IRQs for secondary CPUs --- */
+    s = SYS_BUS_DEVICE(object_resolve_path_component(macio, "gpio"));
+    if (machine->smp.cpus > 1) {
+        /* CPU1 reset: use GPIO 4 */
+        kick = qemu_allocate_irq(cpu_kick, cpus[1], 1);
+        sysbus_connect_irq(s, 4, kick);
     }
+    if (machine->smp.cpus > 2) {
+        /* CPU2 reset: use GPIO 5 */
+        kick = qemu_allocate_irq(cpu_kick, cpus[2], 2);
+        sysbus_connect_irq(s, 5, kick);
+    }
+    if (machine->smp.cpus > 3) {
+        /* CPU3 reset: use GPIO 6 */
+        kick = qemu_allocate_irq(cpu_kick, cpus[3], 3);
+        sysbus_connect_irq(s, 6, kick);
+    }
+
+
 
     /* TODO: additional PCI buses only wired up for 32-bit machines */
     if (PPC_INPUT(env) != PPC_FLAGS_INPUT_970) {
@@ -373,7 +388,6 @@ static void ppc_core99_init(MachineState *machine)
             qdev_connect_gpio_out(uninorth_agp_dev, i,
                                   qdev_get_gpio_in(pic_dev, 0x1b + i));
         }
-
         /* Uninorth internal bus */
         for (i = 0; i < 4; i++) {
             qdev_connect_gpio_out(uninorth_internal_dev, i,
@@ -391,12 +405,10 @@ static void ppc_core99_init(MachineState *machine)
     }
     g_free(openpic_irqs);
 
-    /* We only emulate 2 out of 3 IDE controllers for now */
+    /* IDE controllers */
     ide_drive_get(hd, ARRAY_SIZE(hd));
-
     macio_ide = MACIO_IDE(object_resolve_path_component(macio, "ide[0]"));
     macio_ide_init_drives(macio_ide, hd);
-
     macio_ide = MACIO_IDE(object_resolve_path_component(macio, "ide[1]"));
     macio_ide_init_drives(macio_ide, &hd[MAX_IDE_DEVS]);
 
@@ -406,23 +418,18 @@ static void ppc_core99_init(MachineState *machine)
         } else {
             dev = DEVICE(object_resolve_path_component(macio, "cuda"));
         }
-
         adb_bus = qdev_get_child_bus(dev, "adb.0");
         dev = qdev_new(TYPE_ADB_KEYBOARD);
         qdev_realize_and_unref(dev, adb_bus, &error_fatal);
-
         dev = qdev_new(TYPE_ADB_MOUSE);
         qdev_realize_and_unref(dev, adb_bus, &error_fatal);
     }
 
     if (machine->usb) {
         pci_create_simple(pci_bus, -1, "pci-ohci");
-
-        /* U3 needs to use USB for input because Linux doesn't support via-cuda
-        on PPC64 */
+        /* U3 needs to use USB for input because Linux doesn't support via-cuda on PPC64 */
         if (!has_adb || machine_arch == ARCH_MAC99_U3) {
             USBBus *usb_bus;
-
             usb_bus = USB_BUS(object_resolve_type_unambiguous(TYPE_USB_BUS,
                                                               &error_abort));
             usb_create_simple(usb_bus, "usb-kbd");
@@ -449,8 +456,6 @@ static void ppc_core99_init(MachineState *machine)
 
     /* The NewWorld NVRAM is not located in the MacIO device */
     if (kvm_enabled() && qemu_real_host_page_size() > 4096) {
-        /* We can't combine read-write and read-only in a single page, so
-           move the NVRAM out of ROM again for KVM */
         nvram_addr = 0xFFE00000;
     }
     dev = qdev_new(TYPE_MACIO_NVRAM);
@@ -460,7 +465,6 @@ static void ppc_core99_init(MachineState *machine)
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, nvram_addr);
     nvr = MACIO_NVRAM(dev);
     pmac_format_nvram_partition(nvr, MACIO_NVRAM_SIZE);
-    /* No PCI init: the BIOS will do it */
 
     dev = qdev_new(TYPE_FW_CFG_MEM);
     fw_cfg = FW_CFG(dev);
@@ -498,24 +502,20 @@ static void ppc_core99_init(MachineState *machine)
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_IS_KVM, kvm_enabled());
     if (kvm_enabled()) {
         uint8_t *hypercall;
-
         hypercall = g_malloc(16);
         kvmppc_get_hypercall(env, hypercall, 16);
         fw_cfg_add_bytes(fw_cfg, FW_CFG_PPC_KVM_HC, hypercall, 16);
         fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_KVM_PID, getpid());
     }
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_TBFREQ, tbfreq);
-    /* Mac OS X requires a "known good" clock-frequency value; pass it one. */
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_CLOCKFREQ, CLOCKFREQ);
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_BUSFREQ, BUSFREQ);
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_NVRAM_ADDR, nvram_addr);
 
-    /* MacOS NDRV VGA driver */
     filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, NDRV_VGA_FILENAME);
     if (filename) {
         gchar *ndrv_file;
         gsize ndrv_size;
-
         if (g_file_get_contents(filename, &ndrv_file, &ndrv_size, NULL)) {
             fw_cfg_add_file(fw_cfg, "ndrv/qemu_vga.ndrv", ndrv_file, ndrv_size);
         }
@@ -574,7 +574,7 @@ static void core99_machine_class_init(ObjectClass *oc, const void *data)
     mc->init = ppc_core99_init;
     mc->block_default_type = IF_IDE;
     /* SMP is not supported currently */
-    mc->max_cpus = 1;
+    mc->max_cpus = 4;
     mc->default_boot_order = "cd";
     mc->default_display = "std";
     mc->default_nic = "sungem";
