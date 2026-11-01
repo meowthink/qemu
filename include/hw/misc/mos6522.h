@@ -166,7 +166,11 @@ struct MOS6522State {
     MemoryRegion mem;
     /* VIA registers */
     uint8_t b;
+    uint8_t in_b;
+    uint8_t in_b_mask;
     uint8_t a;
+    uint8_t in_a;
+    uint8_t in_a_mask;
     uint8_t dirb;
     uint8_t dira;
     uint8_t sr;
@@ -218,5 +222,8 @@ extern const VMStateDescription vmstate_mos6522;
 
 uint64_t mos6522_read(void *opaque, hwaddr addr, unsigned size);
 void mos6522_write(void *opaque, hwaddr addr, uint64_t val, unsigned size);
+void mos6522_set_port_input(MOS6522State *s, unsigned port, unsigned bit,
+                            bool level);
+void mos6522_set_sr_input(MOS6522State *s, uint8_t byte);
 
 #endif /* MOS6522_H */

@@ -46,6 +46,41 @@ static const char *mos6522_reg_names[MOS6522_NUM_REGS] = {
     "T2CL", "T2CH", "SR", "ACR", "PCR", "IFR", "IER", "ANH"
 };
 
+/*
+ * TEMPORARY debugging aid: ANS_VIA_DBG[=<max lines>] logs every VIA register
+ * access with its virtual timestamp so a guest handshake can be read in
+ * order.  Capped: a polled handshake emits tens of thousands of lines a
+ * second and the log is written to a file.
+ */
+static uint64_t ans_via_dbg_lines, ans_via_dbg_limit = 400000;
+
+static bool ans_via_dbg_enabled(void)
+{
+    static int cached = -1;
+
+    if (cached < 0) {
+        const char *e = getenv("ANS_VIA_DBG");
+
+        cached = e ? 1 : 0;
+        if (e && atoi(e) > 0) {
+            ans_via_dbg_limit = atoi(e);
+        }
+    }
+    return cached;
+}
+
+static void ans_via_dbg(const char *dir, hwaddr addr, uint32_t val,
+                        MOS6522State *s)
+{
+    if (ans_via_dbg_lines++ >= ans_via_dbg_limit) {
+        return;
+    }
+    fprintf(stderr, "VIA %8" PRId64 " %s %-4s %02x  b=%02x acr=%02x ifr=%02x"
+            " ier=%02x sr=%02x\n",
+            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000, dir,
+            mos6522_reg_names[addr], val, s->b, s->acr, s->ifr, s->ier, s->sr);
+}
+
 
 /* XXX: implement all timer modes */
 
@@ -64,6 +99,13 @@ static void mos6522_update_irq(MOS6522State *s)
     } else {
         qemu_irq_lower(s->irq);
     }
+}
+
+static uint8_t mos6522_port_value(uint8_t latch, uint8_t in, uint8_t in_mask)
+{
+    /* A driven input wins over DIRB: OpenBIOS leaves port B all-outputs
+     * and still expects to sample TREQ. */
+    return (latch & ~in_mask) | (in & in_mask);
 }
 
 static void mos6522_set_irq(void *opaque, int n, int level)
@@ -716,7 +758,7 @@ uint64_t mos6522_read(void *opaque, hwaddr addr, unsigned size)
     }
     switch (addr) {
     case VIA_REG_B:
-        val = s->b;
+        val = mos6522_port_value(s->b, s->in_b, s->in_b_mask);
         ctrl = (s->pcr & CB2_CTRL_MASK) >> CB2_CTRL_SHIFT;
         if (!(ctrl & C2_IND)) {
             s->ifr &= ~CB2_INT;
@@ -728,7 +770,7 @@ uint64_t mos6522_read(void *opaque, hwaddr addr, unsigned size)
        qemu_log_mask(LOG_UNIMP, "Read access to register A with handshake");
        /* fall through */
     case VIA_REG_ANH:
-        val = s->a;
+        val = mos6522_port_value(s->a, s->in_a, s->in_a_mask);
         ctrl = (s->pcr & CA2_CTRL_MASK) >> CA2_CTRL_SHIFT;
         if (!(ctrl & C2_IND)) {
             s->ifr &= ~CA2_INT;
@@ -796,6 +838,10 @@ uint64_t mos6522_read(void *opaque, hwaddr addr, unsigned size)
 
     trace_mos6522_read(addr, mos6522_reg_names[addr], val);
 
+    if (ans_via_dbg_enabled()) {
+        ans_via_dbg("R", addr, val, s);
+    }
+
     return val;
 }
 
@@ -806,6 +852,9 @@ void mos6522_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
     int ctrl;
 
     trace_mos6522_write(addr, mos6522_reg_names[addr], val);
+    if (ans_via_dbg_enabled()) {
+        ans_via_dbg("W", addr, val, s);
+    }
     s->t2_counter_run = 0;
 
     switch (addr) {
@@ -1060,6 +1109,27 @@ void hmp_info_via(Monitor *mon, const QDict *qdict)
     monitor_puts(mon, info->human_readable_text);
 }
 
+void mos6522_set_port_input(MOS6522State *s, unsigned port, unsigned bit,
+                            bool level)
+{
+    uint8_t mask = 1u << bit;
+
+    if (port == 0) {
+        s->in_a_mask |= mask;
+        s->in_a = (s->in_a & ~mask) | (level ? mask : 0);
+    } else {
+        s->in_b_mask |= mask;
+        s->in_b = (s->in_b & ~mask) | (level ? mask : 0);
+    }
+}
+
+void mos6522_set_sr_input(MOS6522State *s, uint8_t byte)
+{
+    s->sr = byte;
+    s->ifr |= SR_INT;
+    mos6522_update_irq(s);
+}
+
 static const MemoryRegionOps mos6522_ops = {
     .read = mos6522_read,
     .write = mos6522_write,
@@ -1087,11 +1157,15 @@ static const VMStateDescription vmstate_mos6522_timer = {
 
 const VMStateDescription vmstate_mos6522 = {
     .name = "mos6522",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8(a, MOS6522State),
         VMSTATE_UINT8(b, MOS6522State),
+        VMSTATE_UINT8_V(in_a, MOS6522State, 2),
+        VMSTATE_UINT8_V(in_a_mask, MOS6522State, 2),
+        VMSTATE_UINT8_V(in_b, MOS6522State, 2),
+        VMSTATE_UINT8_V(in_b_mask, MOS6522State, 2),
         VMSTATE_UINT8(dira, MOS6522State),
         VMSTATE_UINT8(dirb, MOS6522State),
         VMSTATE_UINT8(sr, MOS6522State),
@@ -1112,6 +1186,10 @@ static void mos6522_reset_hold(Object *obj, ResetType type)
 
     s->b = 0;
     s->a = 0;
+    s->in_a = 0;
+    s->in_a_mask = 0;
+    s->in_b = 0;
+    s->in_b_mask = 0;
     /*
      * A bare 6522 resets with port B as all-inputs, but 0xff here is
      * de-facto ABI for QEMU's shipped OpenBIOS: its CUDA driver

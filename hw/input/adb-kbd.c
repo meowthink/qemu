@@ -189,15 +189,51 @@ static void adb_kbd_put_keycode(void *opaque, int keycode)
     }
 }
 
+static bool adb_kbd_is_modifier(uint8_t keycode)
+{
+    switch (keycode) {
+    case ADB_KEY_LEFT_CONTROL:
+    case ADB_KEY_RIGHT_CONTROL:
+    case ADB_KEY_COMMAND:
+    case ADB_KEY_LEFT_SHIFT:
+    case ADB_KEY_CAPS_LOCK:
+    case ADB_KEY_LEFT_OPTION:
+    case ADB_KEY_RIGHT_SHIFT:
+    case ADB_KEY_RIGHT_OPTION:
+        return true;
+    }
+    return false;
+}
+
 static int adb_kbd_poll(ADBDevice *d, uint8_t *obuf)
 {
     KBDState *s = ADB_KEYBOARD(d);
     int keycode;
+    int next;
 
     if (s->count == 0) {
         return 0;
     }
     keycode = s->data[s->rptr];
+    next = (s->rptr + 1) % sizeof(s->data);
+    /*
+     * A normal key press queues make then break.  Deliver the pair in
+     * one register-0 packet; holding a lone non-modifier make until its
+     * release avoids the host polling the make twice.
+     */
+    if (!(keycode & 0x80) && keycode != 0x7f &&
+        !adb_kbd_is_modifier(keycode)) {
+        if (s->count == 1) {
+            return 0;
+        }
+        if (s->data[next] == (keycode | 0x80)) {
+            obuf[0] = keycode;
+            obuf[1] = s->data[next];
+            s->rptr = (next + 1) % sizeof(s->data);
+            s->count -= 2;
+            return 2;
+        }
+    }
     s->rptr++;
     if (s->rptr == sizeof(s->data)) {
         s->rptr = 0;

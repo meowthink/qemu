@@ -805,10 +805,9 @@ static void ans_gc_realize(PCIDevice *d, Error **errp)
                          ANS_GC_TB_FREQ);
     /*
      * The ROM's CudaInit runs the full sync cycle and its driver reads each
-     * response byte on an SR interrupt, so the island's Cuda wants the
-     * hardware framing in one switch.
+     * response byte on an SR interrupt; the default Cuda transport provides
+     * both.
      */
-    qdev_prop_set_bit(DEVICE(&s->cuda), "ans-mode", true);
     if (!qdev_realize(DEVICE(&s->cuda), BUS(&s->escc_bus), errp)) {
         return;
     }

@@ -74,6 +74,13 @@ OBJECT_DECLARE_SIMPLE_TYPE(MOS6522CUDAState, MOS6522_CUDA)
 #define TYPE_CUDA "cuda"
 OBJECT_DECLARE_SIMPLE_TYPE(CUDAState, CUDA)
 
+typedef enum CudaTransportState {
+    CUDA_STATE_IDLE,
+    CUDA_STATE_RECEIVING,
+    CUDA_STATE_SENDING,
+    CUDA_STATE_SYNC,
+} CudaTransportState;
+
 struct CUDAState {
     /*< private >*/
     SysBusDevice parent_obj;
@@ -100,6 +107,10 @@ struct CUDAState {
     /* virtual-time deadline of the pending sr_delay_timer, for the
      * guest-access catch-up path (see cuda_sr_int_catch_up()) */
     int64_t sr_int_due_ns;
+    /* deferred TREQ negation at the end of a sync cycle */
+    QEMUTimer *treq_delay_timer;
+    /* backstop for a sync acknowledge the host stops polling for */
+    QEMUTimer *sync_ack_timer;
 
     /*
      * CUDA_SET_ONE_SECOND_MODE support: once enabled, an unsolicited
@@ -112,13 +123,18 @@ struct CUDAState {
     QEMUTimer *one_sec_timer;
     uint8_t one_sec_mode;
 
-    int data_in_size;
-    int data_in_index;
-    int data_out_index;
+    int tx_len;
+    int tx_idx;
+    int rx_len;
 
     qemu_irq irq;
-    uint8_t data_in[128];
-    uint8_t data_out[16];
+    /*
+     * A response queue: [attention][type][flags][cmd][data...].  RdPram is
+     * open-ended and streams the whole 256-byte PRAM page, so the queue has
+     * to hold that plus the header.
+     */
+    uint8_t tx_buf[1 + 3 + 256];
+    uint8_t rx_buf[16];
 
     /* Extended Parameter RAM, accessed via CUDA_GET_PRAM/CUDA_SET_PRAM.
      * Optionally backed by a "-drive" file (like q800's mac_via PRAM) so
@@ -127,6 +143,48 @@ struct CUDAState {
      * invocations instead of resetting to zero every boot. */
     uint8_t pram[256];
     BlockBackend *pram_blk;
+
+    uint8_t sync_state;
+    uint8_t state;
+    bool iic_nack;
+    /* level driven on the VIA's TREQ input; true is idle */
+    bool treq_high;
+    /* ans-sync-lazy: the sync cycle's two acknowledgements are applied at the
+     * host's next VIA access rather than on a host-clock timer, so the
+     * handshake cannot depend on how fast the guest runs. */
+    bool ans_sync_lazy;
+    bool treq_release_pending;
+    bool treq_release_seen;
+    bool sync_ack_pending;
+    bool sync_ack_after_clear;
+    bool sr_pending_byte_valid;
+    uint8_t sr_pending_byte;
+    /* set for acknowledge bytes, which must land after their delay */
+    bool sr_pending_needs_delay;
+
+    bool push_idle_ack_done;
+    bool push_waiting_read;
+
+    /* Cuda clocks each response byte itself, after a real attention byte,
+     * instead of handing bytes over on the host's BYTEACK toggles. */
+    bool byte_push;
+    /* one-second tick carries the RTC in the RdTime packet form */
+    bool tick_rdtime;
+    /* ACK-only slave on the Cuda I2C bus */
+    bool i2c_stub;
+
+    /* Abandonment watchdog in ns: a response the host has not engaged after
+     * this long is parked and re-presented later.  CUDA_PARK_MS overrides,
+     * 0 disables. */
+    QEMUTimer *park_timer;
+    int64_t park_ns;
+    bool parked;
+    uint8_t park_buf[1 + 3 + 256];
+    int park_len;
+
+    /* Auto-poll reply held while the host link is busy. */
+    uint8_t ap_park[ADB_MAX_OUT_LEN + 3];
+    int ap_park_len;
 };
 
 #endif /* CUDA_H */
