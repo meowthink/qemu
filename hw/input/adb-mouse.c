@@ -24,6 +24,7 @@
 
 #include "qemu/osdep.h"
 #include "ui/console.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/input/adb.h"
 #include "migration/vmstate.h"
 #include "qemu/module.h"
@@ -41,6 +42,18 @@ struct MouseState {
     QemuInputHandlerState *hs;
     int buttons_state, last_buttons_state;
     int dx, dy, dz;
+    bool polled_once;
+    /*
+     * Multiplier applied to incoming host motion deltas. Host input
+     * arrives in host pixels (~100 per inch of physical mouse travel)
+     * while the classic Apple mouse protocol handler declares 200
+     * counts per inch, so guests that normalize pointer speed by the
+     * declared resolution (Mac OS X's AppleADBMouse does; classic Mac
+     * OS's cursor scaling largely doesn't) see half-speed motion at
+     * the default of 1. Set 2 for a faithful "200 cpi device" feel on
+     * such guests: -global adb-mouse.motion-scale=2.
+     */
+    uint8_t motion_scale;
 };
 
 
@@ -66,14 +79,30 @@ static void adb_mouse_handle_event(DeviceState *dev, QemuConsole *src,
 
     switch (evt->type) {
     case INPUT_EVENT_KIND_REL:
+        trace_adb_device_mouse_handle_event(evt->type, evt->rel.axis,
+                                            evt->rel.value, 0);
+        /*
+         * Ignore implausibly large single-event deltas: display
+         * backends synthesize window-sized relative jumps around
+         * grab/ungrab and pointer-warp compensation (observed with
+         * both SDL and Cocoa), which are not real hand motion --
+         * integrating one teleports the guest cursor (observed as
+         * occasional wild jumps while tracking in Mac OS X guests).
+         * Real pointing devices deliver far smaller per-event deltas.
+         */
+        if (evt->rel.value > 256 || evt->rel.value < -256) {
+            break;
+        }
         if (evt->rel.axis == INPUT_AXIS_X) {
-            s->dx += evt->rel.value;
+            s->dx += evt->rel.value * s->motion_scale;
         } else if (evt->rel.axis == INPUT_AXIS_Y) {
-            s->dy += evt->rel.value;
+            s->dy += evt->rel.value * s->motion_scale;
         }
         break;
 
     case INPUT_EVENT_KIND_BTN:
+        trace_adb_device_mouse_handle_event(evt->type, evt->btn.button,
+                                            0, evt->btn.down);
         if (bmap[evt->btn.button]) {
             if (evt->btn.down) {
                 s->buttons_state |= bmap[evt->btn.button];
@@ -104,11 +133,23 @@ static int adb_mouse_poll(ADBDevice *d, uint8_t *obuf)
 {
     MouseState *s = ADB_MOUSE(d);
     int dx, dy;
+    bool report_reset_transient = !s->polled_once;
 
-    if (s->last_buttons_state == s->buttons_state &&
+    /*
+     * A real ADB mouse reports its actual (idle) state the first time
+     * it is talked to after a reset, even if the user has never touched
+     * it -- that initial packet is what lets the ADB Manager clear its
+     * low-memory MBState/mouse-tracking globals from their ROM-supplied
+     * startup default. Suppressing it here (as "nothing changed yet")
+     * left MBState stuck at its initial nonzero value forever, since we
+     * never sent a single packet for the OS to update it from.
+     */
+    if (s->polled_once &&
+        s->last_buttons_state == s->buttons_state &&
         s->dx == 0 && s->dy == 0) {
         return 0;
     }
+    s->polled_once = true;
 
     dx = s->dx;
     if (dx < -63) {
@@ -138,6 +179,28 @@ static int adb_mouse_poll(ADBDevice *d, uint8_t *obuf)
         dx |= 0x80;
     }
 
+    if (report_reset_transient) {
+        /*
+         * Real ADB mice report a momentary button-down transient in their
+         * very first post-reset Talk R0 response, even though the button
+         * isn't physically pressed -- a side effect of real hardware's
+         * power-on/reset behavior. Classic Mac OS's ADB Manager relies on
+         * seeing a genuine transition (not just "first packet, still
+         * idle") to clear the low-memory MBState global from its
+         * ROM-supplied startup default: sending only a static idle
+         * packet here (as the fix above does on its own) delivers data,
+         * but never a *change*, so MBState never actually gets cleared.
+         * Force that same one-shot transient here -- report the primary
+         * (left) button as pressed on this call regardless of actual
+         * state, and record a last_buttons_state that disagrees with the
+         * real buttons_state so adb_mouse_has_data() schedules an
+         * immediate follow-up poll, which will then correctly report the
+         * real (not-pressed) state as a genuine release transition.
+         */
+        dy &= ~0x80;
+        s->last_buttons_state = s->buttons_state ^ ADB_MOUSE_BUTTON_LEFT;
+    }
+
     obuf[0] = dy;
     obuf[1] = dx;
     return 2;
@@ -150,8 +213,18 @@ static int adb_mouse_request(ADBDevice *d, uint8_t *obuf,
     int cmd, reg, olen;
 
     if ((buf[0] & 0x0f) == ADB_FLUSH) {
-        /* flush mouse fifo */
-        s->buttons_state = s->last_buttons_state;
+        /*
+         * Flush discards pending, not-yet-reported relative motion --
+         * real hardware has no queued button data to flush, since the
+         * button state is a live physical line, not buffered. Reverting
+         * buttons_state to last_buttons_state here (as this code used to)
+         * silently erases any real button transition (e.g. a release)
+         * that happened between the last poll and this Flush, since
+         * buttons_state is the only place that transition is recorded --
+         * permanently desyncing the guest's button bookkeeping from
+         * reality (observed as a window drag that never ends because the
+         * guest never sees the mouse-up).
+         */
         s->dx = 0;
         s->dy = 0;
         s->dz = 0;
@@ -189,20 +262,36 @@ static int adb_mouse_request(ADBDevice *d, uint8_t *obuf,
                 trace_adb_device_mouse_request_change_addr(d->devaddr);
                 break;
             default:
-                d->devaddr = buf[1] & 0xf;
                 /*
+                 * A plain handler assignment ignores the address field
+                 * -- only the reserved handler bytes 0x00/0xFE/0xFD
+                 * latch a new address (confirmed against DingusPPC's
+                 * real-hardware-verified AdbMouse::set_register_3,
+                 * which leaves my_addr untouched for handler values).
+                 * Latching it here too (as this used to) would let a
+                 * malformed handler-change write teleport the device
+                 * to a different bus address.
+                 *
                  * we support handlers:
                  * 0x01: Classic Apple Mouse Protocol / 100 cpi operations
                  * 0x02: Classic Apple Mouse Protocol / 200 cpi operations
+                 * 0x04: Extended Apple Mouse Protocol (see the reg 1
+                 *       read below -- lets the guest read our declared
+                 *       resolution/button count instead of assuming the
+                 *       classic protocol's fixed 200 cpi; Mac OS X's
+                 *       AppleADBMouse scales pointer speed inversely
+                 *       with device resolution, so the classic handler
+                 *       made the cursor crawl at half speed given that
+                 *       our "counts" are host pixels, not physical
+                 *       1/200-inch mouse travel)
                  * we don't support handlers (at least):
                  * 0x03: Mouse systems A3 trackball
-                 * 0x04: Extended Apple Mouse Protocol
                  * 0x2f: Microspeed mouse
                  * 0x42: Macally
                  * 0x5f: Microspeed mouse
                  * 0x66: Microspeed mouse
                  */
-                if (buf[2] == 1 || buf[2] == 2) {
+                if (buf[2] == 1 || buf[2] == 2 || buf[2] == 4) {
                     d->handler = buf[2];
                 }
 
@@ -218,6 +307,28 @@ static int adb_mouse_request(ADBDevice *d, uint8_t *obuf,
             olen = adb_mouse_poll(d, obuf);
             break;
         case 1:
+            /*
+             * Extended Apple Mouse Protocol device info -- must be
+             * exactly 8 bytes or the guest rejects handler 4
+             * (AppleADBMouseType4::probe): device signature (u32),
+             * resolution in counts per inch (big-endian u16), device
+             * class, button count. Resolution 100 gives a ~1:1 feel
+             * since our motion units are host pixels (~100 per inch of
+             * physical mouse travel), twice the speed the classic
+             * handler's assumed 200 cpi produced. The signature must
+             * not be 'tpad' (that selects the trackpad code path).
+             */
+            if (d->handler == 4) {
+                obuf[0] = 'Q';
+                obuf[1] = 'E';
+                obuf[2] = 'M';
+                obuf[3] = 'U';
+                obuf[4] = 0;
+                obuf[5] = 100;
+                obuf[6] = 1;    /* device class: mouse */
+                obuf[7] = 2;    /* buttons */
+                olen = 8;
+            }
             break;
         case 3:
             obuf[0] = d->devaddr;
@@ -235,7 +346,8 @@ static bool adb_mouse_has_data(ADBDevice *d)
 {
     MouseState *s = ADB_MOUSE(d);
 
-    return !(s->last_buttons_state == s->buttons_state &&
+    return !s->polled_once ||
+           !(s->last_buttons_state == s->buttons_state &&
              s->dx == 0 && s->dy == 0);
 }
 
@@ -244,16 +356,32 @@ static void adb_mouse_reset(DeviceState *dev)
     ADBDevice *d = ADB_DEVICE(dev);
     MouseState *s = ADB_MOUSE(dev);
 
-    d->handler = 2;
+    /*
+     * The default (reset-time) handler ID doubles as an IOKit driver
+     * match key on Mac OS X: AppleADBMouse's Type 4 (Extended Apple
+     * Mouse Protocol) personality matches "ADB Match" = "3-01" --
+     * address 3 with DEFAULT handler 1 -- while the classic Type 1/2
+     * personalities match bare address "3". With any other default
+     * (this used to be 2, briefly 4) the extended-protocol driver
+     * never even probes, OS X falls back to the classic 200 cpi
+     * protocol, and pointer speed is halved (its HID layer normalizes
+     * by declared resolution; our "counts" are host pixels at roughly
+     * 100/inch). Defaulting to 1 lets Type 4 match, negotiate handler
+     * 4, and read our true resolution from register 1. Guests that
+     * only know the classic protocol simply run us as the 100 cpi
+     * classic mouse, which matches our units anyway.
+     */
+    d->handler = 1;
     d->devaddr = ADB_DEVID_MOUSE;
     s->last_buttons_state = s->buttons_state = 0;
     s->dx = s->dy = s->dz = 0;
+    s->polled_once = false;
 }
 
 static const VMStateDescription vmstate_adb_mouse = {
     .name = "adb_mouse",
-    .version_id = 2,
-    .minimum_version_id = 2,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .fields = (const VMStateField[]) {
         VMSTATE_STRUCT(parent_obj, MouseState, 0, vmstate_adb_device,
                        ADBDevice),
@@ -262,6 +390,7 @@ static const VMStateDescription vmstate_adb_mouse = {
         VMSTATE_INT32(dx, MouseState),
         VMSTATE_INT32(dy, MouseState),
         VMSTATE_INT32(dz, MouseState),
+        VMSTATE_BOOL(polled_once, MouseState),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -283,6 +412,10 @@ static void adb_mouse_initfn(Object *obj)
     d->devaddr = ADB_DEVID_MOUSE;
 }
 
+static const Property adb_mouse_properties[] = {
+    DEFINE_PROP_UINT8("motion-scale", MouseState, motion_scale, 1),
+};
+
 static void adb_mouse_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
@@ -297,6 +430,7 @@ static void adb_mouse_class_init(ObjectClass *oc, const void *data)
     adc->devhasdata = adb_mouse_has_data;
     device_class_set_legacy_reset(dc, adb_mouse_reset);
     dc->vmsd = &vmstate_adb_mouse;
+    device_class_set_props(dc, adb_mouse_properties);
 }
 
 static const TypeInfo adb_mouse_type_info = {
