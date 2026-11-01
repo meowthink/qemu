@@ -71,6 +71,7 @@ config MACIO
     bool
     select CUDA
     select ESCC
+    select SWIM3
     select IDE_MACIO
     select MAC_DBDMA
     select MAC_NVRAM

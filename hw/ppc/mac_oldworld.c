@@ -40,21 +40,55 @@
 #include "hw/pci/pci_host.h"
 #include "hw/pci-host/grackle.h"
 #include "hw/nvram/fw_cfg.h"
+#include "hw/nvram/mac_nvram.h"
+#include "hw/scsi/scsi.h"
 #include "hw/char/escc.h"
 #include "hw/misc/macio/macio.h"
+#include "hw/misc/macio/cuda.h"
+#include "hw/display/ati_mach64_int.h"
+#include "hw/i2c/smbus_eeprom.h"
 #include "hw/core/loader.h"
 #include "hw/core/fw-path-provider.h"
 #include "elf.h"
 #include "qemu/error-report.h"
+#include "system/block-backend.h"
+#include "qobject/qdict.h"
 #include "system/kvm.h"
 #include "system/reset.h"
+#include "system/calib-governor.h"
+#include "qapi/visitor.h"
 #include "kvm_ppc.h"
 
 #define MAX_IDE_BUS 2
 #define CFG_ADDR 0xf0000510
-#define TBFREQ 16600000UL
-#define CLOCKFREQ 266000000UL
-#define BUSFREQ 66000000UL
+/*
+ * Real hardware's actual clock-frequency values, confirmed against this
+ * exact ROM's own device-tree dump (SourceFiles/G3/PowerMacG3-device-tree.txt:
+ * root node "clock-frequency"=0x03fb97a0=66,820,000 Hz; cpus/PowerPC,750
+ * "clock-frequency"=0x11ec2a50=300,690,000 Hz). The previous rounded
+ * 66,000,000/266,000,000 values are close but not exact -- the ROM reads
+ * these via fw_cfg (FW_CFG_PPC_BUSFREQ/CLOCKFREQ) for its own boot-time
+ * timing calibration (confirmed this session: a ROM routine reads a VIA
+ * Timer 2 counter byte in a tight loop specifically to measure real
+ * elapsed time against an expected CPU-cycles-per-tick ratio derived
+ * from these reported frequencies), so an inexact value skews that
+ * calibration systematically, independent of any TCG/icount timing
+ * variance. 66,820,000 Hz also matches DingusPPC's own
+ * "BUS_FREQ_66P82" constant name in machines/machinegossamer.cpp,
+ * confirming this is the real, intended value for this board.
+ */
+#define CLOCKFREQ 300690000UL
+#define BUSFREQ 66820000UL
+/*
+ * Same device-tree dump, cpus/PowerPC,750 "timebase-frequency" =
+ * 0x00fee5e8 = 16,705,000 Hz -- exactly BUSFREQ/4, the standard 60x-bus
+ * PowerPC convention (timebase increments once per 4 bus clocks). The
+ * previous hardcoded 16,600,000 UL was a separate, never-updated rounded
+ * value left over from before BUSFREQ/CLOCKFREQ were corrected to their
+ * exact real-hardware figures above -- fixed here to derive from the
+ * same, now-accurate BUSFREQ constant instead of drifting independently.
+ */
+#define TBFREQ (BUSFREQ / 4)
 
 #define NDRV_VGA_FILENAME "qemu_vga.ndrv"
 
@@ -66,6 +100,45 @@
 #define KERNEL_GAP       0x00100000
 
 #define GRACKLE_BASE 0xfec00000
+
+/*
+ * Real Gossamer-board (Beige G3) hardware exposes a 16-bit "machine ID"
+ * register at physical address 0xFF000004, readable by ROM boot code to
+ * identify board capabilities (floppy controller type, ROM burst-read
+ * support, which PCI slots are physically present, CPU/cache clock
+ * ratio, bus speed, and whether this is an All-in-One-style board).
+ * QEMU previously left this address entirely unimplemented, so reads
+ * fell through to Grackle's PCI-hole "no target responds" default --
+ * not the real machine-identification value the ROM expects. Confirmed
+ * against DingusPPC's GossamerID device (devices/common/machineid.h,
+ * machines/machinegossamer.cpp): a real Beige G3 desktop's value is
+ * built from FDC_TYPE_SWIM3(0x8000) | BURST_ROM_TRUE(0) |
+ * PCI_A_PRSNT(0x3F<<8) | PCM_PID(1<<5) | AIO_PRSNT_FALSE(1<<4) |
+ * BUS_FREQ_66P82(6<<1) | BOSE_PRSNT_FALSE(1) = 0xBF3D.
+ */
+#define MACHINE_ID_BASE 0xff000000
+#define MACHINE_ID_SIZE 4096
+#define MACHINE_ID_VALUE 0xbf3d
+
+static uint64_t machine_id_read(void *opaque, hwaddr addr, unsigned size)
+{
+    if (addr == 4 && size == 2) {
+        return MACHINE_ID_VALUE;
+    }
+    return 0;
+}
+
+static void machine_id_write(void *opaque, hwaddr addr, uint64_t value,
+                             unsigned size)
+{
+    /* read-only */
+}
+
+static const MemoryRegionOps machine_id_ops = {
+    .read = machine_id_read,
+    .write = machine_id_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+};
 
 static void fw_cfg_boot_set(void *opaque, const char *boot_device,
                             Error **errp)
@@ -84,12 +157,307 @@ static void ppc_heathrow_reset(void *opaque)
 
     cpu_ppc_tb_reset(&cpu->env);
     cpu_reset(CPU(cpu));
+
+    /*
+     * HID1's upper PLL_CFG bits reflect the bus-to-core clock multiplier
+     * board straps on real hardware (sampled at power-on, not something
+     * the CPU or firmware sets), so cpu_reset() zeroing them leaves an
+     * unrecognized/invalid multiplier encoding. A real Apple ROM's
+     * boot-time hardware-init code reads this to identify the CPU speed
+     * and aborts if it doesn't recognize the value -- matches the
+     * "AAPL,PowerMac G3" Beige G3 board strap used by DingusPPC's
+     * Gossamer machine, and the same pattern already used for the
+     * Pegasos machine below (see pegasos_cpu_reset()).
+     */
+    cpu->env.spr[SPR_HID1] = 0xEULL << 28;
+}
+
+/*
+ * Build a minimal SPD EEPROM image for a 168-pin SDRAM DIMM.
+ *
+ * QEMU's generic spd_data_generate() (hw/i2c/smbus_eeprom.c) is designed
+ * for x86 SMBIOS reporting, where the actual usable RAM size comes from
+ * elsewhere (e820) and the SPD content only needs to look plausible. Real
+ * Beige G3 ROM firmware, by contrast, *derives* the installed RAM size
+ * from the row/column/bank fields it reads back over I2C, so the encoded
+ * capacity must multiply out exactly or the ROM's memory-sizing code
+ * miscomputes and corrupts later boot state (observed as a completely
+ * different crash -- a stack pointer landing in unmapped memory -- at
+ * RAM sizes other than 256 MiB).
+ *
+ * This mirrors DingusPPC's SpdSdram168::set_capacity() table exactly
+ * (verified against real Beige G3 ROM boot behavior): fixed 12 row
+ * address bits, with column count and bank count varying by capacity.
+ */
+static uint8_t *g3beige_spd_data_generate(uint64_t ram_size,
+                                          uint32_t *megs_out)
+{
+    static const struct { uint32_t megs; uint8_t cols, banks; } table[] = {
+        { 8,   6,  1 },
+        { 16,  7,  1 },
+        { 32,  8,  1 },
+        { 64,  9,  1 },
+        { 128, 10, 1 },
+        { 256, 10, 2 },
+        { 512, 11, 2 },
+    };
+    uint32_t megs = ram_size / MiB;
+    int i;
+
+    /* pick the largest supported capacity not exceeding what's configured */
+    for (i = ARRAY_SIZE(table) - 1; i > 0 && table[i].megs > megs; i--) {
+    }
+    if (megs_out) {
+        *megs_out = table[i].megs;
+    }
+
+    uint8_t *spd = g_malloc0(256);
+    spd[0] = 128; /* number of bytes present */
+    spd[1] = 8;   /* log2(EEPROM size) */
+    spd[2] = 4;   /* memory type: SDRAM */
+    spd[3] = 0xC; /* number of row addresses (12, fixed) */
+    spd[4] = table[i].cols;
+    spd[5] = table[i].banks;
+    return spd;
+}
+
+/*
+ * Auto-manage a default NVRAM backing file, "nvram.img", when the user
+ * hasn't attached one explicitly via -drive if=mtd,... -- creates it
+ * (empty) on first use and mac_nvram.c's Old World formatter fills it
+ * with a valid default OF partition; on later runs, its already-valid
+ * persisted content is read back and left alone instead of being
+ * overwritten again (see pmac_format_nvram_partition_oldworld()).
+ */
+/*
+ * What can this volume start? Reads the volume's own header and looks at
+ * the blessed directory IDs Apple defines: on an HFS Plus volume
+ * (reached through its HFS wrapper when there is one) finderInfo[0] is
+ * the folder the ROM starts from, finderInfo[3] a Mac OS 8/9 System
+ * Folder and finderInfo[5] a Mac OS X one (Technote 1150); on a plain
+ * HFS volume the MDB's drFndrInfo[0] is the blessed System Folder
+ * (Inside Macintosh: Files, MDB layout).
+ *
+ * A volume counts as classic-bootable when finderInfo[3] is set, or when
+ * finderInfo[0] is set and does not equal finderInfo[5]: a volume blessed
+ * only for Mac OS X reads [0] == [5] with [3] == 0, while one blessed by
+ * an older system may carry only [0]. Checked against this project's
+ * disks (2026-09-06): the 9.2 install reads [0] = [3] = 30, [5] = 0; the
+ * 10.0 and 10.2 installs read [0] = [5] with [3] = 0; five plain HFS
+ * installs (7.1, 7.5.3, 8.0, 8.1, 8.5.1) read a non-zero drFndrInfo[0]
+ * at MDB byte 92; and every HFS wrapper reads drFndrInfo[0] = 2, its
+ * own root, which is why the wrapper is looked through, not at.
+ */
+static void mac_oldworld_volume_systems(BlockBackend *blk, uint64_t part_start,
+                                        bool *has_osx, bool *has_classic)
+{
+    uint8_t vh[512];
+    uint64_t base = part_start * 512;
+    uint32_t blessed, classic, osx;
+
+    if (blk_pread(blk, base + 1024, sizeof(vh), vh, 0) < 0) {
+        return;
+    }
+    if (!memcmp(vh, "BD", 2)) {              /* HFS: wrapper or plain */
+        uint32_t al_size = ldl_be_p(vh + 20);
+        uint16_t al_start = lduw_be_p(vh + 28);
+        uint16_t embed = lduw_be_p(vh + 126);
+
+        if (memcmp(vh + 124, "H+", 2) || !al_size) {
+            /* plain HFS: drFndrInfo[0] is the blessed System Folder */
+            *has_classic |= ldl_be_p(vh + 92) != 0;
+            return;
+        }
+        base += (uint64_t)al_start * 512 + (uint64_t)embed * al_size;
+        if (blk_pread(blk, base + 1024, sizeof(vh), vh, 0) < 0) {
+            return;
+        }
+    }
+    if (memcmp(vh, "H+", 2) && memcmp(vh, "HX", 2)) {
+        return;
+    }
+    blessed = ldl_be_p(vh + 80 + 0 * 4);
+    classic = ldl_be_p(vh + 80 + 3 * 4);
+    osx = ldl_be_p(vh + 80 + 5 * 4);
+    *has_osx |= osx != 0;
+    *has_classic |= classic != 0 || (blessed != 0 && blessed != osx);
+}
+
+/*
+ * Walk a disk's Apple partition map. Returns the partition number of a
+ * Mac OS X system volume, counting the way Open Firmware does (the map
+ * itself is 1), or 0 for none; *has_classic is set if anything on the
+ * disk can be started by the ROM on its own.
+ */
+static int mac_oldworld_osx_partition(BlockBackend *blk, bool *has_classic)
+{
+    uint8_t buf[512];
+    uint32_t map_blocks = 1;
+    int osx_part = 0, loader_part = 0;
+    bool rhapsody_ufs = false;
+    uint32_t i;
+
+    if (blk_pread(blk, 0, sizeof(buf), buf, 0) < 0 || memcmp(buf, "ER", 2)) {
+        return 0;
+    }
+    for (i = 1; i <= map_blocks && i < 64; i++) {
+        bool osx = false;
+        const char *type = (const char *)buf + 48;
+
+        if (blk_pread(blk, (uint64_t)i * 512, sizeof(buf), buf, 0) < 0 ||
+            memcmp(buf, "PM", 2)) {
+            break;
+        }
+        map_blocks = ldl_be_p(buf + 4);
+        /*
+         * Rhapsody (Mac OS X Server 1.x) has no HFS+ system volume: it
+         * boots from an Apple_Loader partition ("SecondaryLoader") that
+         * sits beside its Apple_Rhapsody_UFS root. Mac OS 9's Startup
+         * Disk panel points boot-device at that loader partition.
+         */
+        if (!strncmp(type, "Apple_Loader", 32)) {
+            if (!loader_part) {
+                loader_part = i;
+            }
+            continue;
+        }
+        if (!strncmp(type, "Apple_Rhapsody_UFS", 32)) {
+            rhapsody_ufs = true;
+            continue;
+        }
+        if (strncmp(type, "Apple_HFS", 9)) {
+            continue;
+        }
+        mac_oldworld_volume_systems(blk, ldl_be_p(buf + 8), &osx, has_classic);
+        if (osx && !osx_part) {
+            osx_part = i;
+        }
+    }
+    if (!osx_part && loader_part && rhapsody_ufs) {
+        return loader_part;
+    }
+    return osx_part;
+}
+
+/*
+ * Do for a fresh machine what Mac OS 9's Startup Disk control panel does
+ * for a real one. The ROM's own boot scan only finds classic systems, so
+ * a machine whose disks hold only Mac OS X would sit at the flashing
+ * question mark forever with nothing able to write the NVRAM that fixes
+ * it. When that -- and only that -- is the situation, point NVRAM at the
+ * Mac OS X volume and install the shim OF needs to load it.
+ *
+ * Anything else is left alone: a disk the ROM can boot by itself, a
+ * guest that has since written its own NVRAM, an NVRAM image the user
+ * supplied.
+ *
+ * Runs from a machine-init-done notifier rather than from machine init,
+ * because SCSI disks arrive as -device scsi-hd and only exist once the
+ * command-line devices have been created. A classic system on the MESH
+ * bus counts exactly like one on IDE: the ROM scans SCSI first, so a
+ * Mac OS 8/9 disk there is what it would boot, and we must not override
+ * it (2026-09-06: a fresh NVRAM with several OS X IDE disks and Mac OS
+ * 8.1 on SCSI was pointed at OS X before this looked at SCSI at all).
+ *
+ * Limits: a Mac OS X system on a SCSI disk is not selected -- only its
+ * classic-or-not verdict is used -- because the Open Firmware path for a
+ * MESH target has not been established here. The partition map is read
+ * assuming 512-byte blocks; a CD image whose Apple partition map uses
+ * 2048-byte blocks is therefore not detected (its reads land on the
+ * wrong sectors and count as "nothing"), so such a CD neither becomes
+ * the startup device nor counts as classic.
+ */
+typedef struct {
+    Notifier notifier;
+    Object *macio;
+    DriveInfo *hd[MAX_IDE_BUS * MAX_IDE_DEVS];
+} MacOldworldStartupPick;
+
+static void mac_oldworld_pick_startup_device(Notifier *notifier, void *data)
+{
+    MacOldworldStartupPick *pick =
+        container_of(notifier, MacOldworldStartupPick, notifier);
+    MacIONVRAMState *nvram;
+    MESHState *mesh;
+    bool has_classic = false;
+    int i, osx_drive = -1, osx_part = 0;
+
+    nvram = MACIO_NVRAM(object_resolve_path_component(pick->macio, "nvram"));
+    if (!pmac_oldworld_nvram_is_default(nvram)) {
+        return;
+    }
+
+    for (i = 0; i < ARRAY_SIZE(pick->hd); i++) {
+        BlockBackend *blk;
+        int part;
+
+        if (!pick->hd[i]) {
+            continue;
+        }
+        blk = blk_by_legacy_dinfo(pick->hd[i]);
+        part = blk ? mac_oldworld_osx_partition(blk, &has_classic) : 0;
+        if (part && osx_drive < 0) {
+            osx_drive = i;
+            osx_part = part;
+        }
+    }
+
+    mesh = MESH(object_resolve_path_component(pick->macio, "mesh"));
+    for (i = 0; i < 8; i++) {
+        SCSIDevice *sd = scsi_device_find(&mesh->bus, 0, i, 0);
+
+        if (sd && sd->conf.blk) {
+            mac_oldworld_osx_partition(sd->conf.blk, &has_classic);
+        }
+    }
+
+    if (has_classic || osx_drive < 0) {
+        return;
+    }
+
+    g_autofree char *device = g_strdup_printf("ide%d/@%d:%d", osx_drive / 2,
+                                              osx_drive % 2, osx_part);
+    info_report("NVRAM: no disk this ROM can start on its own, but %s holds "
+                "Mac OS X (or Mac OS X Server 1.x) -- pointing a fresh NVRAM "
+                "at it", device);
+    pmac_oldworld_nvram_set_osx_startup(nvram, device);
+}
+
+static BlockBackend *mac_oldworld_default_nvram_blk(void)
+{
+    static const char filename[] = "nvram.img";
+    struct stat st;
+    BlockBackend *blk;
+    Error *local_err = NULL;
+    int fd;
+
+    fd = qemu_open_old(filename, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) {
+        warn_report("could not open/create default NVRAM image '%s': %s",
+                    filename, strerror(errno));
+        return NULL;
+    }
+    if (fstat(fd, &st) == 0 && st.st_size < MACIO_NVRAM_SIZE) {
+        if (ftruncate(fd, MACIO_NVRAM_SIZE) != 0) {
+            warn_report("could not size default NVRAM image '%s': %s",
+                        filename, strerror(errno));
+        }
+    }
+    close(fd);
+
+    QDict *options = qdict_new();
+    qdict_put_str(options, "driver", "raw");
+    blk = blk_new_open(filename, NULL, options, BDRV_O_RDWR, &local_err);
+    if (!blk) {
+        warn_report_err(local_err);
+        return NULL;
+    }
+    return blk;
 }
 
 static void ppc_heathrow_init(MachineState *machine)
 {
     const char *bios_name = machine->firmware ?: PROM_FILENAME;
-    MachineClass *mc = MACHINE_GET_CLASS(machine);
     PowerPCCPU *cpu = NULL;
     CPUPPCState *env = NULL;
     char *filename;
@@ -108,6 +476,21 @@ static void ppc_heathrow_init(MachineState *machine)
     DriveInfo *dinfo, *hd[MAX_IDE_BUS * MAX_IDE_DEVS];
     void *fw_cfg;
     uint64_t tbfreq = kvm_enabled() ? kvmppc_get_tbfreq() : TBFREQ;
+
+    /*
+     * This board's ROM is the one that needs the windowed calibration
+     * governor (see system/calib-governor.c), so this board is what
+     * turns it on -- the mos6522 hook itself is generic and stays inert
+     * on every other machine. An explicit calibration-governor= on the
+     * command line has already been applied and wins over this default.
+     */
+    calib_governor_default_on();
+    /*
+     * ...and tell it what this machine's CPU clock is, so XNU's
+     * pe_run_clock_test() CPU-speed probe (VIA Timer 1 loaded with
+     * 0xffff) is paced to the real thing rather than to raw TCG speed.
+     */
+    calib_governor_set_cpu_clock(CLOCKFREQ);
 
     /* init CPUs */
     for (i = 0; i < machine->smp.cpus; i++) {
@@ -226,6 +609,13 @@ static void ppc_heathrow_init(MachineState *machine)
     memory_region_add_subregion(get_system_memory(), 0xfe000000,
                                 sysbus_mmio_get_region(s, 3));
 
+    /* Gossamer-board machine ID register, punched through the PCI hole */
+    MemoryRegion *machine_id = g_new(MemoryRegion, 1);
+    memory_region_init_io(machine_id, NULL, &machine_id_ops, NULL,
+                          "machine-id", MACHINE_ID_SIZE);
+    memory_region_add_subregion_overlap(get_system_memory(), MACHINE_ID_BASE,
+                                        machine_id, 1);
+
     pci_bus = PCI_HOST_BRIDGE(grackle_dev)->bus;
 
     /* MacIO */
@@ -240,14 +630,32 @@ static void ppc_heathrow_init(MachineState *machine)
     if (dinfo) {
         dev = DEVICE(object_resolve_path_component(macio, "nvram"));
         qdev_prop_set_drive(dev, "drive", blk_by_legacy_dinfo(dinfo));
+    } else {
+        /*
+         * No user-supplied NVRAM image (-drive if=mtd,...) -- manage a
+         * default one ourselves so NVRAM contents (the Old World OF
+         * partition mac_nvram.c seeds on first use) persist across runs
+         * instead of being re-stamped from scratch on every boot.
+         */
+        BlockBackend *nvram_blk = mac_oldworld_default_nvram_blk();
+        if (nvram_blk) {
+            dev = DEVICE(object_resolve_path_component(macio, "nvram"));
+            qdev_prop_set_drive(dev, "drive", nvram_blk);
+        }
     }
 
     pci_realize_and_unref(PCI_DEVICE(macio), pci_bus, &error_fatal);
 
     pic_dev = DEVICE(object_resolve_path_component(macio, "pic"));
+    /*
+     * Heathrow lines 0x16-0x19: onboard GPU, PCI slots A1/B1/C1 --
+     * see pci_grackle_map_irq() for the real-hardware wiring this
+     * index order encodes. Requires the ATI model's pulse-style VBL
+     * interrupt; see the note there.
+     */
     for (i = 0; i < 4; i++) {
         qdev_connect_gpio_out(grackle_dev, i,
-                              qdev_get_gpio_in(pic_dev, 0x15 + i));
+                              qdev_get_gpio_in(pic_dev, 0x16 + i));
     }
 
     /* Connect the heathrow PIC outputs to the 6xx bus */
@@ -264,9 +672,15 @@ static void ppc_heathrow_init(MachineState *machine)
         }
     }
 
-    pci_vga_init(pci_bus);
-
-    pci_init_nic_devices(pci_bus, mc->default_nic);
+    /*
+     * Real hardware wires the ATI card at PCI device 18 (OF slot name
+     * "F1", confirmed via this machine's own device-tree dump) and the
+     * native ROM's PCI probe scans that specific slot rather than
+     * discovering devices generically -- auto-assigning devfn here
+     * left the card undetected and triggered a stack-pointer corruption
+     * in the ROM's native code once it found nothing at slot 18.
+     */
+    pci_create_simple(pci_bus, PCI_DEVFN(18, 0), TYPE_ATI_MACH64);
 
     /* MacIO IDE */
     ide_drive_get(hd, ARRAY_SIZE(hd));
@@ -276,9 +690,129 @@ static void ppc_heathrow_init(MachineState *machine)
     macio_ide = MACIO_IDE(object_resolve_path_component(macio, "ide[1]"));
     macio_ide_init_drives(macio_ide, &hd[MAX_IDE_DEVS]);
 
+    /* once every -device is in place, so the SCSI disks are visible too */
+    {
+        MacOldworldStartupPick *pick = g_new0(MacOldworldStartupPick, 1);
+
+        pick->notifier.notify = mac_oldworld_pick_startup_device;
+        pick->macio = macio;
+        memcpy(pick->hd, hd, sizeof(pick->hd));
+        qemu_add_machine_init_done_notifier(&pick->notifier);
+    }
+
     /* MacIO CUDA/ADB */
     dev = DEVICE(object_resolve_path_component(macio, "cuda"));
     adb_bus = qdev_get_child_bus(dev, "adb.0");
+
+    /*
+     * Real hardware determines its RAM configuration by reading an I2C
+     * SPD EEPROM on each populated DIMM slot via CUDA's I2C pass-through.
+     * Without it, real Beige G3 ROM/Toolbox RAM-sizing code walks off
+     * into the weeds (this was found to precede a later stack-pointer
+     * corruption during early boot).
+     *
+     * The Gossamer board has 3 physical DIMM slots, addressed 0x57/0x56/
+     * 0x55 for DIMM_1/2/3 respectively (confirmed against DingusPPC's
+     * real, working `machines/machinegossamer.cpp`: `setup_ram_slot(
+     * "RAM_DIMM_1", 0x57, ...)` etc. -- NOT the generic 168-pin-SPD
+     * 0x50-based sequential scheme `spdram.h`'s own doc comment
+     * describes, which is a different board's SA0-2 strapping, not this
+     * one). The requested RAM size is split greedily across the three
+     * slots using the largest supported module capacities (max 512MB
+     * per DIMM, per the SPD table this shares with DingusPPC's
+     * SpdSdram168::set_capacity()): -m 512 stays the historical single
+     * 512MB DIMM, -m 768 becomes 512+256, -m 1024 becomes 512+512.
+     * The ROM reads each populated slot's SPD, sizes each bank, and
+     * programs the MPC106 bank-decode registers accordingly -- which is
+     * why those registers being writable (hw/pci-host/grackle.c) is a
+     * prerequisite for multi-DIMM configurations. Slots with no module
+     * are left unregistered: the I2C bus NAKs unclaimed addresses,
+     * exactly the "empty slot" behavior real hardware shows.
+     *
+     * History, kept because it cost real debugging time: a prior
+     * version used a nonstandard 0x50 (not a real address on this
+     * board), and a still earlier regression blamed on the 0x57 switch
+     * was actually from registering the same content at TWO addresses
+     * simultaneously -- the SPD content itself was verified
+     * byte-for-byte against DingusPPC's SpdSdram168 for every capacity.
+     * A leftover -m remainder smaller than the smallest module (8MB) is
+     * simply not represented; the guest sees the sum of the DIMMs, and
+     * a warning notes any shortfall.
+     */
+    {
+        static const uint8_t dimm_addr[3] = { 0x57, 0x56, 0x55 };
+        uint64_t remaining = machine->ram_size;
+        int slot;
+
+        for (slot = 0; slot < 3 && remaining >= 8 * MiB; slot++) {
+            uint32_t megs = 0;
+            uint8_t *spd = g3beige_spd_data_generate(remaining, &megs);
+
+            smbus_eeprom_init_one(CUDA(dev)->i2c_bus, dimm_addr[slot], spd);
+            remaining -= (uint64_t)megs * MiB;
+        }
+        if (remaining) {
+            warn_report("g3beige: %" PRIu64 " MiB of RAM not representable "
+                        "as three DIMMs (max 512 MiB each); guest will see "
+                        "%" PRIu64 " MiB", remaining / MiB,
+                        (machine->ram_size - remaining) / MiB);
+        }
+    }
+
+    /*
+     * Real hardware also has a small I2C EEPROM at 0x53 identifying the
+     * "Whisper" personality card (confirmed via the device tree's
+     * "perch" node, iic-address 0xa6 = 0x53 << 1, compatible="Whisper"),
+     * which DingusPPC's Gossamer machine likewise creates
+     * (machines/machinegossamer.cpp's "Perch" I2CProm). Content matches
+     * DingusPPC's WhisperID byte-for-byte: 16-byte ID string, 16 zero
+     * bytes, then 0xFF padding for the rest of the 256-byte part except
+     * the very last byte (left at the buffer's default zero-fill).
+     */
+    {
+        static const uint8_t whisper_id[16] = {
+            0x0f, 0xaa, 0x55, 0xaa, 0x57, 0x68, 0x69, 0x73,
+            0x70, 0x65, 0x72, 0x00, 0x00, 0x00, 0x00, 0x02,
+        };
+        uint8_t *perch_buf = g_malloc0(256);
+        memset(perch_buf + 32, 0xff, 223);
+        memcpy(perch_buf, whisper_id, sizeof(whisper_id));
+        smbus_eeprom_init_one(CUDA(dev)->i2c_bus, 0x53, perch_buf);
+    }
+
+    /*
+     * Real hardware also has an Athens (Apple part# 343S1191) clock
+     * generator ASIC on this same I2C bus at address 0x28, confirmed via
+     * DingusPPC's machinegossamer.cpp. Without it, this address's
+     * CUDA_COMBINED_FORMAT_IIC presence probe NAKs; native ROM code uses
+     * exactly this kind of onboard-device probe (alongside the SPD/Perch
+     * probes above) to decide whether to fall into a factory-diagnostics
+     * serial console instead of continuing normal boot -- with every
+     * probed address NAK'ing (this device was entirely missing), it
+     * always took that path and then hung forever waiting for serial
+     * input that headless boot can never provide.
+     */
+    i2c_slave_create_simple(CUDA(dev)->i2c_bus, "athens", 0x28);
+
+    /*
+     * Real hardware also has a TDA7433 audio tone/volume control chip on
+     * this same I2C bus at address 0x45, alongside the AWACS/Screamer
+     * sound codec's own MMIO register block (confirmed via DingusPPC's
+     * devices/sound/awacs.cpp, which registers its AudioProcessor at this
+     * same address). Without it, this address's CUDA_COMBINED_FORMAT_IIC
+     * presence probe NAKs, contributing to the factory-diagnostics
+     * serial-console fallback described above.
+     */
+    {
+        I2CSlave *tda = i2c_slave_new("tda7433", 0x45);
+
+        /* it sits behind the codec's output: master volume/balance/mute */
+        object_property_set_link(OBJECT(tda), "codec",
+                                 object_resolve_path_component(macio, "awacs"),
+                                 &error_abort);
+        i2c_slave_realize_and_unref(tda, CUDA(dev)->i2c_bus, &error_fatal);
+    }
+
     dev = qdev_new(TYPE_ADB_KEYBOARD);
     qdev_realize_and_unref(dev, adb_bus, &error_fatal);
     dev = qdev_new(TYPE_ADB_MOUSE);
@@ -404,6 +938,53 @@ static int heathrow_kvm_type(MachineState *machine, const char *arg)
     return 2;
 }
 
+static char *heathrow_get_calib_governor(Object *obj, Error **errp)
+{
+    return calib_governor_get_config();
+}
+
+static void heathrow_set_calib_governor(Object *obj, const char *value,
+                                        Error **errp)
+{
+    calib_governor_configure(value, errp);
+}
+
+static void heathrow_get_gov_stat(Object *obj, Visitor *v, const char *name,
+                                  void *opaque, Error **errp)
+{
+    CalibGovStats gov;
+    uint64_t value;
+
+    calib_governor_get_stats(&gov);
+    switch ((uintptr_t)opaque) {
+    case 0:
+        value = gov.windows;
+        break;
+    case 1:
+        value = gov.governed_ns / 1000000;
+        break;
+    case 2:
+        value = gov.insns;
+        break;
+    case 3:
+        value = gov.slept_ns / 1000000;
+        break;
+    case 4:
+        value = gov.capped;
+        break;
+    case 5:
+        value = gov.ignored;
+        break;
+    case 6:
+        value = gov.ungoverned;
+        break;
+    default:
+        value = gov.probes;
+        break;
+    }
+    visit_type_uint64(v, name, &value, errp);
+}
+
 static void heathrow_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -420,12 +1001,67 @@ static void heathrow_class_init(ObjectClass *oc, const void *data)
     /* TOFIX "cad" when Mac floppy is implemented */
     mc->default_boot_order = "cd";
     mc->kvm_type = heathrow_kvm_type;
-    mc->default_cpu_type = POWERPC_CPU_TYPE_NAME("750_v3.1");
-    mc->default_display = "std";
-    mc->default_nic = "ne2k_pci";
+    mc->default_cpu_type = POWERPC_CPU_TYPE_NAME("750_v2.2");
     mc->ignore_boot_device_suffixes = true;
     mc->default_ram_id = "ppc_heathrow.ram";
+    /*
+     * Real Beige G3 ROM boot-time Memory Manager init reads a low-memory
+     * heap/zone-size global that is derived from installed RAM; below a
+     * certain threshold this negotiation tends to come up short compared
+     * to a real 256 MiB-equipped machine, and a later stage's linked-list
+     * resource walk (Slot Manager / device list) terminates early,
+     * leaving the stack in a state that can lead to a wild jump into RAM
+     * data during the escc self-test dispatch. QEMU's generic 128 MiB
+     * default (hw/core/machine.c) makes this the only observed outcome;
+     * matching the real hardware's common 256 MiB configuration (also
+     * DingusPPC's default for this same ROM) makes it much less likely,
+     * though boot timing is not fully deterministic here (VIA/CUDA
+     * real-time counters), so this mitigates rather than guarantees.
+     */
+    mc->default_ram_size = 256 * MiB;
     fwc->get_dev_path = heathrow_fw_dev_path;
+
+    /*
+     * This machine's ROM calibrates its CPU-speed constants by spinning
+     * a pure register loop inside a ~1ms VIA T2 one-shot; unthrottled
+     * TCG finishes the loop first and stores zero, which later divides
+     * by zero in the ATAPI driver and Open Transport. The governor
+     * paces the vCPU only while such a one-shot is armed. On by default
+     * because the failure it prevents is a boot-blocker, not a nicety.
+     */
+    object_class_property_add_str(oc, "calibration-governor",
+                                  heathrow_get_calib_governor,
+                                  heathrow_set_calib_governor);
+    object_class_property_set_description(oc, "calibration-governor",
+        "Pace the CPU while a VIA T2 one-shot calibration window is open and "
+        "the code running in it looks like a calibration spin: 'on' (the "
+        "default, 79 MIPS), 'off', 'mips=<n>', or 'warn-pct=<n>' for the "
+        "paced-share threshold of the runtime warning");
+
+    object_class_property_add(oc, "calibration-governor-windows", "uint64",
+                              heathrow_get_gov_stat, NULL, NULL,
+                              (void *)(uintptr_t)0);
+    object_class_property_add(oc, "calibration-governor-governed-ms", "uint64",
+                              heathrow_get_gov_stat, NULL, NULL,
+                              (void *)(uintptr_t)1);
+    object_class_property_add(oc, "calibration-governor-insns", "uint64",
+                              heathrow_get_gov_stat, NULL, NULL,
+                              (void *)(uintptr_t)2);
+    object_class_property_add(oc, "calibration-governor-slept-ms", "uint64",
+                              heathrow_get_gov_stat, NULL, NULL,
+                              (void *)(uintptr_t)3);
+    object_class_property_add(oc, "calibration-governor-capped", "uint64",
+                              heathrow_get_gov_stat, NULL, NULL,
+                              (void *)(uintptr_t)4);
+    object_class_property_add(oc, "calibration-governor-ignored", "uint64",
+                              heathrow_get_gov_stat, NULL, NULL,
+                              (void *)(uintptr_t)5);
+    object_class_property_add(oc, "calibration-governor-ungoverned", "uint64",
+                              heathrow_get_gov_stat, NULL, NULL,
+                              (void *)(uintptr_t)6);
+    object_class_property_add(oc, "calibration-governor-probes", "uint64",
+                              heathrow_get_gov_stat, NULL, NULL,
+                              (void *)(uintptr_t)7);
 }
 
 static const TypeInfo ppc_heathrow_machine_info = {

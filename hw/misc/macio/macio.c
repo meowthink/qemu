@@ -42,11 +42,6 @@
 
 #define ESCC_CLOCK 3686400
 
-/* BMAC (Ethernet) IRQ definitions for Heathrow */
-#define OLDWORLD_BMAC_IRQ       14
-#define OLDWORLD_BMAC_TXDMA_IRQ 10
-#define OLDWORLD_BMAC_RXDMA_IRQ 11
-
 /* Note: this code is strongly inspired by the corresponding code in PearPC */
 
 /*
@@ -156,6 +151,13 @@ static void macio_oldworld_realize(PCIDevice *d, Error **errp)
         return;
     }
 
+    /*
+     * Real Beige G3 hardware's mac-io/heathrow chip reports revision-id=1
+     * in its PCI config space (confirmed against a real hardware Open
+     * Firmware device-tree dump, "revision-id" property under Node mac-io).
+     */
+    pci_set_byte(&d->config[PCI_REVISION_ID], 1);
+
     /* Heathrow PIC */
     if (!qdev_realize(DEVICE(&os->pic), BUS(&s->macio_bus), errp)) {
         return;
@@ -203,38 +205,88 @@ static void macio_oldworld_realize(PCIDevice *d, Error **errp)
     sbd = SYS_BUS_DEVICE(&os->nvram);
     memory_region_add_subregion(&s->bar, 0x60000,
                                 sysbus_mmio_get_region(sbd, 0));
-    pmac_format_nvram_partition(&os->nvram, os->nvram.size);
+    pmac_format_nvram_partition_oldworld(&os->nvram);
 
-    /* IDE buses */
+    /*
+     * IDE buses. Channel numbers 0xb/0xc (not the seemingly more
+     * "familiar" 0x16/0x1a): with the corrected DBDMA_CHANNEL_SHIFT
+     * (include/hw/ppc/mac_dbdma.h), a real ROM's IDE0 DMA-start command
+     * is observed to set RUN on internal channel 0x0b. The old values
+     * were tuned to double-compensate for the wrong shift.
+     */
     if (!macio_realize_ide(s, &os->ide[0],
                            qdev_get_gpio_in(pic_dev, OLDWORLD_IDE0_IRQ),
                            qdev_get_gpio_in(pic_dev, OLDWORLD_IDE0_DMA_IRQ),
-                           0x16, errp)) {
+                           0x0b, errp)) {
         return;
     }
 
     if (!macio_realize_ide(s, &os->ide[1],
                            qdev_get_gpio_in(pic_dev, OLDWORLD_IDE1_IRQ),
                            qdev_get_gpio_in(pic_dev, OLDWORLD_IDE1_DMA_IRQ),
-                           0x1a, errp)) {
+                           0x0c, errp)) {
         return;
     }
 
-    /* BMAC Ethernet */
-    /* Connect BMAC to network if configured via -net or -nic */
-    qemu_configure_nic_device(DEVICE(&os->bmac), true, "bmac");
-    if (!qdev_realize(DEVICE(&os->bmac), BUS(&s->macio_bus), errp)) {
+    /*
+     * BMAC ethernet: physically always present on the real board, but
+     * created only when the user actually asked for networking -- a
+     * pluggable-NIC-style "-nic none" cannot otherwise keep a guest whose
+     * system software chokes on an Ethernet controller from seeing one.
+     */
+    if (qemu_find_nic_info(TYPE_BMAC, true, "bmac")) {
+        qemu_configure_nic_device(DEVICE(&os->bmac), true, "bmac");
+        if (!qdev_realize(DEVICE(&os->bmac), BUS(&s->macio_bus), errp)) {
+            return;
+        }
+        sbd = SYS_BUS_DEVICE(&os->bmac);
+        memory_region_add_subregion(&s->bar, 0x11000,
+                                    sysbus_mmio_get_region(sbd, 0));
+        sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev, OLDWORLD_BMAC_IRQ));
+        sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, OLDWORLD_BMAC_TX_IRQ));
+        sysbus_connect_irq(sbd, 2, qdev_get_gpio_in(pic_dev, OLDWORLD_BMAC_RX_IRQ));
+        bmac_register_dma(&os->bmac, &s->dbdma);
+    }
+
+    /* MESH SCSI controller: always physically present */
+    if (!qdev_realize(DEVICE(&os->mesh), BUS(&s->macio_bus), errp)) {
         return;
     }
-    sbd = SYS_BUS_DEVICE(&os->bmac);
-    memory_region_add_subregion(&s->bar, 0x11000,
+    sbd = SYS_BUS_DEVICE(&os->mesh);
+    memory_region_add_subregion(&s->bar, 0x10000,
                                 sysbus_mmio_get_region(sbd, 0));
-    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev, OLDWORLD_BMAC_IRQ));
-    sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, OLDWORLD_BMAC_TXDMA_IRQ));
-    sysbus_connect_irq(sbd, 2, qdev_get_gpio_in(pic_dev, OLDWORLD_BMAC_RXDMA_IRQ));
-    
-    /* Register BMAC DMA channels with DBDMA */
-    bmac_register_dma(&os->bmac, &s->dbdma);
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev, OLDWORLD_MESH_IRQ));
+    sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, OLDWORLD_MESH_DMA_IRQ));
+    mesh_register_dma(&os->mesh, &s->dbdma);
+
+    /*
+     * AWACS sound codec: always physically present. The real ROM plays a
+     * startup chime very early and hangs polling Codec Status otherwise.
+     */
+    if (!qdev_realize(DEVICE(&os->awacs), BUS(&s->macio_bus), errp)) {
+        return;
+    }
+    sbd = SYS_BUS_DEVICE(&os->awacs);
+    memory_region_add_subregion(&s->bar, 0x14000,
+                                sysbus_mmio_get_region(sbd, 0));
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev, OLDWORLD_AWACS_IRQ));
+    sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, OLDWORLD_AWACS_DMA_IRQ));
+    awacs_register_dma(&os->awacs, &s->dbdma);
+
+    /*
+     * SWIM3 floppy controller: always physically present; 16 byte-wide
+     * registers at a 16-byte stride in a 0x1000 window, sector data
+     * through DBDMA channel 1.
+     */
+    if (!qdev_realize(DEVICE(&os->swim), BUS(&s->macio_bus), errp)) {
+        return;
+    }
+    sbd = SYS_BUS_DEVICE(&os->swim);
+    memory_region_add_subregion(&s->bar, 0x15000,
+                                sysbus_mmio_get_region(sbd, 0));
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev, OLDWORLD_SWIM_IRQ));
+    sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, 0x01));
+    swim3_register_dma(&os->swim, &s->dbdma);
 }
 
 static void macio_init_ide(MacIOState *s, MACIOIDEState *ide, int index)
@@ -268,7 +320,12 @@ static void macio_oldworld_init(Object *obj)
         macio_init_ide(s, &os->ide[i], i);
     }
 
-    object_initialize_child(obj, "bmac", &os->bmac, TYPE_BMAC);
+    if (qemu_find_nic_info(TYPE_BMAC, true, "bmac")) {
+        object_initialize_child(obj, "bmac", &os->bmac, TYPE_BMAC);
+    }
+    object_initialize_child(obj, "mesh", &os->mesh, TYPE_MESH);
+    object_initialize_child(obj, "awacs", &os->awacs, TYPE_AWACS);
+    object_initialize_child(obj, "swim", &os->swim, TYPE_SWIM3);
 }
 
 static void timer_write(void *opaque, hwaddr addr, uint64_t value,
