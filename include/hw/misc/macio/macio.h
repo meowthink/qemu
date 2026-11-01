@@ -36,6 +36,7 @@
 #include "hw/nvram/mac_nvram.h"
 #include "hw/ppc/mac_dbdma.h"
 #include "hw/ppc/openpic.h"
+#include "hw/net/bmac.h"
 #include "qom/object.h"
 
 /* Old World IRQs */
@@ -127,6 +128,7 @@ struct OldWorldMacIOState {
 
     MacIONVRAMState nvram;
     MACIOIDEState ide[2];
+    BMACState bmac;
 };
 
 #define TYPE_NEWWORLD_MACIO "macio-newworld"

@@ -34,9 +34,16 @@
 #include "hw/char/escc.h"
 #include "hw/misc/macio/macio.h"
 #include "hw/intc/heathrow_pic.h"
+#include "hw/net/bmac.h"
+#include "net/net.h"
 #include "trace.h"
 
 #define ESCC_CLOCK 3686400
+
+/* BMAC (Ethernet) IRQ definitions for Heathrow */
+#define OLDWORLD_BMAC_IRQ       14
+#define OLDWORLD_BMAC_TXDMA_IRQ 10
+#define OLDWORLD_BMAC_RXDMA_IRQ 11
 
 /* Note: this code is strongly inspired by the corresponding code in PearPC */
 
@@ -191,6 +198,22 @@ static void macio_oldworld_realize(PCIDevice *d, Error **errp)
                            0x1a, errp)) {
         return;
     }
+
+    /* BMAC Ethernet */
+    /* Connect BMAC to network if configured via -net or -nic */
+    qemu_configure_nic_device(DEVICE(&os->bmac), true, "bmac");
+    if (!qdev_realize(DEVICE(&os->bmac), BUS(&s->macio_bus), errp)) {
+        return;
+    }
+    sbd = SYS_BUS_DEVICE(&os->bmac);
+    memory_region_add_subregion(&s->bar, 0x11000,
+                                sysbus_mmio_get_region(sbd, 0));
+    sysbus_connect_irq(sbd, 0, qdev_get_gpio_in(pic_dev, OLDWORLD_BMAC_IRQ));
+    sysbus_connect_irq(sbd, 1, qdev_get_gpio_in(pic_dev, OLDWORLD_BMAC_TXDMA_IRQ));
+    sysbus_connect_irq(sbd, 2, qdev_get_gpio_in(pic_dev, OLDWORLD_BMAC_RXDMA_IRQ));
+    
+    /* Register BMAC DMA channels with DBDMA */
+    bmac_register_dma(&os->bmac, &s->dbdma);
 }
 
 static void macio_init_ide(MacIOState *s, MACIOIDEState *ide, int index)
@@ -223,6 +246,8 @@ static void macio_oldworld_init(Object *obj)
     for (i = 0; i < 2; i++) {
         macio_init_ide(s, &os->ide[i], i);
     }
+
+    object_initialize_child(obj, "bmac", &os->bmac, TYPE_BMAC);
 }
 
 static void timer_write(void *opaque, hwaddr addr, uint64_t value,
