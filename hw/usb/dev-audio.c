@@ -127,6 +127,8 @@ static unsigned altset_channels[] = {
 #define USBAUDIO_PACKET_SIZE(channels) (USBAUDIO_PACKET_SIZE_BASE * channels)
 #define USBAUDIO_SAMPLE_RATE     48000
 #define USBAUDIO_PACKET_INTERVAL 1
+/* the stereo settings also take 44.1 kHz, the rate drivers pick by default */
+#define USBAUDIO_SAMPLE_RATE_CD  44100
 
 static const USBDescIface desc_iface[] = {
     {
@@ -260,22 +262,23 @@ static const USBDescIface desc_iface[] = {
             },{
                 /* Headphone Type I Format Type Descriptor */
                 .data = (uint8_t[]) {
-                    0x0b,                       /*  u8  bLength */
+                    0x0e,                       /*  u8  bLength */
                     USB_DT_CS_INTERFACE,        /*  u8  bDescriptorType */
                     DST_AS_FORMAT_TYPE,         /*  u8  bDescriptorSubtype */
                     0x01,                       /*  u8  bFormatType */
                     0x02,                       /*  u8  bNrChannels */
                     0x02,                       /*  u8  bSubFrameSize */
                     0x10,                       /*  u8  bBitResolution */
-                    0x01,                       /*  u8  bSamFreqType */
-                    U24(USBAUDIO_SAMPLE_RATE),  /* u24  tSamFreq */
+                    0x02,                       /*  u8  bSamFreqType */
+                    U24(USBAUDIO_SAMPLE_RATE_CD), /* u24  tSamFreq(1) */
+                    U24(USBAUDIO_SAMPLE_RATE),  /* u24  tSamFreq(2) */
                 }
             }
         },
         .eps = (USBDescEndpoint[]) {
             {
                 .bEndpointAddress      = USB_DIR_OUT | 0x01,
-                .bmAttributes          = 0x09,
+                .bmAttributes          = 0x0d,
                 .wMaxPacketSize        = USBAUDIO_PACKET_SIZE(2),
                 .bInterval             = 1,
                 .is_audio              = 1,
@@ -285,7 +288,7 @@ static const USBDescIface desc_iface[] = {
                     0x07,                       /*  u8  bLength */
                     USB_DT_CS_ENDPOINT,         /*  u8  bDescriptorType */
                     DST_EP_GENERAL,             /*  u8  bDescriptorSubtype */
-                    0x00,                       /*  u8  bmAttributes */
+                    0x01,                       /*  u8  bmAttributes (freq) */
                     0x00,                       /*  u8  bLockDelayUnits */
                     U16(0x0000),                /* u16  wLockDelay */
                 },
@@ -320,15 +323,16 @@ static const USBDescIface desc_iface[] = {
             },{
                 /* Microphone Type I Format Type Descriptor */
                 .data = (uint8_t[]) {
-                    0x0b,                       /*  u8  bLength */
+                    0x0e,                       /*  u8  bLength */
                     USB_DT_CS_INTERFACE,        /*  u8  bDescriptorType */
                     DST_AS_FORMAT_TYPE,         /*  u8  bDescriptorSubtype */
                     0x01,                       /*  u8  bFormatType */
                     0x02,                       /*  u8  bNrChannels */
                     0x02,                       /*  u8  bSubFrameSize */
                     0x10,                       /*  u8  bBitResolution */
-                    0x01,                       /*  u8  bSamFreqType */
-                    U24(USBAUDIO_SAMPLE_RATE),  /* u24  tSamFreq */
+                    0x02,                       /*  u8  bSamFreqType */
+                    U24(USBAUDIO_SAMPLE_RATE_CD), /* u24  tSamFreq(1) */
+                    U24(USBAUDIO_SAMPLE_RATE),  /* u24  tSamFreq(2) */
                 }
             }
         },
@@ -345,7 +349,7 @@ static const USBDescIface desc_iface[] = {
                     0x07,                       /*  u8  bLength */
                     USB_DT_CS_ENDPOINT,         /*  u8  bDescriptorType */
                     DST_EP_GENERAL,             /*  u8  bDescriptorSubtype */
-                    0x00,                       /*  u8  bmAttributes */
+                    0x01,                       /*  u8  bmAttributes (freq) */
                     0x00,                       /*  u8  bLockDelayUnits */
                     U16(0x0000),                /* u16  wLockDelay */
                 },
@@ -355,7 +359,7 @@ static const USBDescIface desc_iface[] = {
 };
 
 static const USBDescDevice desc_device = {
-    .bcdUSB                        = 0x0110,
+    .bcdUSB                        = 0x0100,
     .bMaxPacketSize0               = 64,
     .bNumConfigurations            = 1,
     .confs = (USBDescConfig[]) {
@@ -524,22 +528,23 @@ static const USBDescIface desc_iface_multi[] = {
             },{
                 /* Headphone Type I Format Type Descriptor */
                 .data = (uint8_t[]) {
-                    0x0b,                       /*  u8  bLength */
+                    0x0e,                       /*  u8  bLength */
                     USB_DT_CS_INTERFACE,        /*  u8  bDescriptorType */
                     DST_AS_FORMAT_TYPE,         /*  u8  bDescriptorSubtype */
                     0x01,                       /*  u8  bFormatType */
                     0x02,                       /*  u8  bNrChannels */
                     0x02,                       /*  u8  bSubFrameSize */
                     0x10,                       /*  u8  bBitResolution */
-                    0x01,                       /*  u8  bSamFreqType */
-                    U24(USBAUDIO_SAMPLE_RATE),  /* u24  tSamFreq */
+                    0x02,                       /*  u8  bSamFreqType */
+                    U24(USBAUDIO_SAMPLE_RATE_CD), /* u24  tSamFreq(1) */
+                    U24(USBAUDIO_SAMPLE_RATE),  /* u24  tSamFreq(2) */
                 }
             }
         },
         .eps = (USBDescEndpoint[]) {
             {
                 .bEndpointAddress      = USB_DIR_OUT | 0x01,
-                .bmAttributes          = 0x09,
+                .bmAttributes          = 0x0d,
                 .wMaxPacketSize        = USBAUDIO_PACKET_SIZE(2),
                 .bInterval             = 1,
                 .is_audio              = 1,
@@ -549,7 +554,7 @@ static const USBDescIface desc_iface_multi[] = {
                     0x07,                       /*  u8  bLength */
                     USB_DT_CS_ENDPOINT,         /*  u8  bDescriptorType */
                     DST_EP_GENERAL,             /*  u8  bDescriptorSubtype */
-                    0x00,                       /*  u8  bmAttributes */
+                    0x01,                       /*  u8  bmAttributes (freq) */
                     0x00,                       /*  u8  bLockDelayUnits */
                     U16(0x0000),                /* u16  wLockDelay */
                 },
@@ -592,7 +597,7 @@ static const USBDescIface desc_iface_multi[] = {
         .eps = (USBDescEndpoint[]) {
             {
                 .bEndpointAddress      = USB_DIR_OUT | 0x01,
-                .bmAttributes          = 0x09,
+                .bmAttributes          = 0x0d,
                 .wMaxPacketSize        = USBAUDIO_PACKET_SIZE(6),
                 .bInterval             = 1,
                 .is_audio              = 1,
@@ -645,7 +650,7 @@ static const USBDescIface desc_iface_multi[] = {
         .eps = (USBDescEndpoint[]) {
             {
                 .bEndpointAddress      = USB_DIR_OUT | 0x01,
-                .bmAttributes          = 0x09,
+                .bmAttributes          = 0x0d,
                 .wMaxPacketSize        = USBAUDIO_PACKET_SIZE(8),
                 .bInterval             = 1,
                 .is_audio              = 1,
@@ -690,15 +695,16 @@ static const USBDescIface desc_iface_multi[] = {
             },{
                 /* Microphone Type I Format Type Descriptor */
                 .data = (uint8_t[]) {
-                    0x0b,                       /*  u8  bLength */
+                    0x0e,                       /*  u8  bLength */
                     USB_DT_CS_INTERFACE,        /*  u8  bDescriptorType */
                     DST_AS_FORMAT_TYPE,         /*  u8  bDescriptorSubtype */
                     0x01,                       /*  u8  bFormatType */
                     0x02,                       /*  u8  bNrChannels */
                     0x02,                       /*  u8  bSubFrameSize */
                     0x10,                       /*  u8  bBitResolution */
-                    0x01,                       /*  u8  bSamFreqType */
-                    U24(USBAUDIO_SAMPLE_RATE),  /* u24  tSamFreq */
+                    0x02,                       /*  u8  bSamFreqType */
+                    U24(USBAUDIO_SAMPLE_RATE_CD), /* u24  tSamFreq(1) */
+                    U24(USBAUDIO_SAMPLE_RATE),  /* u24  tSamFreq(2) */
                 }
             }
         },
@@ -715,7 +721,7 @@ static const USBDescIface desc_iface_multi[] = {
                     0x07,                       /*  u8  bLength */
                     USB_DT_CS_ENDPOINT,         /*  u8  bDescriptorType */
                     DST_EP_GENERAL,             /*  u8  bDescriptorSubtype */
-                    0x00,                       /*  u8  bmAttributes */
+                    0x01,                       /*  u8  bmAttributes (freq) */
                     0x00,                       /*  u8  bLockDelayUnits */
                     U16(0x0000),                /* u16  wLockDelay */
                 },
@@ -725,7 +731,7 @@ static const USBDescIface desc_iface_multi[] = {
 };
 
 static const USBDescDevice desc_device_multi = {
-    .bcdUSB                        = 0x0110,
+    .bcdUSB                        = 0x0100,
     .bMaxPacketSize0               = 64,
     .bNumConfigurations            = 1,
     .confs = (USBDescConfig[]) {
@@ -784,6 +790,16 @@ static const USBDesc desc_audio_multi = {
 #define LOUDNESS_CONTROL                0x0a
 
 /*
+ * Endpoint Control Selectors
+ */
+#define SAMPLING_FREQ_CONTROL           0x01
+
+#define ClassEndpointRequest \
+        ((USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_ENDPOINT) << 8)
+#define ClassEndpointOutRequest \
+        ((USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_ENDPOINT) << 8)
+
+/*
  * buffering
  */
 
@@ -797,10 +813,8 @@ struct streambuf {
 static void streambuf_init(struct streambuf *buf, uint32_t size,
                            uint32_t channels)
 {
-    uint32_t frame_size = channels * 2; /* 16-bit samples */
-
     g_free(buf->data);
-    buf->size = size - (size % frame_size);
+    buf->size = size - (size % USBAUDIO_PACKET_SIZE(channels));
     buf->data = g_malloc(buf->size);
     buf->prod = 0;
     buf->cons = 0;
@@ -814,33 +828,24 @@ static void streambuf_fini(struct streambuf *buf)
 
 static int streambuf_put(struct streambuf *buf, USBPacket *p, uint32_t channels)
 {
-    uint32_t frame_size = channels * 2; /* 16-bit samples */
-    size_t pkt_size = p->iov.size;
     int64_t free = buf->size - (buf->prod - buf->cons);
-
-    if (pkt_size == 0 || pkt_size % frame_size != 0) {
-        return 0;
-    }
-    if (pkt_size > buf->size) {
-        return 0;
-    }
-
-    /* If buffer is full, drop oldest data to make room */
-    if ((int64_t)pkt_size > free) {
-        buf->cons = buf->prod - (buf->size - pkt_size);
-    }
-
-    /* Handle ring buffer wraparound */
+    size_t len = p->iov.size;
     size_t offset = buf->prod % buf->size;
-    if (offset + pkt_size <= buf->size) {
-        usb_packet_copy(p, buf->data + offset, pkt_size);
-    } else {
-        size_t first = buf->size - offset;
-        usb_packet_copy(p, buf->data + offset, first);
-        usb_packet_copy(p, buf->data, pkt_size - first);
+    size_t first = MIN(len, buf->size - offset);
+
+    if (free < len) {
+        return 0;
     }
-    buf->prod += pkt_size;
-    return pkt_size;
+    if (len > USBAUDIO_PACKET_SIZE(channels) || len % (channels * 2)) {
+        return 0;
+    }
+
+    usb_packet_copy(p, buf->data + offset, first);
+    if (first < len) {
+        usb_packet_copy(p, buf->data, len - first);
+    }
+    buf->prod += len;
+    return len;
 }
 
 static uint8_t *streambuf_get(struct streambuf *buf, size_t *len)
@@ -864,10 +869,9 @@ static uint8_t *streambuf_get(struct streambuf *buf, size_t *len)
  * to avoid zero-sample artifacts (hiss) from rate mismatch underruns.
  */
 static int streambuf_read(struct streambuf *buf, USBPacket *p,
-                          uint32_t channels)
+                          size_t pkt_size)
 {
     int64_t used = buf->prod - buf->cons;
-    size_t pkt_size = USBAUDIO_PACKET_SIZE(channels);
 
     if (used >= (int64_t)pkt_size) {
         size_t offset = buf->cons % buf->size;
@@ -916,6 +920,7 @@ struct USBAudioState {
         Volume vol;
         struct streambuf buf;
         uint32_t channels;
+        uint32_t freq;
     } out;
 
     struct {
@@ -925,6 +930,8 @@ struct USBAudioState {
         Volume vol;
         struct streambuf buf;
         uint32_t channels;
+        uint32_t freq;
+        uint32_t frac;      /* samples owed to the next packet, in 1/1000 */
     } in;
 
     /* properties */
@@ -940,7 +947,6 @@ static void output_callback(void *opaque, int avail)
 {
     USBAudioState *s = opaque;
     uint8_t *data;
-    uint32_t frame_size = s->out.channels * 2; /* 16-bit samples */
 
     while (avail) {
         size_t written, len;
@@ -950,14 +956,7 @@ static void output_callback(void *opaque, int avail)
             return;
         }
 
-        /* Ensure we only write whole audio frames */
-        len = len - (len % frame_size);
-        if (len == 0) {
-            return;
-        }
-
         written = audio_be_write(s->audio_be, s->out.voice, data, len);
-        written = written - (written % frame_size);
         avail -= written;
         s->out.buf.cons += written;
 
@@ -967,8 +966,24 @@ static void output_callback(void *opaque, int avail)
     }
 }
 
+static void usb_audio_set_output_freq(USBAudioState *s, uint32_t freq)
+{
+    s->out.freq = freq;
+    s->out.as.freq = freq;
+    s->out.voice = audio_be_open_out(s->audio_be, s->out.voice, TYPE_USB_AUDIO,
+                                     s, output_callback, &s->out.as);
+    audio_be_set_volume_out(s->audio_be, s->out.voice, &s->out.vol);
+    streambuf_init(&s->out.buf, s->buffer, s->out.channels);
+    audio_be_set_active_out(s->audio_be, s->out.voice,
+                            s->out.altset != ALTSET_OFF);
+}
+
 static int usb_audio_set_output_altset(USBAudioState *s, int altset)
 {
+    /* only the stereo setting has a sampling frequency control */
+    uint32_t freq = altset == ALTSET_STEREO ? s->out.freq
+                                            : USBAUDIO_SAMPLE_RATE;
+
     switch (altset) {
     case ALTSET_OFF:
         audio_be_set_active_out(s->audio_be, s->out.voice, false);
@@ -977,10 +992,12 @@ static int usb_audio_set_output_altset(USBAudioState *s, int altset)
     case ALTSET_51:
     case ALTSET_71:
         if (s->out.channels != altset_channels[altset]) {
+            s->out.freq = freq;
             usb_audio_reinit(USB_DEVICE(s), altset_channels[altset]);
-        } else if (s->out.altset == ALTSET_OFF) {
-            streambuf_init(&s->out.buf, s->buffer, s->out.channels);
+        } else if (s->out.freq != freq) {
+            usb_audio_set_output_freq(s, freq);
         }
+        streambuf_init(&s->out.buf, s->buffer, s->out.channels);
         audio_be_set_active_out(s->audio_be, s->out.voice, true);
         break;
     default:
@@ -1021,6 +1038,21 @@ static void input_callback(void *opaque, int avail)
         }
         buf->prod += nread;
         avail -= nread;
+    }
+}
+
+static void usb_audio_set_input_freq(USBAudioState *s, uint32_t freq)
+{
+    s->in.freq = freq;
+    s->in.as.freq = freq;
+    s->in.frac = 0;
+    s->in.voice = audio_be_open_in(s->audio_be, s->in.voice, TYPE_USB_AUDIO,
+                                   s, input_callback, &s->in.as);
+    streambuf_init(&s->in.buf, 32 * USBAUDIO_PACKET_SIZE(2), 2);
+    if (s->in.voice) {
+        audio_be_set_volume_in(s->audio_be, s->in.voice, &s->in.vol);
+        audio_be_set_active_in(s->audio_be, s->in.voice,
+                               s->in.altset != ALTSET_OFF);
     }
 }
 
@@ -1247,6 +1279,43 @@ static void usb_audio_handle_control(USBDevice *dev, USBPacket *p,
     }
 
     switch (request) {
+    case ClassEndpointRequest | CR_GET_CUR:
+        if (value != SAMPLING_FREQ_CONTROL << 8 || length < 3 ||
+            ((index & 0xff) != (USB_DIR_OUT | 1) &&
+             (index & 0xff) != (USB_DIR_IN | 2))) {
+            goto fail;
+        }
+        ret = (index & 0xff) == (USB_DIR_OUT | 1) ? s->out.freq : s->in.freq;
+        data[0] = ret;
+        data[1] = ret >> 8;
+        data[2] = ret >> 16;
+        p->actual_length = 3;
+        break;
+    case ClassEndpointOutRequest | CR_SET_CUR:
+        if (value != SAMPLING_FREQ_CONTROL << 8 || length < 3) {
+            goto fail;
+        }
+        ret = data[0] | (data[1] << 8) | (data[2] << 16);
+        if (ret != USBAUDIO_SAMPLE_RATE && ret != USBAUDIO_SAMPLE_RATE_CD) {
+            goto fail;
+        }
+        if ((index & 0xff) == (USB_DIR_OUT | 1) &&
+            s->out.altset <= ALTSET_STEREO) {
+            if (ret != s->out.freq) {
+                usb_audio_set_output_freq(s, ret);
+            }
+        } else if ((index & 0xff) == (USB_DIR_IN | 2)) {
+            if (ret != s->in.freq) {
+                usb_audio_set_input_freq(s, ret);
+            }
+        } else {
+            goto fail;
+        }
+        if (s->debug) {
+            fprintf(stderr, "usb-audio: ep 0x%02x rate %d\n",
+                    index & 0xff, ret);
+        }
+        break;
     case ClassInterfaceRequest | CR_GET_CUR:
     case ClassInterfaceRequest | CR_GET_MIN:
     case ClassInterfaceRequest | CR_GET_MAX:
@@ -1318,19 +1387,28 @@ static void usb_audio_handle_dataout(USBAudioState *s, USBPacket *p)
         return;
     }
 
-    if (!streambuf_put(&s->out.buf, p, s->out.channels)) {
-        usb_packet_skip(p, p->iov.size);
+    streambuf_put(&s->out.buf, p, s->out.channels);
+    if (p->actual_length < p->iov.size && s->debug > 1) {
+        fprintf(stderr, "usb-audio: output overrun (%zd bytes)\n",
+                p->iov.size - p->actual_length);
     }
 }
 
 static void usb_audio_handle_datain(USBAudioState *s, USBPacket *p)
 {
+    size_t frames;
+
     if (s->in.altset == ALTSET_OFF) {
         p->status = USB_RET_STALL;
         return;
     }
 
-    streambuf_read(&s->in.buf, p, s->in.channels);
+    /* 44.1 kHz: nine packets of 44 frames, then one of 45 */
+    s->in.frac += s->in.freq;
+    frames = s->in.frac / 1000;
+    s->in.frac %= 1000;
+    streambuf_read(&s->in.buf, p,
+                   MIN(frames * s->in.channels * 2, p->iov.size));
 }
 
 static void usb_audio_handle_data(USBDevice *dev, USBPacket *p)
@@ -1394,7 +1472,9 @@ static void usb_audio_realize(USBDevice *dev, Error **errp)
         s->out.vol.vol[i] = 240; /* 0 dB */
     }
 
+    s->out.freq          = USBAUDIO_SAMPLE_RATE;
     s->in.altset         = ALTSET_OFF;
+    s->in.freq           = USBAUDIO_SAMPLE_RATE;
     s->in.vol.mute       = false;
     s->in.vol.vol[0]     = 240; /* 0 dB */
     s->in.vol.vol[1]     = 240;
@@ -1408,13 +1488,13 @@ static void usb_audio_reinit(USBDevice *dev, unsigned channels)
 
     s->out.channels      = channels;
     if (!s->buffer_user) {
-        s->buffer = 64 * USBAUDIO_PACKET_SIZE(s->out.channels);
+        s->buffer = 32 * USBAUDIO_PACKET_SIZE(s->out.channels);
     } else {
         s->buffer = s->buffer_user;
     }
 
     s->out.vol.channels  = s->out.channels;
-    s->out.as.freq       = USBAUDIO_SAMPLE_RATE;
+    s->out.as.freq       = s->out.freq;
     s->out.as.nchannels  = s->out.channels;
     s->out.as.fmt        = AUDIO_FORMAT_S16;
     s->out.as.big_endian = false;
@@ -1428,7 +1508,7 @@ static void usb_audio_reinit(USBDevice *dev, unsigned channels)
     /* Input is always stereo */
     s->in.channels       = 2;
     s->in.vol.channels   = 2;
-    s->in.as.freq        = USBAUDIO_SAMPLE_RATE;
+    s->in.as.freq        = s->in.freq;
     s->in.as.nchannels   = 2;
     s->in.as.fmt         = AUDIO_FORMAT_S16;
     streambuf_init(&s->in.buf, 32 * USBAUDIO_PACKET_SIZE(2), 2);
