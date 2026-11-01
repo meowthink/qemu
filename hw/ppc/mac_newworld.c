@@ -152,6 +152,7 @@ typedef enum {
 typedef struct Core99ModelInfo {
     const char *name;
     const char *cpu_type;
+    const uint8_t *spd_donor;
     uint32_t tbfreq;
     uint32_t clockfreq;
     uint32_t busfreq;
@@ -162,13 +163,13 @@ typedef struct Core99ModelInfo {
 static const Core99ModelInfo core99_models[] = {
     /* PowerMac3,1 "Sawtooth", 100MHz bus */
     { "pm31", POWERPC_CPU_TYPE_NAME("7400_v2.9"),
-      25000000, 500000000, 100000000, 0xB0000000, 3 },
+      mac_spd_dimm0, 25000000, 500000000, 100000000, 0xB0000000, 3 },
     /* PowerMac3,4 "Digital Audio", 933MHz (the Quicksilver ratio) */
     { "pm34", POWERPC_CPU_TYPE_NAME("7400_v2.9"),
-      33290001, 933333331, 133160004, 0x20000000, 3 },
+      mac_spd_dimm0, 33290001, 933333331, 133160004, 0x20000000, 3 },
     /* PowerMac3,6 "Mirrored Drive Doors", dual 867MHz, 4 DIMM slots */
     { "pm36", POWERPC_CPU_TYPE_NAME("7455_v2.1"),
-      33306279, 866666664, 133225119, 0x0000A000, 4 },
+      mac_spd_pm36_dimm0, 33306279, 866666664, 133225119, 0x0000A000, 4 },
 };
 
 #define CORE99_DEFAULT_MODEL 1  /* pm34 */
@@ -248,7 +249,7 @@ static void core99_add_spd_dimms(const Core99MachineState *cms, I2CBus *bus,
             g++;
             continue;
         }
-        memcpy(spd, mac_spd_dimm0, MAC_SPD_SIZE);
+        memcpy(spd, model->spd_donor, MAC_SPD_SIZE);
         spd[3] = spd_geom[g].rows;
         spd[4] = spd_geom[g].cols;
         spd[5] = spd_geom[g].ranks;
