@@ -431,6 +431,109 @@ static void pmu_cmd_read_pmu_ram(PMUState *s,
     *out_len = 0;
 }
 
+/*
+ * PMU_I2C_CMD: the PMU is an I2C master in its own right, and on a
+ * PowerMac3,6 the DIMM clock buffer hangs off it rather than off UniNorth or
+ * KeyLargo.  The real 4.6.0f1 ROM finishes its device tree by switching off
+ * the clocks of empty DIMM slots through here, and brackets every transfer
+ * with a poll loop (clear-pmu-status) that only exits once a
+ * PMU_I2C_BUS_STATUS query answers PMU_I2C_STATUS_OK -- so a PMU that does
+ * not know the command never answers at all and hangs Open Firmware for
+ * good, before it has looked for anything to boot.
+ *
+ * The request is Linux's struct pmu_i2c_hdr:
+ *   bus, mode, bus2, address, sub_addr, comb_addr, count, data[count]
+ * The command's own reply is just a status byte; the result of the transfer
+ * is fetched afterwards with a one-byte request naming PMU_I2C_BUS_STATUS,
+ * answered by OK for a write or DATAREAD plus the bytes for a read.
+ */
+#define PMU_I2C_STATUS_ERROR   0xff
+
+static void pmu_cmd_i2c(PMUState *s,
+                        const uint8_t *in_data, uint8_t in_len,
+                        uint8_t *out_data, uint8_t *out_len)
+{
+    uint8_t mode, addr, subaddr, combaddr, count;
+    bool is_read;
+    unsigned i;
+
+    *out_len = 1;
+    out_data[0] = PMU_I2C_STATUS_OK;
+
+    if (in_len < 1) {
+        return;
+    }
+
+    if (in_data[0] == PMU_I2C_BUS_STATUS) {
+        out_data[0] = s->i2c_status;
+        if (s->i2c_status == PMU_I2C_STATUS_DATAREAD) {
+            memcpy(&out_data[1], s->i2c_data, s->i2c_data_len);
+            *out_len = 1 + s->i2c_data_len;
+        }
+        /* Reading the result consumes it; an error is reported just once. */
+        s->i2c_status = PMU_I2C_STATUS_OK;
+        s->i2c_data_len = 0;
+        return;
+    }
+
+    if (in_len < 7) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "PMU: I2C command, invalid len %d, expected >= 7\n",
+                      in_len);
+        return;
+    }
+
+    mode = in_data[1];
+    addr = in_data[3];
+    subaddr = in_data[4];
+    combaddr = in_data[5];
+    count = in_data[6];
+    is_read = (mode == PMU_I2C_MODE_COMBINED) ? (combaddr & 1) : (addr & 1);
+
+    trace_pmu_cmd_i2c(in_data[0], mode, addr, subaddr, count);
+
+    s->i2c_status = PMU_I2C_STATUS_ERROR;
+    s->i2c_data_len = 0;
+
+    if (is_read) {
+        count = MIN(count, sizeof(s->i2c_data));
+    } else {
+        count = MIN(count, in_len - 7);
+    }
+
+    if (mode != PMU_I2C_MODE_SIMPLE) {
+        /* Address the register first, as a write. */
+        if (i2c_start_send(s->i2c_bus, addr >> 1) ||
+            i2c_send(s->i2c_bus, subaddr)) {
+            i2c_end_transfer(s->i2c_bus);
+            return;
+        }
+        if (is_read && i2c_start_recv(s->i2c_bus, addr >> 1)) {
+            i2c_end_transfer(s->i2c_bus);
+            return;
+        }
+    } else if (i2c_start_transfer(s->i2c_bus, addr >> 1, is_read)) {
+        return;
+    }
+
+    if (is_read) {
+        for (i = 0; i < count; i++) {
+            s->i2c_data[i] = i2c_recv(s->i2c_bus);
+        }
+        s->i2c_data_len = count;
+        s->i2c_status = PMU_I2C_STATUS_DATAREAD;
+    } else {
+        s->i2c_status = PMU_I2C_STATUS_OK;
+        for (i = 0; i < count; i++) {
+            if (i2c_send(s->i2c_bus, in_data[7 + i])) {
+                s->i2c_status = PMU_I2C_STATUS_ERROR;
+                break;
+            }
+        }
+    }
+    i2c_end_transfer(s->i2c_bus);
+}
+
 /* description of commands */
 typedef struct PMUCmdHandler {
     uint8_t command;
@@ -455,6 +558,7 @@ static const PMUCmdHandler PMUCmdHandlers[] = {
     { PMU_GET_COVER, "GET_COVER", pmu_cmd_get_cover },
     { PMU_DOWNLOAD_STATUS, "DOWNLOAD STATUS", pmu_cmd_download_status },
     { PMU_READ_PMU_RAM, "READ PMGR RAM", pmu_cmd_read_pmu_ram },
+    { PMU_I2C_CMD, "I2C", pmu_cmd_i2c },
 };
 
 static void pmu_dispatch_cmd(PMUState *s)
@@ -693,6 +797,9 @@ static const VMStateDescription vmstate_pmu = {
         VMSTATE_BUFFER(cmd_rsp, PMUState),
         VMSTATE_UINT8(intbits, PMUState),
         VMSTATE_UINT8(intmask, PMUState),
+        VMSTATE_UINT8(i2c_status, PMUState),
+        VMSTATE_BUFFER(i2c_data, PMUState),
+        VMSTATE_UINT8(i2c_data_len, PMUState),
         VMSTATE_UINT32(tick_offset, PMUState),
         VMSTATE_TIMER_PTR(one_sec_timer, PMUState),
         VMSTATE_INT64(one_sec_target, PMUState),
@@ -713,6 +820,9 @@ static void pmu_reset(DeviceState *dev)
     s->intbits = 0;
 
     s->cmd_state = pmu_state_idle;
+
+    s->i2c_status = PMU_I2C_STATUS_OK;
+    s->i2c_data_len = 0;
 }
 
 static void pmu_realize(DeviceState *dev, Error **errp)
@@ -735,6 +845,8 @@ static void pmu_realize(DeviceState *dev, Error **errp)
     s->one_sec_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, pmu_one_sec_timer, s);
     s->one_sec_target = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000;
     timer_mod(s->one_sec_timer, s->one_sec_target);
+
+    s->i2c_bus = i2c_init_bus(dev, "pmu-i2c");
 
     if (s->has_adb) {
         qbus_init(adb_bus, sizeof(*adb_bus), TYPE_ADB_BUS, dev, "adb.0");

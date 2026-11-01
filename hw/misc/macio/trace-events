@@ -25,6 +25,7 @@ macio_gpio_read(uint64_t addr, uint64_t val) "addr 0x%"PRIx64" val 0x%"PRIx64
 pmu_adb_poll(int olen) "ADB autopoll, olen=%d"
 pmu_one_sec_timer(void) "PMU one sec..."
 pmu_cmd_set_int_mask(int intmask) "Setting PMU int mask to 0x%02x"
+pmu_cmd_i2c(int bus, int mode, int addr, int subaddr, int count) "I2C bus=%d mode=%d addr=0x%02x subaddr=0x%02x count=%d"
 pmu_cmd_set_adb_autopoll(int mask) "ADB set autopoll, mask=0x%04x"
 pmu_cmd_adb_nobus(void) "ADB PACKET with no ADB bus!"
 pmu_cmd_adb_request(int inlen, int indata0, int indata1, int indata2, int indata3, int indata4) "ADB request: len=%d, cmd=0x%02x, pflags=0x%02x, adblen=%d: 0x%02x 0x%02x..."

@@ -11,6 +11,7 @@
 #define PMU_H
 
 #include "hw/input/adb.h"
+#include "hw/i2c/i2c.h"
 #include "hw/misc/mos6522.h"
 #include "hw/misc/macio/gpio.h"
 #include "qom/object.h"
@@ -227,6 +228,16 @@ struct PMUState {
 
     /* GPIO */
     MacIOGPIOState *gpio;
+
+    /*
+     * I2C master: the PMU drives its own bus (see pmu_cmd_i2c()), which on a
+     * PowerMac3,6 carries the DIMM clock buffer.  The result of the last
+     * transfer is reported through PMU_I2C_BUS_STATUS queries.
+     */
+    I2CBus *i2c_bus;
+    uint8_t i2c_status;
+    uint8_t i2c_data[32];
+    uint8_t i2c_data_len;
 };
 
 #define TYPE_VIA_PMU "via-pmu"
