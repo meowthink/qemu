@@ -6669,7 +6669,11 @@ static void ppc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
               ctx->base.pc_next, ctx->mem_idx, (int)msr_ir);
 
     ctx->cia = pc = ctx->base.pc_next;
-    insn = translator_ldl_end(env, dcbase, pc, mo_endian);
+    if (!need_addrswizzle_le(ctx)) {
+        insn = translator_ldl_end(env, dcbase, pc, mo_endian);
+    } else {
+        insn = translator_ldl_end(env, dcbase, pc ^ 4, MO_BE);
+    }
     ctx->base.pc_next = pc += 4;
 
     if (!is_prefix_insn(ctx, insn)) {
@@ -6685,7 +6689,8 @@ static void ppc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
         gen_exception_err(ctx, POWERPC_EXCP_ALIGN, POWERPC_EXCP_ALIGN_INSN);
         ok = true;
     } else {
-        uint32_t insn2 = translator_ldl_end(env, dcbase, pc, mo_endian);
+        uint32_t insn2;
+        insn2 = translator_ldl_end(env, dcbase, pc, mo_endian);
         ctx->base.pc_next = pc += 4;
         ok = decode_insn64(ctx, deposit64(insn2, 32, 32, insn));
     }
