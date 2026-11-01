@@ -68,3 +68,7 @@ dbdma_store_word(int channel, uint32_t addr, int len, uint32_t value) "channel=0
 
 # mac_dbdma.c
 dbdma_io_latency(int channel, int64_t ns, int is_last) "ch=%d latency=%"PRId64"ns last=%d"
+
+# mac99_firewire_stub.c
+mac99_firewire_stub_read(uint64_t addr, unsigned size, uint64_t val) "R addr=0x%03"PRIx64" size=%u val=0x%08"PRIx64
+mac99_firewire_stub_write(uint64_t addr, unsigned size, uint64_t val) "W addr=0x%03"PRIx64" size=%u val=0x%08"PRIx64
