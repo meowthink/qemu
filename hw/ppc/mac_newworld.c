@@ -125,6 +125,76 @@ static uint64_t translate_kernel_address(void *opaque, uint64_t addr)
     return (addr & 0x0fffffff) + KERNEL_LOAD_ADDR;
 }
 
+/*
+ * Return a NUL-terminated copy of an OF variable's value from the nvram
+ * "common" (0x70) partition, or NULL if not present. Caller frees.
+ *
+ * On flash-backed machines the 16 KB flash is two mirrored 8 KB copies and
+ * the active data can live in either one (the other is left erased, 0xff, as
+ * the next write target), so both copies are scanned; with the 8 KB MacIO
+ * NVRAM there is a single copy and the loop runs once.
+ */
+static char *core99_nvram_get_var(const uint8_t *data, uint32_t size,
+                                  const char *name)
+{
+    const uint32_t COPY = 0x2000;
+    size_t nlen = strlen(name);
+    uint32_t base;
+
+    for (base = 0; base + COPY <= size; base += COPY) {
+        uint32_t off;
+
+        for (off = base; off + 16 <= base + COPY; ) {
+            uint32_t plen = (((data[off + 2] << 8) | data[off + 3]) * 16);
+            uint32_t dstart, dend, i;
+
+            if (plen == 0) {
+                break;
+            }
+            /*
+             * The Open Firmware variable partition is "common" on Apple's
+             * own flash layout (a real ROM's) but "system" in QEMU's
+             * chrp_nvram.c, which is what OpenBIOS writes into the MacIO
+             * NVRAM; accept either so this reports on both paths.
+             */
+            if (data[off] != 0x70 ||
+                (memcmp(&data[off + 4], "common", 6) != 0 &&
+                 memcmp(&data[off + 4], "system", 6) != 0)) {
+                off += plen;
+                continue;
+            }
+            dstart = off + 16;
+            dend = (plen > 16 && off + plen <= base + COPY) ? off + plen
+                                                            : base + COPY;
+            for (i = dstart; i < dend && data[i]; ) {
+                const char *v = (const char *)&data[i];
+                size_t vl = strnlen(v, dend - i);
+
+                if (vl > nlen && v[nlen] == '=' && !memcmp(v, name, nlen)) {
+                    return g_strndup(v + nlen + 1, vl - nlen - 1);
+                }
+                i += vl + 1;
+            }
+            break;
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Report which device the machine is configured to boot from -- the OF
+ * "boot-device" nvram variable (a trace event, `-trace mac99_boot_device`).
+ * This is what the guest is *set* to boot from; OpenBIOS may still fall back
+ * to scanning other devices when it is absent.
+ */
+static void core99_report_boot_device(MacIONVRAMState *nvr)
+{
+    g_autofree char *dev = nvr->data ?
+        core99_nvram_get_var(nvr->data, nvr->size, "boot-device") : NULL;
+
+    trace_mac99_boot_device(dev ? dev : "(unset)");
+}
+
 static void ppc_core99_reset(void *opaque)
 {
     PowerPCCPU *cpu = opaque;
@@ -582,6 +652,7 @@ static void ppc_core99_init(MachineState *machine)
     if (macio_nvram_is_blank(nvr, MACIO_NVRAM_SIZE)) {
         pmac_format_nvram_partition(nvr, MACIO_NVRAM_SIZE);
     }
+    core99_report_boot_device(nvr);
     /* No PCI init: the BIOS will do it */
 
     dev = qdev_new(TYPE_FW_CFG_MEM);
