@@ -751,9 +751,14 @@ static void sparse_decode(unsigned region, uint32_t hae, hwaddr off,
     *lane = pos;
 }
 
-static uint64_t sparse_read_common(AddressSpace *as, unsigned region,
-                                   uint32_t hae,
-                                   hwaddr off, unsigned size)
+/*
+ * Sparse-space transfer (21172 TRM 6.3.2/6.3.3, tables 6-3/6-5).
+ *
+ * pci_base is added to the decoded PCI address, so a machine can attach the
+ * same encoding to another base: the EB164 VGA hose uses 0xa0000.
+ */
+uint64_t alcor_sparse_read(AddressSpace *as, unsigned region, uint32_t hae,
+                           hwaddr pci_base, hwaddr off, unsigned size)
 {
     uint64_t pci_addr;
     uint64_t val = 0;
@@ -763,6 +768,7 @@ static uint64_t sparse_read_common(AddressSpace *as, unsigned region,
     unsigned pos = (off >> 5) & 3;
 
     sparse_decode(region, hae, off, &pci_addr, &xsize, &lane);
+    pci_addr += pci_base;
 
     if (size == 8 && size_code == 3 && pos == 3) {
         /*
@@ -810,10 +816,9 @@ static uint64_t sparse_read_common(AddressSpace *as, unsigned region,
     return val << (8 * pos);
 }
 
-static void sparse_write_common(AddressSpace *as, unsigned region,
-                                uint32_t hae,
-                                hwaddr off, uint64_t val,
-                                unsigned size)
+void alcor_sparse_write(AddressSpace *as, unsigned region, uint32_t hae,
+                        hwaddr pci_base, hwaddr off, uint64_t val,
+                        unsigned size)
 {
     uint64_t pci_addr;
     uint8_t buf[8];
@@ -822,6 +827,7 @@ static void sparse_write_common(AddressSpace *as, unsigned region,
     unsigned pos = (off >> 5) & 3;
 
     sparse_decode(region, hae, off, &pci_addr, &xsize, &lane);
+    pci_addr += pci_base;
 
     if (size_code == 3 && pos == 3 && size == 8) {
         /* Quadword access (LDQ/STQ): ad<2:0> = 000. */
@@ -863,8 +869,8 @@ static uint64_t sparse_mem_read(void *opaque, hwaddr addr,
     AlcorSparseWindow *win = opaque;
     AlcorPchipState *pcs = win->pcs;
 
-    return sparse_read_common(&pcs->mem_as, win->region,
-                              pcs->upstream->hae_mem, addr, size);
+    return alcor_sparse_read(&pcs->mem_as, win->region,
+                             pcs->upstream->hae_mem, 0, addr, size);
 }
 
 static void sparse_mem_write(void *opaque, hwaddr addr, uint64_t val,
@@ -873,8 +879,8 @@ static void sparse_mem_write(void *opaque, hwaddr addr, uint64_t val,
     AlcorSparseWindow *win = opaque;
     AlcorPchipState *pcs = win->pcs;
 
-    sparse_write_common(&pcs->mem_as, win->region,
-                        pcs->upstream->hae_mem, addr, val, size);
+    alcor_sparse_write(&pcs->mem_as, win->region,
+                       pcs->upstream->hae_mem, 0, addr, val, size);
 }
 
 static const MemoryRegionOps sparse_mem_ops = {
@@ -897,9 +903,9 @@ static uint64_t sparse_io_read(void *opaque, hwaddr addr,
     AlcorSparseWindow *win = opaque;
     AlcorPchipState *pcs = win->pcs;
 
-    return sparse_read_common(&pcs->io_as, win->region,
-                              win->region == 4 ? pcs->upstream->hae_io : 0,
-                              addr, size);
+    return alcor_sparse_read(&pcs->io_as, win->region,
+                             win->region == 4 ? pcs->upstream->hae_io : 0,
+                             0, addr, size);
 }
 
 static void sparse_io_write(void *opaque, hwaddr addr, uint64_t val,
@@ -908,9 +914,9 @@ static void sparse_io_write(void *opaque, hwaddr addr, uint64_t val,
     AlcorSparseWindow *win = opaque;
     AlcorPchipState *pcs = win->pcs;
 
-    sparse_write_common(&pcs->io_as, win->region,
-                        win->region == 4 ? pcs->upstream->hae_io : 0,
-                        addr, val, size);
+    alcor_sparse_write(&pcs->io_as, win->region,
+                       win->region == 4 ? pcs->upstream->hae_io : 0,
+                       0, addr, val, size);
 }
 
 static const MemoryRegionOps sparse_io_ops = {
@@ -1031,8 +1037,12 @@ static void alcor_chipset_realize(DeviceState *dev, Error **errp)
      * The chipset decodes the whole 0x80.0000.0000-0xE1.0000.0000 range
      * of the 40-bit address space; present it as one sysbus region.
      */
+    /*
+     * Sized to cover the flagged sparse aliases below (the highest ends
+     * at FD.C000.0000 + 1GB), i.e. 80.0000.0000 - FD.FFFF.FFFF.
+     */
     memory_region_init(&s->iomem, OBJECT(s), "alcor.iomem",
-                       0x6100000000ULL);
+                       0x7E00000000ULL);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->iomem);
 
     /* Pchip initialization. */
@@ -1057,6 +1067,41 @@ static void alcor_chipset_realize(DeviceState *dev, Error **errp)
                                 &pcs->reg_io_sparse[0]);
     memory_region_add_subregion(&s->iomem, ALCOR_REGION(IO_SPARSE_B),
                                 &pcs->reg_io_sparse[1]);
+
+    /*
+     * The sparse-space decode only looks at addr<39> and addr<34:30>;
+     * addr<38:35> are "should be zero" bits (TRM 6.3.2, 6.3.3) and take
+     * no part in it.  The ARC firmware's "hose" addresses - which is what
+     * the firmware, the loader and NT's HAL use - set them (the board's
+     * own flash window lives at C7C0.0000.0000, = 87C0.0000.0000 with
+     * addr<38:35> = 1000), so every sparse window has to decode once per
+     * 2^35 as well.  NT reaches PCI I/O sparse region A at
+     * FD.8000.0000 and its PCI memory window at FC.0000.0000, so decode
+     * the whole 0xF8.0000.0000-0xFDFF.FFFF.FFFF alias of the sparse
+     * windows (addr<38:35> = 1111).
+     */
+    {
+        MemoryRegion *src[5];
+        hwaddr base[5];
+
+#define ALCOR_HOSE_FLAGS    (0xFULL << 35)   /* addr<38:35> are ignored */
+        src[0] = &pcs->reg_mem_sparse[0]; base[0] = ALCOR_MEM_SPARSE0;
+        src[1] = &pcs->reg_mem_sparse[1]; base[1] = ALCOR_MEM_SPARSE1;
+        src[2] = &pcs->reg_mem_sparse[2]; base[2] = ALCOR_MEM_SPARSE2;
+        src[3] = &pcs->reg_io_sparse[0];  base[3] = ALCOR_IO_SPARSE_A;
+        src[4] = &pcs->reg_io_sparse[1];  base[4] = ALCOR_IO_SPARSE_B;
+
+        for (i = 0; i < 5; i++) {
+            memory_region_init_alias(&s->hose_alias[i], OBJECT(s),
+                                     "alcor.hose", src[i], 0,
+                                     memory_region_size(src[i]));
+            memory_region_add_subregion(&s->iomem,
+                                        (base[i] | ALCOR_HOSE_FLAGS) -
+                                        ALCOR_IO_BASE,
+                                        &s->hose_alias[i]);
+        }
+#undef ALCOR_HOSE_FLAGS
+    }
 
     /* Sparse PCI configuration and special/IACK cycles. */
     memory_region_add_subregion(&s->iomem, ALCOR_REGION(CONF_SPARSE),

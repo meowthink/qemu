@@ -9,6 +9,7 @@
 #include "hw/pci/pci_bus.h"
 #include "qemu/units.h"
 #include "qom/object.h"
+#include "system/memory.h"
 
 #define TYPE_ALCOR_CHIPSET "alcor-chipset"
 OBJECT_DECLARE_SIMPLE_TYPE(AlcorState, ALCOR_CHIPSET)
@@ -16,6 +17,17 @@ OBJECT_DECLARE_SIMPLE_TYPE(AlcorState, ALCOR_CHIPSET)
 #define TYPE_ALCOR_PLD "alcor-pld"
 
 PCIBus *alcor_get_pci_bus(DeviceState *dev);
+
+/*
+ * Sparse-space transfers (21172 TRM 6.3.2/6.3.3).  `off` carries the
+ * byte-enable/size/lane encoding, `pci_base` is added to the decoded PCI
+ * address (the EB164 VGA hose uses the same encoding based at 0xa0000).
+ */
+uint64_t alcor_sparse_read(AddressSpace *as, unsigned region, uint32_t hae,
+                           hwaddr pci_base, hwaddr off, unsigned size);
+void alcor_sparse_write(AddressSpace *as, unsigned region, uint32_t hae,
+                        hwaddr pci_base, hwaddr off, uint64_t val,
+                        unsigned size);
 
 /*
  * Alcor base address definitions.
