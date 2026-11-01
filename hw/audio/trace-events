@@ -61,3 +61,25 @@ virtio_snd_handle_event(void) "event queue callback called"
 virtio_snd_pcm_stream_flush(uint32_t stream) "flushing stream %"PRIu32
 virtio_snd_handle_tx_xfer(void) "tx queue callback called"
 virtio_snd_handle_rx_xfer(void) "rx queue callback called"
+
+# tda7433.c
+tda7433_subaddr(uint8_t sub, bool auto_inc) "subaddress %u auto-increment %d"
+tda7433_write(uint8_t reg, uint8_t val) "reg %u = 0x%02x"
+tda7433_read(uint8_t reg, uint8_t val) "reg %u -> 0x%02x"
+tda7433_apply(int left_ddb, int right_ddb, bool mute) "attenuation L=%d/10dB R=%d/10dB mute=%d"
+
+# awacs.c
+awacs_set_rate(int sr_id, int rate) "sr_id=%d rate=%d"
+awacs_codec_write(unsigned reg, uint32_t value) "codec reg %u = 0x%03x"
+awacs_volume(bool mute, int left, int right, int pl, int pr, bool pm, int lg, int rg) "mute=%d codec left=%d/15 right=%d/15 processor att L=%d/10dB R=%d/10dB mute=%d -> gain %d/%d of 255"
+awacs_open_voice(int rate) "rate=%d"
+awacs_dma_out(uint64_t addr, int len, int rate, int64_t now_ns) "addr=0x%"PRIx64" len=%d rate=%d now=%"PRId64
+awacs_out_complete_fire(int64_t now_ns) "now=%"PRId64
+awacs_dma_pace(int len, int64_t dur_ns, int64_t lead_ns, int64_t fire_in_ns, int fifo) "len=%d dur=%"PRId64"ns deadline_lead=%"PRId64"ns fire_in=%"PRId64"ns fifo=%d"
+awacs_dma_flush(int pending, int fifo, bool stopping, uint32_t remaining, int64_t now_ns) "channel flush/stop: pending_io=%d fifo=%d stopping=%d resCount=%u now=%"PRId64
+awacs_out_complete_drop(uint32_t status, bool processing) "stale completion dropped: channel status=0x%x processing=%d"
+awacs_fifo_overflow(int dropped) "dropped=%d bytes"
+awacs_mmio_write(uint64_t addr, uint64_t val, unsigned size) "addr=0x%"PRIx64" val=0x%"PRIx64" size=%u"
+awacs_cb(int avail, int fifo_count, int64_t now_ns) "avail=%d fifo=%d now=%"PRId64
+awacs_cb_write(int chunk, size_t written, int fifo_after) "chunk=%d written=%zu fifo_after=%d"
+awacs_mmio_read(uint64_t addr, uint64_t val, unsigned size) "addr=0x%"PRIx64" val=0x%"PRIx64" size=%u"
