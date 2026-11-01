@@ -189,6 +189,7 @@ typedef struct S3TrioState {
     uint16_t frgd_mix; /* bae8 */
     uint16_t mfc[16]; /* bee8 */
     uint16_t multifunc_data; /* byte-write assembly of bee8 */
+    bool read_sel_valid;
     uint16_t pix_trans; /* e2e8 */
     uint16_t pix_trans_ext; /* e2ea (image data extension, 32-bit transfers) */
     uint32_t xfer_pixel;    /* CPU pixel data received so far */
@@ -1091,12 +1092,35 @@ static void s3_trio_enable_writeb(void *opaque, uint32_t addr, uint32_t val)
     trace_s3_vga_enable_writeb(addr, val);
 }
 
+/*
+ * The RAMDAC has one address register for reads and writes.  A read-index
+ * write points it at the following entry, as does the first byte of each
+ * three-byte colour read.
+ */
+static uint32_t s3_dac_read(S3TrioState *s, uint32_t addr)
+{
+    uint32_t val = vga_ioport_read(&s->vga, addr);
+
+    if (addr == VGA_PEL_D && !s->vga.dac_sub_index) {
+        s->vga.dac_write_index++;
+    }
+    return val;
+}
+
+static void s3_dac_write(S3TrioState *s, uint32_t addr, uint32_t val)
+{
+    vga_ioport_write(&s->vga, addr, val);
+    if (addr == VGA_PEL_IR) {
+        s->vga.dac_write_index = val + 1;
+    }
+}
+
 static uint32_t s3_trio_dac_ioport_readb(void *opaque, uint32_t addr)
 {
     S3TrioState *s = opaque;
     uint32_t val;
 
-    val = vga_ioport_read(&s->vga, addr - 0x2ea + VGA_PEL_MSK);
+    val = s3_dac_read(s, addr - 0x2ea + VGA_PEL_MSK);
     trace_s3_vga_dac_readb(addr, val);
     return val;
 }
@@ -1115,7 +1139,7 @@ static void s3_trio_dac_ioport_writeb(void *opaque, uint32_t addr, uint32_t val)
     } else if (addr == 0x2ed && val > 0x3f) {
         s->vga.dac_8bit = 1;
     }
-    vga_ioport_write(&s->vga, addr - 0x2ea + VGA_PEL_MSK, val);
+    s3_dac_write(s, addr - 0x2ea + VGA_PEL_MSK, val);
 }
 
 static uint16_t* s3_trio_get_register(S3TrioState *s, uint32_t addr, int is_write, uint32_t* val_if_write)
@@ -1202,7 +1226,12 @@ static uint16_t* s3_trio_get_register(S3TrioState *s, uint32_t addr, int is_writ
         break;
     case REG_MULTIFUNC_CNTL:
         if (is_write) {
-            p = &s->mfc[(*val_if_write >> 12) & 0xf];
+            unsigned int index = (*val_if_write >> 12) & 0xf;
+
+            p = &s->mfc[index];
+            if (index == 0xf) {
+                s->read_sel_valid = true;
+            }
             *val_if_write &= 0x0fff;
         } else {
             p = NULL;
@@ -1218,6 +1247,22 @@ static uint16_t* s3_trio_get_register(S3TrioState *s, uint32_t addr, int is_writ
     }
 
     return p;
+}
+
+/*
+ * A read at BEE8 returns the register selected by READ_SEL, with its index
+ * in bits 15-12, then advances READ_SEL.
+ */
+static uint16_t s3_read_register_data(S3TrioState *s)
+{
+    static const uint8_t index[] = { 0x0, 0x1, 0x2, 0x3, 0x4, 0xa, 0xe };
+    unsigned int sel = s->mfc[0xf] & 0x7;
+
+    s->mfc[0xf] = (s->mfc[0xf] & ~0x7) | ((sel + 1) & 0x7);
+    if (sel >= ARRAY_SIZE(index)) {
+        return 0xffff;
+    }
+    return (index[sel] << 12) | (s->mfc[index[sel]] & 0xfff);
 }
 
 static uint32_t s3_trio_ioport_readb(void *opaque, uint32_t addr)
@@ -1253,6 +1298,13 @@ static uint32_t s3_trio_ioport_readw(void *opaque, uint32_t addr)
     uint32_t val;
     uint16_t *p;
     uint32_t *w;
+
+    if (address_to_reg(addr) == REG_MULTIFUNC_CNTL &&
+        s->read_sel_valid) {
+        val = s3_read_register_data(s);
+        trace_s3_vga_io_readw(addr, val);
+        return val;
+    }
 
     p = s3_trio_get_register(s, address_to_reg(addr), 0, NULL);
     w = s3_trio_wide_register(s, address_to_reg(addr));
@@ -1327,10 +1379,15 @@ static void s3_trio_ioport_writeb(void *opaque, uint32_t addr, uint32_t val)
      * index of the previous word (DB008-B 18-11, "Bits 15-12 INDEX").
      */
     if (address_to_reg(addr & ~0x1) == REG_MULTIFUNC_CNTL) {
+        unsigned int index;
+
         ((uint8_t *)&s->multifunc_data)[~addr & 1] = val;
         if (!(addr & 1)) {
-            s->mfc[(s->multifunc_data >> 12) & 0xf] =
-                s->multifunc_data & 0x0fff;
+            index = (s->multifunc_data >> 12) & 0xf;
+            s->mfc[index] = s->multifunc_data & 0x0fff;
+            if (index == 0xf) {
+                s->read_sel_valid = true;
+            }
         }
         s3_trio_post_write(s, addr & ~0x1);
         return;
@@ -1524,6 +1581,11 @@ static uint64_t s3_mmio_window_read(void *opaque, hwaddr addr, unsigned size)
     unsigned i;
 
     if (s3_enhanced_window_enabled(s) && s3_mmio_window_is_reg(addr, false)) {
+        if (address_to_reg(addr & ~0x1) == REG_MULTIFUNC_CNTL &&
+            size == 2 && s->read_sel_valid) {
+            return s3_read_register_data(s);
+        }
+
         uint16_t *p = s3_trio_get_register(s, address_to_reg(addr & ~0x1), 0,
                                            NULL);
         uint32_t *wp = s3_trio_wide_register(s, address_to_reg(addr & ~0x1));
@@ -1566,6 +1628,12 @@ static uint32_t s3_trio_vga_ioport_read(void *opaque, uint32_t addr)
 {
     S3TrioState *s = opaque;
     uint32_t val;
+
+    if (vga_ioport_invalid(&s->vga, addr)) {
+        val = 0xff;
+        trace_s3_vga_io_readb(addr, val);
+        return val;
+    }
 
     switch (addr) {
     case VGA_CRT_DM:
@@ -1635,6 +1703,9 @@ static uint32_t s3_trio_vga_ioport_read(void *opaque, uint32_t addr)
             break;
         }
         break;
+    case VGA_PEL_D:
+        val = s3_dac_read(s, addr);
+        break;
     default:
         val = vga_ioport_read(&s->vga, addr);
         break;
@@ -1646,8 +1717,14 @@ static uint32_t s3_trio_vga_ioport_read(void *opaque, uint32_t addr)
 
 static void s3_trio_update_bank_offset(S3TrioState *s)
 {
-    s->vga.bank_offset = (s->vga.cr[0x31] & 0x01) ?
-                         ((uint32_t)(s->vga.cr[0x6a] & 0x3f) << 16) : 0;
+    uint32_t offset = 0;
+
+    if (s->vga.cr[0x31] & 0x01) {
+        offset = (uint32_t)s->vga.cr[0x6a] <<
+                 (s->vga.sr[VGA_SEQ_MEMORY_MODE] & VGA_SR04_CHN_4M ?
+                  16 : 14);
+    }
+    s->vga.bank_offset = offset & (s->vga.vram_size - 1);
     vga_update_memory_access(&s->vga);
 }
 
@@ -1678,6 +1755,10 @@ static void s3_trio_vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
     S3TrioState *s = opaque;
 
     trace_s3_vga_io_writeb(addr, val);
+    if (vga_ioport_invalid(&s->vga, addr)) {
+        return;
+    }
+
     switch (addr) {
     case VGA_CRT_DM:
     case VGA_CRT_DC:
@@ -1705,6 +1786,17 @@ static void s3_trio_vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
         case 0x31:
         case 0x6a:
             vga_ioport_write(&s->vga, addr, val);
+            s3_trio_update_bank_offset(s);
+            break;
+        case 0x35:
+            vga_ioport_write(&s->vga, addr, val);
+            s->vga.cr[0x6a] = (s->vga.cr[0x6a] & ~0x0f) | (val & 0x0f);
+            s3_trio_update_bank_offset(s);
+            break;
+        case 0x51:
+            vga_ioport_write(&s->vga, addr, val);
+            s->vga.cr[0x6a] = (s->vga.cr[0x6a] & ~0x30) |
+                              ((val & 0x0c) << 2);
             s3_trio_update_bank_offset(s);
             break;
         case 0x38:
@@ -1751,6 +1843,7 @@ static void s3_trio_vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
                 val &= ~0x08;
             }
             vga_ioport_write(&s->vga, addr, val);
+            s3_trio_update_bank_offset(s);
             break;
         case 0x08:
             s->vga.sr[s->vga.sr_index] = val;
@@ -1767,6 +1860,9 @@ static void s3_trio_vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
             break;
         }
         break;
+    case VGA_PEL_IR:
+        s3_dac_write(s, addr, val);
+        break;
     default:
         if (addr == VGA_PEL_IW) {
             s->vga.dac_8bit = 0;
@@ -1778,15 +1874,29 @@ static void s3_trio_vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
     }
 }
 
+/*
+ * Input status 1 is read as a halfword at 3BA or 3DA.  Both bytes carry
+ * the status, so the retrace bit is visible in the byte selected by the
+ * bus endianness.
+ */
+static uint32_t s3_trio_vga_input_status_readw(void *opaque, uint32_t addr)
+{
+    uint32_t val = s3_trio_vga_ioport_read(opaque, addr) & 0xff;
+
+    return val | (val << 8);
+}
+
 static const MemoryRegionPortio s3_trio_portio_list[] = {
     { 0x0102, 1, 1, .read = s3_trio_enable_readb, .write = s3_trio_enable_writeb, },
     { 0x02e8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
     { 0x02e8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
     { 0x02ea, 4, 1, .read = s3_trio_dac_ioport_readb, .write = s3_trio_dac_ioport_writeb, },
     { 0x03b4,  2, 1, .read = s3_trio_vga_ioport_read, .write = s3_trio_vga_ioport_write },
+    { 0x03ba,  1, 2, .read = s3_trio_vga_input_status_readw },
     { 0x03ba,  1, 1, .read = s3_trio_vga_ioport_read, .write = s3_trio_vga_ioport_write },
     { 0x03c0, 16, 1, .read = s3_trio_vga_ioport_read, .write = s3_trio_vga_ioport_write },
     { 0x03d4,  2, 1, .read = s3_trio_vga_ioport_read, .write = s3_trio_vga_ioport_write },
+    { 0x03da,  1, 2, .read = s3_trio_vga_input_status_readw },
     { 0x03da,  1, 1, .read = s3_trio_vga_ioport_read, .write = s3_trio_vga_ioport_write },
     { 0x06e8, 1, 2, .read = s3_trio_ioport_readw, .write = s3_trio_ioport_writew, },
     { 0x06e8, 2, 1, .read = s3_trio_ioport_readb, .write = s3_trio_ioport_writeb, },
@@ -1964,7 +2074,7 @@ static void s3_trio_get_resolution(VGACommonState *s, int *pwidth, int *pheight)
 
 static VMStateDescription vmstate_s3_trio = {
     .name = TYPE_S3_TRIO,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (VMStateField []) {
         VMSTATE_PCI_DEVICE(dev, S3TrioState),
@@ -2003,6 +2113,7 @@ static VMStateDescription vmstate_s3_trio = {
         VMSTATE_UINT16(bkgd_mix, S3TrioState),
         VMSTATE_UINT16(frgd_mix, S3TrioState),
         VMSTATE_UINT16_ARRAY(mfc, S3TrioState, 16),
+        VMSTATE_BOOL_V(read_sel_valid, S3TrioState, 2),
         VMSTATE_UINT16(pix_trans, S3TrioState),
         VMSTATE_END_OF_LIST()
     },
@@ -2039,6 +2150,7 @@ static void s3_trio_reset(DeviceState *d)
 
     s->disp_stat |= DISP_STAT_SENSE;
     s->gp_stat = GP_STAT_FIFO_EMPTY;
+    s->read_sel_valid = false;
     s->xfer_lo = 0;
     s->xfer_lo_valid = false;
 }
@@ -2140,6 +2252,33 @@ static uint32_t s3_cursor_hash(S3TrioState *s)
     uint32_t h = 2166136261u;
     int i;
 
+    for (i = 0x45; i <= 0x4f; i++) {
+        h ^= s->vga.cr[i];
+        h *= 16777619u;
+    }
+    for (i = 0; i < ARRAY_SIZE(s->cursor_fg); i++) {
+        h ^= s->cursor_fg[i];
+        h *= 16777619u;
+        h ^= s->cursor_bg[i];
+        h *= 16777619u;
+    }
+    h ^= s3_pixel_bytes(s);
+    h *= 16777619u;
+    h ^= s3_pixel_565(s);
+    h *= 16777619u;
+    if (((s->vga.cr[0x45] >> 2) & 3) == 0 && s3_pixel_bytes(s) == 1) {
+        unsigned int idx = s->vga.cr[0x0e];
+
+        for (i = 0; i < 3; i++) {
+            h ^= s->vga.palette[idx * 3 + i];
+            h *= 16777619u;
+        }
+        idx = s->vga.cr[0x0f];
+        for (i = 0; i < 3; i++) {
+            h ^= s->vga.palette[idx * 3 + i];
+            h *= 16777619u;
+        }
+    }
     for (i = 0; i < 1024; i++) {
         h ^= s->vga.vram_ptr[(addr + i) % s->vga.vram_size];
         h *= 16777619u;
