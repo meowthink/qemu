@@ -212,6 +212,15 @@ static int PPC_NVRAM_set_params (Nvram *nvram, uint16_t NVRAM_size,
     return 0;
 }
 
+static bool nvram_image_present(Nvram *nvram)
+{
+    g_autofree char *filename = object_property_get_str(OBJECT(nvram),
+                                                        "filename", NULL);
+    struct stat st;
+
+    return filename && *filename && !stat(filename, &st) && st.st_size > 0;
+}
+
 static int prep_set_cmos_checksum(DeviceState *dev, void *opaque)
 {
     uint16_t checksum = *(uint16_t *)opaque;
@@ -430,13 +439,12 @@ static void ibm_40p_init(MachineState *machine)
     qemu_register_boot_set(fw_cfg_boot_set, fw_cfg);
 
     /* Prepare firmware configuration for Open Hack'Ware */
-    if (m48t59) {
+    if (m48t59 && !nvram_image_present(m48t59)) {
         PPC_NVRAM_set_params(m48t59, NVRAM_SIZE, "PREP", machine->ram_size,
                              boot_device,
                              kernel_base, kernel_size,
                              machine->kernel_cmdline,
                              initrd_base, initrd_size,
-                             /* XXX: need an option to load a NVRAM image */
                              0,
                              graphic_width, graphic_height, graphic_depth);
     }
